@@ -24,6 +24,8 @@ const WAIT_MS: u32 = 100;
 const SILENCE_SAMPLES_PER_TIMEOUT: usize = (SAMPLE_RATE as usize * WAIT_MS as usize) / 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Source {
     /// Default microphone: the local user.
     Mic,

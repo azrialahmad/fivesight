@@ -1,0 +1,108 @@
+@import 'tailwindcss';
+
+/* Light only, by design. */
+:root {
+  color-scheme: light;
+  --surface: #f8fafd;
+  --card: #ffffff;
+  --outline: #e1e3e8;
+  --ink: #1f1f1f;
+  --muted: #5f6368;
+  --blue: #0b57d0;
+  --blue-soft: #d3e3fd;
+  --blue-hover: #0a4cb8;
+  --red: #b3261e;
+  --red-soft: #f9dedc;
+  --green: #137333;
+  --green-soft: #e6f4ea;
+  --hover: #eef1f6;
+}
+
+@theme inline {
+  --color-surface: var(--surface);
+  --color-card: var(--card);
+  --color-line: var(--outline);
+  --color-ink: var(--ink);
+  --color-muted: var(--muted);
+  --color-blue: var(--blue);
+  --color-blue-soft: var(--blue-soft);
+  --color-blue-hover: var(--blue-hover);
+  --color-red: var(--red);
+  --color-red-soft: var(--red-soft);
+  --color-green: var(--green);
+  --color-green-soft: var(--green-soft);
+  --color-hover: var(--hover);
+  --font-sans: 'Google Sans Text', 'Google Sans', 'Segoe UI Variable Text', 'Segoe UI', system-ui, sans-serif;
+}
+
+@layer base {
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 0;
+  background: none;
+  color: inherit;
+}
+button:disabled {
+  cursor: default;
+}
+
+button:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+}
+
+::-webkit-scrollbar {
+  width: 12px;
+}
+::-webkit-scrollbar-thumb {
+  background: #c7c9ce;
+  border-radius: 8px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #a8abb1;
+  background-clip: content-box;
+  border: 3px solid transparent;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.45; transform: scale(0.8); }
+}
+.rec-dot {
+  animation: pulse-dot 1.6s ease-in-out infinite;
+}
+
+@keyframes rise {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+.rise {
+  animation: rise 0.22s ease-out;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rec-dot, .rise { animation: none; }
+}

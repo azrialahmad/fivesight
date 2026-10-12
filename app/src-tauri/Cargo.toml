@@ -1,0 +1,24 @@
+[package]
+name = "fivesight-app"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "fivesight_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+default = []
+cuda = ["fs-stt/cuda"]
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+fs-audio = { path = "../../crates/fs-audio" }
+fs-stt = { path = "../../crates/fs-stt", features = ["engine"] }
+fs-pipeline = { path = "../../crates/fs-pipeline" }

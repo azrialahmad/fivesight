@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "cli"]
+members = ["crates/*", "cli", "app/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,3 +17,7 @@ tracing = "0.1"
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Keep the native inference stack fast even in debug builds.
+[profile.dev.package.whisper-rs-sys]
+opt-level = 3

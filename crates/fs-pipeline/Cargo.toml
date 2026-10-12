@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
 tracing.workspace = true
 fs-audio = { path = "../fs-audio" }
 fs-vad = { path = "../fs-vad", features = ["silero"] }
