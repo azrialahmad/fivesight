@@ -8,10 +8,11 @@ const DEFAULT_SETTINGS: Settings = {
   provider: 'openrouter',
   openrouterModel: 'google/gemini-2.5-flash',
   fallbackModel: '',
-  localUrl: 'http://localhost:11434/v1',
-  localModel: 'gemma3',
+  customUrl: 'http://localhost:11434/v1',
+  customModel: 'gemma3',
   language: 'auto',
-  hasKey: false
+  hasKey: false,
+  hasCustomKey: false
 };
 
 class Session {
@@ -102,7 +103,8 @@ class Session {
     this.busy = true;
     this.error = null;
     try {
-      const id = await api.startRecording(this.settings.language, this.current && !this.current.endedAt ? this.current.id : null);
+      // Record into the meeting that's open (also when continuing a finished one).
+      const id = await api.startRecording(this.view === 'meeting' ? (this.current?.id ?? null) : null);
       this.recording = true;
       this.recordingMeetingId = id;
       this.startedAt = Date.now();
@@ -163,6 +165,17 @@ class Session {
     this.current.title = t;
     await api.renameMeeting(this.current.id, t);
     this.refreshMeetings();
+  }
+
+  /** Pick what the speech recognizer expects. Applies from the next time recording starts. */
+  async setMeetingLanguage(language: string) {
+    if (!this.current) return;
+    this.current.language = language;
+    try {
+      await api.setMeetingLanguage(this.current.id, language);
+    } catch (e) {
+      this.error = String(e);
+    }
   }
 
   async remove(id: number) {

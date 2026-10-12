@@ -16,6 +16,29 @@ pub enum LlmError {
     Stream(String),
 }
 
+impl LlmError {
+    /// A message for the person using the app, with the likely fix. `key_sent` says whether
+    /// the failed request carried an API key.
+    pub fn user_message(&self, key_sent: bool) -> String {
+        match self {
+            LlmError::Api { status: 401 | 403, .. } if !key_sent => {
+                "The AI server wants an API key, but none was sent. Add one in Settings, under AI model.".into()
+            }
+            LlmError::Api { status: 401 | 403, .. } => {
+                "The AI server rejected your API key. Check it in Settings, under AI model.".into()
+            }
+            LlmError::Api { status: 404, .. } => {
+                "The AI server doesn't recognise that address or model name. Check both in Settings.".into()
+            }
+            LlmError::Api { status: 429, .. } => "The AI server is rate limiting you. Try again in a moment.".into(),
+            LlmError::Http(e) if e.is_connect() || e.is_timeout() => {
+                "Couldn't reach the AI server. Check the address in Settings, or that your local server is running.".into()
+            }
+            other => other.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     /// e.g. `https://openrouter.ai/api/v1` or `http://localhost:11434/v1`.
@@ -37,7 +60,20 @@ impl LlmConfig {
     }
 
     pub fn local(base_url: &str, model: &str) -> Self {
-        Self { base_url: base_url.trim_end_matches('/').into(), api_key: None, model: model.into(), fallback_model: None }
+        Self::custom(base_url, None, model)
+    }
+
+    /// Any OpenAI-compatible server. The key is optional (local servers don't need one).
+    /// A pasted full endpoint such as `.../v1/chat/completions` is trimmed back to the base.
+    pub fn custom(base_url: &str, api_key: Option<String>, model: &str) -> Self {
+        let trimmed = base_url.trim().trim_end_matches('/');
+        let base = trimmed.strip_suffix("/chat/completions").unwrap_or(trimmed).trim_end_matches('/');
+        Self {
+            base_url: base.into(),
+            api_key: api_key.map(|k| k.trim().to_string()).filter(|k| !k.is_empty()),
+            model: model.trim().into(),
+            fallback_model: None,
+        }
     }
 }
 
@@ -185,6 +221,58 @@ mod tests {
         }
         s.push_str("data: [DONE]\n\n");
         s
+    }
+
+    #[test]
+    fn user_messages_explain_the_fix() {
+        let api = |status| LlmError::Api { status, body: "{\"error\":{\"message\":\"Missing Authentication header\"}}".into() };
+        assert!(api(401).user_message(false).contains("none was sent"));
+        assert!(api(401).user_message(true).contains("rejected your API key"));
+        assert!(api(404).user_message(true).contains("model name"));
+        assert!(api(429).user_message(true).contains("rate limiting"));
+        // Unknown statuses keep the raw detail so nothing is hidden.
+        assert!(api(500).user_message(true).contains("500"));
+        assert!(LlmError::Stream("cut".into()).user_message(true).contains("cut"));
+    }
+
+    #[test]
+    fn custom_normalizes_url_and_key() {
+        let c = LlmConfig::custom(" https://api.example.com/v1/chat/completions/ ", Some("  sk-1 ".into()), " m ");
+        assert_eq!(c.base_url, "https://api.example.com/v1");
+        assert_eq!(c.api_key.as_deref(), Some("sk-1"));
+        assert_eq!(c.model, "m");
+        assert_eq!(LlmConfig::custom("http://localhost:11434/v1/", Some("   ".into()), "x").api_key, None);
+    }
+
+    /// Serve one request and hand back the raw request head the client sent.
+    async fn capture_head() -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut s, _) = l.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let n = s.read(&mut buf).await.unwrap_or(0);
+            let _ = tx.send(String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase());
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: [DONE]\n\n").await;
+            let _ = s.shutdown().await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn sends_bearer_key_when_configured() {
+        let (url, head) = capture_head().await;
+        let cfg = LlmConfig::custom(&url, Some("sk-test".into()), "m");
+        chat_stream(&cfg, &[Message::user("x")], |_| {}).await.unwrap();
+        assert!(head.await.unwrap().contains("authorization: bearer sk-test"));
+    }
+
+    #[tokio::test]
+    async fn sends_no_auth_header_without_a_key() {
+        let (url, head) = capture_head().await;
+        chat_stream(&LlmConfig::custom(&url, None, "m"), &[Message::user("x")], |_| {}).await.unwrap();
+        assert!(!head.await.unwrap().contains("authorization"));
     }
 
     #[tokio::test]

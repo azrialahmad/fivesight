@@ -9,6 +9,7 @@
 //! Partials are coalesced: a stream never has more than one partial job in flight, so a
 //! slow GPU cannot build a backlog. Finals are always queued.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use fs_audio::{rms, Capture, Source};
 use fs_stt::engine::Engine;
 use fs_stt::filter::{judge, FilterConfig, SegmentStats, Verdict};
+use fs_stt::lang::{LangMode, LangTracker, BILINGUAL_PROMPT, MIN_DETECT_SECS};
 use fs_vad::silero::SileroVad;
 use fs_vad::{EndpointConfig, Endpointer, Event, FRAME, SAMPLE_RATE};
 
@@ -26,8 +28,10 @@ use fs_vad::{EndpointConfig, Endpointer, Event, FRAME, SAMPLE_RATE};
 pub struct PipelineConfig {
     pub whisper_model: PathBuf,
     pub vad_model: PathBuf,
-    /// `Some("id")`, `Some("en")`, or `None` for auto-detect.
-    pub language: Option<String>,
+    /// Auto picks between Indonesian and English per utterance; Id/En pin one language.
+    pub language: LangMode,
+    /// Biases Whisper toward the right vocabulary. Ignored in English-only mode.
+    pub initial_prompt: Option<String>,
     pub partial_interval: Duration,
     pub partial_window_s: f32,
     pub me_end_silence_ms: usize,
@@ -46,7 +50,8 @@ impl PipelineConfig {
         Self {
             whisper_model,
             vad_model,
-            language: None,
+            language: LangMode::Auto,
+            initial_prompt: Some(BILINGUAL_PROMPT.into()),
             partial_interval: Duration::from_millis(700),
             partial_window_s: 15.0,
             me_end_silence_ms: 800,
@@ -271,6 +276,17 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
     }
 }
 
+/// Ask Whisper how likely Indonesian and English are, then apply the sticky choice.
+fn detect_and_choose(engine: &Engine, tracker: &mut LangTracker, audio: &[f32], secs: f32) -> &'static str {
+    match engine.detect_among(audio, &["id", "en"]) {
+        Ok(p) => tracker.choose(p[0], p[1], secs),
+        Err(e) => {
+            tracing::warn!("language detection failed: {e}");
+            tracker.last().unwrap_or("id")
+        }
+    }
+}
+
 fn worker_loop(
     engine: Engine,
     cfg: PipelineConfig,
@@ -279,8 +295,50 @@ fn worker_loop(
     inflight_mic: Arc<AtomicBool>,
     inflight_out: Arc<AtomicBool>,
 ) {
-    let lang = cfg.language.as_deref();
+    let prompt = match cfg.language {
+        LangMode::En => None,
+        _ => cfg.initial_prompt.as_deref(),
+    };
+    // One tracker per audio stream (mic, loopback), and the language picked for each
+    // utterance in progress so its partials don't re-detect on every pass.
+    let mut trackers = [LangTracker::default(), LangTracker::default()];
+    let mut seg_lang: HashMap<(usize, u64), &'static str> = HashMap::new();
+
     for job in jobs {
+        let src = match job.source {
+            Source::Mic => 0,
+            Source::Loopback => 1,
+        };
+        let secs = job.audio.len() as f32 / SAMPLE_RATE as f32;
+        let key = (src, job.segment_id);
+        let lang: Option<&'static str> = match cfg.language {
+            LangMode::Id => Some("id"),
+            LangMode::En => Some("en"),
+            LangMode::Auto => Some(match job.kind {
+                Kind::Partial => match seg_lang.get(&key) {
+                    Some(l) => *l,
+                    None if secs >= MIN_DETECT_SECS => {
+                        let l = detect_and_choose(&engine, &mut trackers[src], &job.audio, secs);
+                        seg_lang.insert(key, l);
+                        l
+                    }
+                    None => trackers[src].last().unwrap_or("id"),
+                },
+                Kind::Final => {
+                    let l = if secs >= MIN_DETECT_SECS {
+                        detect_and_choose(&engine, &mut trackers[src], &job.audio, secs)
+                    } else {
+                        seg_lang.get(&key).copied().or(trackers[src].last()).unwrap_or("id")
+                    };
+                    seg_lang.remove(&key);
+                    l
+                }
+            }),
+        };
+        if seg_lang.len() > 64 {
+            seg_lang.clear(); // utterances dropped before their final never clean up
+        }
+
         let start_ms = job.start_sample * 1000 / SAMPLE_RATE as u64;
         let mk = |text: String, dropped: Option<String>| TranscriptEvent {
             source: job.source,
@@ -292,8 +350,8 @@ fn worker_loop(
         };
 
         let result = match job.kind {
-            Kind::Partial => engine.transcribe(&job.audio, lang, 1, None),
-            Kind::Final => engine.transcribe(&job.audio, lang, cfg.final_beam, None),
+            Kind::Partial => engine.transcribe(&job.audio, lang, 1, prompt),
+            Kind::Final => engine.transcribe(&job.audio, lang, cfg.final_beam, prompt),
         };
         if job.kind == Kind::Partial {
             match job.source {

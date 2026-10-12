@@ -13,7 +13,7 @@
   });
 
   const languages: [string, string][] = [
-    ['auto', 'Auto-detect (Indonesian + English mixed)'],
+    ['auto', 'Indonesian + English (switches per sentence)'],
     ['id', 'Indonesian'],
     ['en', 'English']
   ];
@@ -34,8 +34,10 @@
     <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
 
     <section>
-      <label class="font-semibold" for="lang">Spoken language</label>
-      <p class="mt-0.5 text-sm text-muted">Pinning one language is more accurate than auto-detect.</p>
+      <label class="font-semibold" for="lang">Language for new meetings</label>
+      <p class="mt-0.5 text-sm text-muted">
+        You can change it per meeting, right in the meeting. If your calls are mostly one language, pinning it is the most accurate.
+      </p>
       <select id="lang" class={field} bind:value={form.language}>
         {#each languages as [v, label]}<option value={v}>{label}</option>{/each}
       </select>
@@ -48,8 +50,8 @@
         <button class="{seg} {form.provider === 'openrouter' ? 'bg-ink text-white' : 'text-muted'}" role="radio" aria-checked={form.provider === 'openrouter'} onclick={() => (form.provider = 'openrouter')}>
           OpenRouter (cloud)
         </button>
-        <button class="{seg} {form.provider === 'local' ? 'bg-ink text-white' : 'text-muted'}" role="radio" aria-checked={form.provider === 'local'} onclick={() => (form.provider = 'local')}>
-          Local model
+        <button class="{seg} {form.provider === 'custom' ? 'bg-ink text-white' : 'text-muted'}" role="radio" aria-checked={form.provider === 'custom'} onclick={() => (form.provider = 'custom')}>
+          OpenAI-compatible
         </button>
       </div>
 
@@ -64,11 +66,22 @@
         <p class="mt-3 text-xs text-muted">Meeting text is sent to the model you pick here.</p>
       {:else}
         <label class="mt-5 block text-sm font-medium" for="url">Server address</label>
-        <input id="url" class={field} bind:value={form.localUrl} />
-        <p class="mt-1.5 text-xs text-muted">Any OpenAI-compatible server: Ollama, LM Studio, llama.cpp.</p>
+        <input id="url" class={field} placeholder="https://api.openai.com/v1" bind:value={form.customUrl} />
+        <p class="mt-1.5 text-xs text-muted">
+          Any OpenAI-compatible server: OpenAI, a company gateway, or your own (Ollama, LM Studio, llama.cpp).
+        </p>
         <label class="mt-4 block text-sm font-medium" for="lm">Model name</label>
-        <input id="lm" class={field} bind:value={form.localModel} />
-        <p class="mt-3 text-xs text-muted">Nothing leaves this PC.</p>
+        <input id="lm" class={field} bind:value={form.customModel} />
+        <label class="mt-4 block text-sm font-medium" for="ckey">API key <span class="font-normal text-faint">(leave empty for a local server)</span></label>
+        <input id="ckey" type="password" autocomplete="off" class={field} placeholder={form.hasCustomKey ? 'Saved. Type to replace.' : 'Hosted services need one'} bind:value={apiKey} />
+        <p class="mt-1.5 text-xs text-muted">Stored in Windows Credential Manager, not in a file.</p>
+        <label class="mt-4 block text-sm font-medium" for="fb2">Fallback model <span class="font-normal text-faint">(optional)</span></label>
+        <input id="fb2" class={field} placeholder="Used if the main model fails" bind:value={form.fallbackModel} />
+        <p class="mt-3 text-xs text-muted">
+          {form.customUrl.includes('localhost') || form.customUrl.includes('127.0.0.1')
+            ? 'Nothing leaves this PC.'
+            : 'Meeting text is sent to this server.'}
+        </p>
       {/if}
     </section>
 

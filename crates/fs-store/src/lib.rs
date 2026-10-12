@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS meetings (
     started_at  INTEGER NOT NULL,
     ended_at    INTEGER,
     notes       TEXT NOT NULL DEFAULT '',
-    enhanced    TEXT NOT NULL DEFAULT ''
+    enhanced    TEXT NOT NULL DEFAULT '',
+    language    TEXT NOT NULL DEFAULT 'auto'
 );
 
 CREATE TABLE IF NOT EXISTS segments (
@@ -72,6 +73,8 @@ pub struct Meeting {
     pub ended_at: Option<i64>,
     pub notes: String,
     pub enhanced: String,
+    /// "auto", "id" or "en": what the speech recognizer should expect.
+    pub language: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -122,28 +125,57 @@ fn fts_query(q: &str) -> Option<String> {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Self::init(Connection::open(path)?)
     }
 
     pub fn open_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
+        Self::init(Connection::open_in_memory()?)
+    }
+
+    /// Create tables, then bring databases made by older versions up to date.
+    fn init(conn: Connection) -> Result<Self> {
+        // Order matters: columns added later must not be referenced by the base schema's
+        // indexes, and `CREATE TABLE IF NOT EXISTS` leaves an old `meetings` table untouched.
         conn.execute_batch(SCHEMA)?;
+        let has_language: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'language'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_language == 0 {
+            conn.execute_batch("ALTER TABLE meetings ADD COLUMN language TEXT NOT NULL DEFAULT 'auto'")?;
+        }
         Ok(Self { conn })
     }
 
     pub fn create_meeting(&self, title: &str, started_at: i64) -> Result<i64> {
+        self.create_meeting_in(title, started_at, "auto")
+    }
+
+    pub fn create_meeting_in(&self, title: &str, started_at: i64, language: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO meetings (title, started_at) VALUES (?1, ?2)",
-            params![title, started_at],
+            "INSERT INTO meetings (title, started_at, language) VALUES (?1, ?2, ?3)",
+            params![title, started_at, language],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn set_language(&self, id: i64, language: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE meetings SET language = ?2 WHERE id = ?1", params![id, language])?;
+        Ok(())
     }
 
     pub fn end_meeting(&self, id: i64, ended_at: i64) -> Result<()> {
         self.conn
             .execute("UPDATE meetings SET ended_at = ?2 WHERE id = ?1", params![id, ended_at])?;
+        Ok(())
+    }
+
+    /// Mark a finished meeting as in progress again (recording into it a second time).
+    pub fn reopen_meeting(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("UPDATE meetings SET ended_at = NULL WHERE id = ?1", params![id])?;
         Ok(())
     }
 
@@ -173,7 +205,7 @@ impl Store {
     pub fn get_meeting(&self, id: i64) -> Result<Meeting> {
         self.conn
             .query_row(
-                "SELECT id, title, started_at, ended_at, notes, enhanced FROM meetings WHERE id = ?1",
+                "SELECT id, title, started_at, ended_at, notes, enhanced, language FROM meetings WHERE id = ?1",
                 params![id],
                 |r| {
                     Ok(Meeting {
@@ -183,6 +215,7 @@ impl Store {
                         ended_at: r.get(3)?,
                         notes: r.get(4)?,
                         enhanced: r.get(5)?,
+                        language: r.get(6)?,
                     })
                 },
             )
@@ -283,6 +316,8 @@ mod tests {
         assert_eq!(m.ended_at, Some(5000));
         assert_eq!(m.notes, "- PAY-142 timeout");
         assert!(matches!(s.get_meeting(999), Err(StoreError::NotFound(999))));
+        s.reopen_meeting(id).unwrap();
+        assert_eq!(s.get_meeting(id).unwrap().ended_at, None);
     }
 
     #[test]
@@ -350,6 +385,41 @@ mod tests {
         s.add_chat(None, "user", "global", 3).unwrap();
         assert_eq!(s.chat_history(Some(id)).unwrap().len(), 2);
         assert_eq!(s.chat_history(None).unwrap(), vec![ChatMessage { role: "user".into(), content: "global".into() }]);
+    }
+
+    #[test]
+    fn language_defaults_to_auto_and_can_change() {
+        let s = store();
+        let a = s.create_meeting("a", 1).unwrap();
+        let b = s.create_meeting_in("b", 2, "id").unwrap();
+        assert_eq!(s.get_meeting(a).unwrap().language, "auto");
+        assert_eq!(s.get_meeting(b).unwrap().language, "id");
+        s.set_language(a, "en").unwrap();
+        assert_eq!(s.get_meeting(a).unwrap().language, "en");
+    }
+
+    #[test]
+    fn migrates_a_database_from_before_the_language_column() {
+        let dir = std::env::temp_dir().join(format!("fs_store_migrate_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            // The schema exactly as the first release created it, with a meeting in it.
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE meetings (id INTEGER PRIMARY KEY, title TEXT NOT NULL, started_at INTEGER NOT NULL,
+                    ended_at INTEGER, notes TEXT NOT NULL DEFAULT '', enhanced TEXT NOT NULL DEFAULT '');
+                 INSERT INTO meetings (title, started_at, notes) VALUES ('old meeting', 5, 'kept notes');",
+            )
+            .unwrap();
+        }
+        let s = Store::open(&path).unwrap();
+        let m = s.get_meeting(1).unwrap();
+        assert_eq!((m.title.as_str(), m.notes.as_str(), m.language.as_str()), ("old meeting", "kept notes", "auto"));
+        // Opening again must be a no-op, not an error.
+        drop(s);
+        assert!(Store::open(&path).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

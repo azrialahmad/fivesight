@@ -50,6 +50,22 @@ impl Engine {
         Ok(Self { ctx })
     }
 
+    /// Probability Whisper assigns to each of `langs` (e.g. `["id", "en"]`) for this audio.
+    /// Unknown language codes score 0.
+    pub fn detect_among(&self, samples: &[f32], langs: &[&str]) -> Result<Vec<f32>, EngineError> {
+        let mut state = self.ctx.create_state()?;
+        state.pcm_to_mel(samples, 4)?;
+        let (_, probs) = state.lang_detect(0, 4)?;
+        Ok(langs
+            .iter()
+            .map(|l| {
+                whisper_rs::get_lang_id(l)
+                    .and_then(|i| probs.get(i as usize).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect())
+    }
+
     /// Transcribe 16 kHz mono f32 samples. `language`: `Some("id")`, `Some("en")`, or `None` to auto-detect.
     pub fn transcribe(
         &self,

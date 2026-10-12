@@ -105,7 +105,7 @@ fn live(secs: u64, lang: Option<String>) -> Result<()> {
     use std::time::{Duration, Instant};
 
     let mut cfg = PipelineConfig::new("models/ggml-large-v3-turbo.bin".into(), "models/silero_vad.onnx".into());
-    cfg.language = lang;
+    cfg.language = fs_stt::lang::LangMode::parse(lang.as_deref().unwrap_or("auto"));
     let (tx, rx) = std::sync::mpsc::channel();
     println!("loading models ...");
     let pipeline = Pipeline::start(cfg, tx)?;

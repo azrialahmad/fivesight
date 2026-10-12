@@ -19,6 +19,8 @@ export interface Meeting {
   endedAt: number | null;
   notes: string;
   enhanced: string;
+  /** What the speech recognizer expects: 'auto' (Indonesian + English), 'id' or 'en'. */
+  language: string;
 }
 
 export interface MeetingSummary {
@@ -49,13 +51,14 @@ export interface Hit {
 }
 
 export interface Settings {
-  provider: 'openrouter' | 'local';
+  provider: 'openrouter' | 'custom';
   openrouterModel: string;
   fallbackModel: string;
-  localUrl: string;
-  localModel: string;
+  customUrl: string;
+  customModel: string;
   language: string;
   hasKey: boolean;
+  hasCustomKey: boolean;
 }
 
 export interface Status {
@@ -84,8 +87,9 @@ type Off = () => void;
 
 export interface Api {
   status(): Promise<Status>;
-  /** Records into `meetingId` if given, otherwise creates a meeting. Returns the meeting id. */
-  startRecording(language: string, meetingId: number | null): Promise<number>;
+  /** Records into `meetingId` if given, otherwise creates a meeting; uses that meeting's language. */
+  startRecording(meetingId: number | null): Promise<number>;
+  setMeetingLanguage(id: number, language: string): Promise<void>;
   stopRecording(): Promise<void>;
   listMeetings(): Promise<MeetingSummary[]>;
   getMeeting(id: number): Promise<{ meeting: Meeting; transcript: StoredSeg[]; chat: ChatMsg[] }>;
@@ -109,7 +113,8 @@ export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in
 
 const tauriApi: Api = {
   status: () => invoke('get_status'),
-  startRecording: (language, meetingId) => invoke('start_recording', { language, meetingId }),
+  startRecording: (meetingId) => invoke('start_recording', { meetingId }),
+  setMeetingLanguage: (id, language) => invoke('set_meeting_language', { id, language }),
   stopRecording: () => invoke('stop_recording'),
   listMeetings: () => invoke('list_meetings'),
   getMeeting: (id) => invoke('get_meeting', { id }),
@@ -146,16 +151,17 @@ function createMockApi(): Api {
     provider: 'openrouter',
     openrouterModel: 'google/gemini-2.5-flash',
     fallbackModel: '',
-    localUrl: 'http://localhost:11434/v1',
-    localModel: 'gemma3',
+    customUrl: 'http://localhost:11434/v1',
+    customModel: 'gemma3',
     language: 'auto',
-    hasKey: false
+    hasKey: false,
+    hasCustomKey: false
   };
   const day = 86_400_000;
   const meetings: Meeting[] = [
-    { id: 3, title: 'Payments sync', startedAt: Date.now() - 2 * 3600_000, endedAt: Date.now() - 3600_000, notes: '- PAY-142 timeout\n- retry = 30s?\n- Budi owns fix, Fri', enhanced: '## PAY-142 checkout timeout\n\nThe retry logic **waits 30 seconds** before failing on staging.\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: add a regression test', },
-    { id: 2, title: 'Design review', startedAt: Date.now() - day, endedAt: Date.now() - day + 2400_000, notes: '', enhanced: '' },
-    { id: 1, title: 'Weekly planning', startedAt: Date.now() - 3 * day, endedAt: Date.now() - 3 * day + 3000_000, notes: '', enhanced: '' }
+    { id: 3, title: 'Payments sync', startedAt: Date.now() - 2 * 3600_000, endedAt: Date.now() - 3600_000, notes: '- PAY-142 timeout\n- retry = 30s?\n- Budi owns fix, Fri', enhanced: '## PAY-142 checkout timeout\n\nThe retry logic **waits 30 seconds** before failing on staging.\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: add a regression test', language: 'auto' },
+    { id: 2, title: 'Design review', startedAt: Date.now() - day, endedAt: Date.now() - day + 2400_000, notes: '', enhanced: '', language: 'auto' },
+    { id: 1, title: 'Weekly planning', startedAt: Date.now() - 3 * day, endedAt: Date.now() - 3 * day + 3000_000, notes: '', enhanced: '', language: 'auto' }
   ];
   const transcripts: Record<number, StoredSeg[]> = {
     3: [
@@ -179,14 +185,14 @@ function createMockApi(): Api {
     status: async () => ({ recording: recording !== null, recordingMeetingId: recording, modelsDir: null }),
     newMeeting: async () => {
       const id = nextId++;
-      meetings.unshift({ id, title: 'Untitled meeting', startedAt: Date.now(), endedAt: null, notes: '', enhanced: '' });
+      meetings.unshift({ id, title: 'Untitled meeting', startedAt: Date.now(), endedAt: null, notes: '', enhanced: '', language: 'auto' });
       return id;
     },
-    startRecording: async (_language, meetingId) => {
+    startRecording: async (meetingId) => {
       let id = meetingId;
       if (id === null) {
         id = nextId++;
-        meetings.unshift({ id, title: 'Untitled meeting', startedAt: Date.now(), endedAt: null, notes: '', enhanced: '' });
+        meetings.unshift({ id, title: 'Untitled meeting', startedAt: Date.now(), endedAt: null, notes: '', enhanced: '', language: 'auto' });
       }
       transcripts[id] ??= [];
       const rid = id;
@@ -241,7 +247,8 @@ function createMockApi(): Api {
         segs.filter((s) => s.text.toLowerCase().includes(q.toLowerCase())).map((s) => ({ meetingId: Number(id), meetingTitle: get(Number(id)).title, startMs: s.startMs, snippet: s.text }))
       ),
     getSettings: async () => ({ ...settings }),
-    saveSettings: async (s, key) => void (settings = { ...s, hasKey: key ? true : s.hasKey }),
+    saveSettings: async (s, key) => void (settings = { ...s, hasKey: key && s.provider === 'openrouter' ? true : settings.hasKey, hasCustomKey: key && s.provider === 'custom' ? true : settings.hasCustomKey }),
+    setMeetingLanguage: async (id, language) => void (get(id).language = language),
     openLivePanel: async () => {},
     onTranscript: (cb) => sub('transcript', cb),
     onRecording: (cb) => sub('recording', cb),

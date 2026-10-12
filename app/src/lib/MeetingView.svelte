@@ -12,6 +12,12 @@
   onMount(() => (timer = setInterval(() => (now = Date.now()), 500)));
   onDestroy(() => clearInterval(timer));
 
+  const languages: [string, string][] = [
+    ['auto', 'Indonesian + English'],
+    ['id', 'Indonesian only'],
+    ['en', 'English only']
+  ];
+
   const m = $derived(session.current!);
   const live = $derived(session.isRecordingCurrent);
   const elapsed = $derived(session.startedAt ? clock(now - session.startedAt) : '0:00');
@@ -48,6 +54,23 @@
     {/if}
 
     <div class="ml-auto flex items-center gap-2">
+      <label
+        class="relative flex items-center rounded-full border border-line text-[13px] font-medium focus-within:border-ink {live ? 'opacity-60' : 'hover:border-ink'}"
+        title={live ? 'Stop recording to change the language' : 'What language is this meeting in? Applies the next time you record.'}
+      >
+        <span class="sr-only">Meeting language</span>
+        <select
+          class="appearance-none rounded-full bg-transparent py-2 pl-4 pr-9 outline-none disabled:cursor-not-allowed"
+          value={m.language}
+          disabled={live}
+          onchange={(e) => session.setMeetingLanguage(e.currentTarget.value)}
+        >
+          {#each languages as [value, label]}
+            <option {value}>{label}</option>
+          {/each}
+        </select>
+        <span class="pointer-events-none absolute right-3 rotate-90 text-faint"><Icon name="chevron" size={16} /></span>
+      </label>
       <button
         class="flex items-center gap-2 rounded-full border px-4 py-2 text-[13px] font-medium {session.drawer ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}"
         onclick={() => (session.drawer = !session.drawer)}

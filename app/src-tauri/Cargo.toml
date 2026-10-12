@@ -22,3 +22,6 @@ tracing.workspace = true
 fs-audio = { path = "../../crates/fs-audio" }
 fs-stt = { path = "../../crates/fs-stt", features = ["engine"] }
 fs-pipeline = { path = "../../crates/fs-pipeline" }
+fs-store = { path = "../../crates/fs-store" }
+fs-llm = { path = "../../crates/fs-llm" }
+keyring = { version = "3", features = ["windows-native"] }
