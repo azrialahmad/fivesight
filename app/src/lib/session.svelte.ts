@@ -1,167 +1,249 @@
-import { invoke } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { api, inTauri } from './api';
+import type { ChatMsg, Hit, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
-export type Source = 'mic' | 'loopback';
+export { inTauri };
+export type View = 'home' | 'meeting' | 'settings';
 
-export interface Seg {
-  key: string;
-  source: Source;
-  id: number;
-  startMs: number;
-  text: string;
-  final: boolean;
-}
-
-interface TranscriptEvent {
-  source: Source;
-  kind: 'partial' | 'final';
-  segmentId: number;
-  startMs: number;
-  text: string;
-}
-
-interface Status {
-  recording: boolean;
-  modelsDir: string | null;
-}
-
-export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
-
-const LANG_KEY = 'fivesight.language';
-
-function loadLanguage(): string {
-  try {
-    return localStorage.getItem(LANG_KEY) ?? 'auto';
-  } catch {
-    return 'auto';
-  }
-}
+const DEFAULT_SETTINGS: Settings = {
+  provider: 'openrouter',
+  openrouterModel: 'google/gemini-2.5-flash',
+  fallbackModel: '',
+  localUrl: 'http://localhost:11434/v1',
+  localModel: 'gemma3',
+  language: 'auto',
+  hasKey: false
+};
 
 class Session {
+  view = $state<View>('home');
+  meetings = $state<MeetingSummary[]>([]);
+  current = $state<Meeting | null>(null);
   segs = $state<Seg[]>([]);
+  chat = $state<ChatMsg[]>([]);
+  settings = $state<Settings>({ ...DEFAULT_SETTINGS });
+
   recording = $state(false);
+  recordingMeetingId = $state<number | null>(null);
+  startedAt = $state<number | null>(null);
   busy = $state(false);
   error = $state<string | null>(null);
-  startedAt = $state<number | null>(null);
   modelsDir = $state<string | null>(null);
-  language = $state(loadLanguage());
 
-  /** Segments in time order. */
+  enhancing = $state(false);
+  enhancedLive = $state('');
+  asking = $state(false);
+  answerLive = $state('');
+
+  drawer = $state(false);
+  query = $state('');
+  hits = $state<Hit[]>([]);
+
   sorted = $derived([...this.segs].sort((a, b) => a.startMs - b.startMs));
+  isRecordingCurrent = $derived(this.recording && this.recordingMeetingId === this.current?.id);
 
-  private mockTimer: ReturnType<typeof setInterval> | null = null;
+  private notesTimer: ReturnType<typeof setTimeout> | null = null;
+  private ready = false;
 
   async init() {
-    if (!inTauri) return;
-    const s = await invoke<Status>('get_status');
-    this.recording = s.recording;
-    this.modelsDir = s.modelsDir;
-    await listen<TranscriptEvent>('transcript', (e) => this.ingest(e.payload));
-    await listen<boolean>('recording', (e) => {
-      this.recording = e.payload;
-      if (!e.payload) this.startedAt = null;
-    });
+    if (this.ready) return;
+    this.ready = true;
+    await Promise.all([
+      api.onTranscript((e) => this.ingest(e)),
+      api.onRecording((r) => {
+        this.recording = r;
+        if (!r) {
+          this.recordingMeetingId = null;
+          this.startedAt = null;
+          this.refreshMeetings();
+        }
+      }),
+      api.onEnhance((e) => this.onEnhance(e)),
+      api.onAsk((e) => this.onAsk(e))
+    ]);
+    const [status, settings] = await Promise.all([api.status(), api.getSettings()]);
+    this.recording = status.recording;
+    this.recordingMeetingId = status.recordingMeetingId;
+    this.modelsDir = status.modelsDir;
+    this.settings = settings;
+    await this.refreshMeetings();
+    if (status.recording && status.recordingMeetingId !== null) await this.openMeeting(status.recordingMeetingId);
   }
 
-  setLanguage(lang: string) {
-    this.language = lang;
+  async refreshMeetings() {
+    this.meetings = await api.listMeetings();
+  }
+
+  go(view: View) {
+    this.view = view;
+  }
+
+  async openMeeting(id: number) {
+    await this.flushNotes();
+    const { meeting, transcript, chat } = await api.getMeeting(id);
+    this.current = meeting;
+    this.segs = transcript.map(toSeg);
+    this.chat = chat;
+    this.answerLive = '';
+    this.enhancedLive = '';
+    this.drawer = false;
+    this.error = null;
+    this.view = 'meeting';
+  }
+
+  /** Create an empty meeting you can take notes in before (or without) recording. */
+  async newMeeting() {
+    const id = await api.newMeeting();
+    await this.refreshMeetings();
+    await this.openMeeting(id);
+  }
+
+  async startRecording() {
+    if (this.busy || this.recording) return;
+    this.busy = true;
+    this.error = null;
     try {
-      localStorage.setItem(LANG_KEY, lang);
-    } catch {
-      /* storage unavailable: keep in memory */
+      const id = await api.startRecording(this.settings.language, this.current && !this.current.endedAt ? this.current.id : null);
+      this.recording = true;
+      this.recordingMeetingId = id;
+      this.startedAt = Date.now();
+      await this.refreshMeetings();
+      if (this.current?.id !== id) await this.openMeeting(id);
+    } catch (e) {
+      this.error = String(e);
+    } finally {
+      this.busy = false;
     }
   }
 
-  ingest(ev: TranscriptEvent) {
+  async stopRecording() {
+    if (this.busy || !this.recording) return;
+    this.busy = true;
+    try {
+      await api.stopRecording();
+      this.recording = false;
+      this.recordingMeetingId = null;
+      this.startedAt = null;
+      await this.refreshMeetings();
+      if (this.current) this.current = (await api.getMeeting(this.current.id)).meeting;
+    } catch (e) {
+      this.error = String(e);
+    } finally {
+      this.busy = false;
+    }
+  }
+
+  private ingest(ev: TranscriptEvent) {
+    if (ev.meetingId !== this.current?.id) return;
     const key = `${ev.source}:${ev.segmentId}`;
     const final = ev.kind === 'final';
     const i = this.segs.findIndex((s) => s.key === key);
-    if (i === -1) {
-      this.segs.push({ key, source: ev.source, id: ev.segmentId, startMs: ev.startMs, text: ev.text, final });
-    } else if (!this.segs[i].final) {
+    if (i === -1) this.segs.push({ key, source: ev.source, id: ev.segmentId, startMs: ev.startMs, text: ev.text, final });
+    else if (!this.segs[i].final) {
       this.segs[i].text = ev.text;
       this.segs[i].final = final;
     }
   }
 
-  async start() {
-    if (this.busy || this.recording) return;
-    this.busy = true;
+  setNotes(text: string) {
+    if (!this.current) return;
+    this.current.notes = text;
+    if (this.notesTimer) clearTimeout(this.notesTimer);
+    this.notesTimer = setTimeout(() => this.flushNotes(), 600);
+  }
+
+  async flushNotes() {
+    if (this.notesTimer) clearTimeout(this.notesTimer);
+    this.notesTimer = null;
+    if (this.current) await api.setNotes(this.current.id, this.current.notes).catch(() => {});
+  }
+
+  async rename(title: string) {
+    if (!this.current) return;
+    const t = title.trim() || 'Untitled meeting';
+    this.current.title = t;
+    await api.renameMeeting(this.current.id, t);
+    this.refreshMeetings();
+  }
+
+  async remove(id: number) {
+    await api.deleteMeeting(id);
+    if (this.current?.id === id) {
+      this.current = null;
+      this.view = 'home';
+    }
+    await this.refreshMeetings();
+  }
+
+  async enhance() {
+    if (!this.current || this.enhancing) return;
+    await this.flushNotes();
+    this.enhancing = true;
+    this.enhancedLive = '';
     this.error = null;
     try {
-      if (inTauri) {
-        await invoke('start_recording', { language: this.language });
-      } else {
-        this.startMock();
-      }
-      this.recording = true;
-      this.startedAt = Date.now();
+      await api.enhance(this.current.id);
     } catch (e) {
+      this.enhancing = false;
       this.error = String(e);
-    } finally {
-      this.busy = false;
     }
   }
 
-  async stop() {
-    if (this.busy || !this.recording) return;
-    this.busy = true;
+  private onEnhance(e: StreamEvent) {
+    if (e.meetingId !== this.current?.id) return;
+    if (e.error) {
+      this.enhancing = false;
+      this.error = e.error;
+    } else if (e.done) {
+      this.enhancing = false;
+      if (this.current) this.current.enhanced = this.enhancedLive;
+      this.enhancedLive = '';
+    } else this.enhancedLive += e.delta;
+  }
+
+  async ask(question: string) {
+    const q = question.trim();
+    if (!q || this.asking) return;
+    this.chat.push({ role: 'user', content: q });
+    this.asking = true;
+    this.answerLive = '';
+    this.error = null;
     try {
-      if (inTauri) await invoke('stop_recording');
-      else this.stopMock();
-      this.recording = false;
-      this.startedAt = null;
+      await api.ask(this.current?.id ?? null, q);
     } catch (e) {
+      this.asking = false;
       this.error = String(e);
-    } finally {
-      this.busy = false;
     }
   }
 
-  clear() {
-    this.segs = [];
+  private onAsk(e: StreamEvent) {
+    if (e.meetingId !== (this.current?.id ?? null)) return;
+    if (e.error) {
+      this.asking = false;
+      this.error = e.error;
+    } else if (e.done) {
+      this.asking = false;
+      this.chat.push({ role: 'assistant', content: this.answerLive });
+      this.answerLive = '';
+    } else this.answerLive += e.delta;
   }
 
-  async openLivePanel() {
-    if (inTauri) await invoke('open_live_panel');
+  async runSearch(q: string) {
+    this.query = q;
+    this.hits = q.trim().length < 2 ? [] : await api.search(q.trim());
   }
 
-  /** Scripted conversation so the UI can be previewed in a plain browser. */
-  private startMock() {
-    const script: [Source, string][] = [
-      ['loopback', 'Good morning everyone. Let us start with the status of ticket PAY-142.'],
-      ['mic', 'Thanks. I reproduced it on staging yesterday, the retry waits thirty seconds.'],
-      ['loopback', 'Can you update the Confluence page with the root cause?'],
-      ['mic', 'Sure, I will also add a regression test and share the pull request.']
-    ];
-    let line = 0;
-    let word = 0;
-    let t = 0;
-    this.mockTimer = setInterval(() => {
-      const [source, text] = script[line % script.length];
-      const words = text.split(' ');
-      word++;
-      const id = Math.floor(line) + 1;
-      const done = word >= words.length;
-      this.ingest({
-        source,
-        kind: done ? 'final' : 'partial',
-        segmentId: id,
-        startMs: t,
-        text: words.slice(0, word).join(' ')
-      });
-      if (done) {
-        line++;
-        word = 0;
-        t += 6000;
-      }
-    }, 280);
+  async saveSettings(s: Settings, apiKey: string | null) {
+    await api.saveSettings(s, apiKey);
+    this.settings = await api.getSettings();
   }
 
-  private stopMock() {
-    if (this.mockTimer) clearInterval(this.mockTimer);
-    this.mockTimer = null;
+  openLivePanel() {
+    return api.openLivePanel();
   }
+}
+
+function toSeg(s: StoredSeg): Seg {
+  return { key: `${s.source}:${s.segId}`, source: s.source, id: s.segId, startMs: s.startMs, text: s.text, final: true };
 }
 
 export const session = new Session();
