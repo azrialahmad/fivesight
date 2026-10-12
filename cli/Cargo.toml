@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-engine = ["fs-stt/engine"]
+engine = ["fs-stt/engine", "dep:fs-pipeline"]
 cuda = ["engine", "fs-stt/cuda"]
 
 [dependencies]
@@ -19,3 +19,4 @@ fs-atlassian = { path = "../crates/fs-atlassian" }
 hound = "3.5.1"
 fs-audio = { path = "../crates/fs-audio" }
 fs-vad = { path = "../crates/fs-vad" }
+fs-pipeline = { path = "../crates/fs-pipeline", optional = true }

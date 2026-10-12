@@ -1,0 +1,11 @@
+[package]
+name = "fs-pipeline"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+fs-audio = { path = "../fs-audio" }
+fs-vad = { path = "../fs-vad", features = ["silero"] }
+fs-stt = { path = "../fs-stt", features = ["engine"] }

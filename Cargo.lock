@@ -179,6 +179,7 @@ dependencies = [
  "anyhow",
  "fs-atlassian",
  "fs-audio",
+ "fs-pipeline",
  "fs-stt",
  "fs-vad",
  "hound",
@@ -246,6 +247,17 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
+name = "fs-pipeline"
+version = "0.1.0"
+dependencies = [
+ "fs-audio",
+ "fs-stt",
+ "fs-vad",
  "thiserror",
  "tracing",
 ]

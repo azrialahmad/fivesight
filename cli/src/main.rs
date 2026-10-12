@@ -97,9 +97,46 @@ fn capture(secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Live transcription of mic ("me") and system audio ("others") for `secs` seconds.
+/// Nothing is recorded to disk; transcripts only print to the console.
+#[cfg(feature = "engine")]
+fn live(secs: u64, lang: Option<String>) -> Result<()> {
+    use fs_pipeline::{Kind, Pipeline, PipelineConfig};
+    use std::time::{Duration, Instant};
+
+    let mut cfg = PipelineConfig::new("models/ggml-large-v3-turbo.bin".into(), "models/silero_vad.onnx".into());
+    cfg.language = lang;
+    let (tx, rx) = std::sync::mpsc::channel();
+    println!("loading models ...");
+    let pipeline = Pipeline::start(cfg, tx)?;
+    println!("listening for {secs}s. '..' = partial, '>>' = final, 'xx' = filtered out\n");
+
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(secs) {
+        let Ok(ev) = rx.recv_timeout(Duration::from_millis(100)) else { continue };
+        let who = match ev.source {
+            fs_audio::Source::Mic => "me    ",
+            fs_audio::Source::Loopback => "others",
+        };
+        let t = format!("{:>5.1}s", ev.start_ms as f32 / 1000.0);
+        match (&ev.dropped, ev.kind) {
+            (Some(why), _) => println!("xx {who} {t} #{} [{why}] {}", ev.segment_id, ev.text),
+            (None, Kind::Partial) => println!(".. {who} {t} #{} {}", ev.segment_id, ev.text),
+            (None, Kind::Final) => println!(">> {who} {t} #{} {}", ev.segment_id, ev.text),
+        }
+    }
+    println!("\ndropped frames: {}", pipeline.dropped_frames());
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        #[cfg(feature = "engine")]
+        Some("live") => live(
+            args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30),
+            args.get(3).filter(|l| l.as_str() != "auto").cloned(),
+        ),
         Some("capture") => capture(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6)),
         #[cfg(feature = "engine")]
         Some("bench") => {

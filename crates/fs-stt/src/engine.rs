@@ -18,6 +18,24 @@ pub struct Segment {
     pub end_ms: i64,
     pub text: String,
     pub no_speech_prob: f32,
+    /// Mean log-probability of the text tokens (special tokens excluded).
+    pub avg_logprob: f32,
+}
+
+fn avg_logprob(seg: &whisper_rs::WhisperSegment) -> f32 {
+    let (mut sum, mut n) = (0.0f32, 0u32);
+    for i in 0..seg.n_tokens() {
+        let Some(tok) = seg.get_token(i) else { continue };
+        let is_special = tok
+            .to_str_lossy()
+            .map(|t| t.starts_with("[_") || t.starts_with("<|"))
+            .unwrap_or(true);
+        if !is_special {
+            sum += tok.token_data().plog;
+            n += 1;
+        }
+    }
+    if n == 0 { 0.0 } else { sum / n as f32 }
 }
 
 pub struct Engine {
@@ -66,6 +84,7 @@ impl Engine {
                 end_ms: seg.end_timestamp() * 10,
                 text: seg.to_str_lossy()?.trim().to_string(),
                 no_speech_prob: seg.no_speech_probability(),
+                avg_logprob: avg_logprob(&seg),
             });
         }
         Ok(out)
