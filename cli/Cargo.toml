@@ -1,0 +1,13 @@
+[package]
+name = "fivesight-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "fivesight-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+fs-stt = { path = "../crates/fs-stt" }
+fs-atlassian = { path = "../crates/fs-atlassian" }

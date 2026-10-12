@@ -1,0 +1,7 @@
+target/
+node_modules/
+dist/
+*.ggml
+*.onnx
+models/
+.env
