@@ -7,6 +7,9 @@
 
 use std::collections::VecDeque;
 
+#[cfg(feature = "silero")]
+pub mod silero;
+
 /// Samples per frame. Silero VAD at 16 kHz expects 512 (32 ms).
 pub const FRAME: usize = 512;
 pub const SAMPLE_RATE: usize = 16_000;
