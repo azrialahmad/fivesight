@@ -51,9 +51,56 @@ fn bench(model: &str, wav: &str, lang: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Capture both streams for `secs` seconds and print the level per second.
+/// Levels only: no audio is saved.
+fn capture(secs: u64) -> Result<()> {
+    use fs_audio::{rms, Capture, Source};
+    use std::sync::mpsc::sync_channel;
+    use std::time::{Duration, Instant};
+
+    let (mic_tx, mic_rx) = sync_channel(256);
+    let (out_tx, out_rx) = sync_channel(256);
+    let mic = Capture::start(Source::Mic, mic_tx)?;
+    let out = Capture::start(Source::Loopback, out_tx)?;
+    println!("mic      : {}\nloopback : {}", mic.device_name, out.device_name);
+    println!("capturing {secs}s (talk, and play some audio) ...\n");
+
+    let frames_per_sec = fs_audio::SAMPLE_RATE as usize / fs_audio::FRAME;
+    let (mut mic_buf, mut out_buf) = (Vec::new(), Vec::new());
+    let (mut mic_total, mut out_total) = (0usize, 0usize);
+    let start = Instant::now();
+    let mut next_report = 1;
+    while start.elapsed() < Duration::from_secs(secs) {
+        for f in mic_rx.try_iter() {
+            mic_total += 1;
+            mic_buf.extend(f);
+        }
+        for f in out_rx.try_iter() {
+            out_total += 1;
+            out_buf.extend(f);
+        }
+        if start.elapsed() >= Duration::from_secs(next_report) {
+            println!("t={next_report:>2}s  mic rms {:.4}   loopback rms {:.4}", rms(&mic_buf), rms(&out_buf));
+            mic_buf.clear();
+            out_buf.clear();
+            next_report += 1;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!(
+        "\nframes: mic {mic_total} (expect ~{}), loopback {out_total} (expect ~{}); dropped: mic {}, loopback {}",
+        secs as usize * frames_per_sec,
+        secs as usize * frames_per_sec,
+        mic.dropped_frames(),
+        out.dropped_frames()
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("capture") => capture(args.get(2).and_then(|s| s.parse().ok()).unwrap_or(6)),
         #[cfg(feature = "engine")]
         Some("bench") => {
             let (Some(model), Some(wav)) = (args.get(2), args.get(3)) else {

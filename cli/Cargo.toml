@@ -17,3 +17,5 @@ anyhow.workspace = true
 fs-stt = { path = "../crates/fs-stt" }
 fs-atlassian = { path = "../crates/fs-atlassian" }
 hound = "3.5.1"
+fs-audio = { path = "../crates/fs-audio" }
+fs-vad = { path = "../crates/fs-vad" }
