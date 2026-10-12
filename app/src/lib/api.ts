@@ -51,14 +51,13 @@ export interface Hit {
 }
 
 export interface Settings {
-  provider: 'openrouter' | 'custom';
-  openrouterModel: string;
+  /** Any OpenAI-compatible server (OpenRouter, OpenAI, Groq, Ollama, a company gateway...). */
+  baseUrl: string;
+  model: string;
   fallbackModel: string;
-  customUrl: string;
-  customModel: string;
   language: string;
+  /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
   hasKey: boolean;
-  hasCustomKey: boolean;
 }
 
 export interface Status {
@@ -102,6 +101,10 @@ export interface Api {
   search(query: string): Promise<Hit[]>;
   getSettings(): Promise<Settings>;
   saveSettings(s: Settings, apiKey: string | null): Promise<void>;
+  keySaved(baseUrl: string): Promise<boolean>;
+  forgetKey(baseUrl: string): Promise<void>;
+  /** Sends a one-word request with the form's values; resolves with a message or rejects with a fix. */
+  testLlm(s: Settings, apiKey: string | null): Promise<string>;
   openLivePanel(): Promise<void>;
   onTranscript(cb: (e: TranscriptEvent) => void): Promise<Off>;
   onRecording(cb: (recording: boolean) => void): Promise<Off>;
@@ -127,6 +130,9 @@ const tauriApi: Api = {
   search: (query) => invoke('search', { query }),
   getSettings: () => invoke('get_settings'),
   saveSettings: (settings, apiKey) => invoke('save_settings', { settings, apiKey }),
+  keySaved: (baseUrl) => invoke('key_saved', { baseUrl }),
+  forgetKey: (baseUrl) => invoke('forget_key', { baseUrl }),
+  testLlm: (settings, apiKey) => invoke('test_llm', { settings, apiKey }),
   openLivePanel: () => invoke('open_live_panel'),
   onTranscript: (cb) => listen<TranscriptEvent>('transcript', (e) => cb(e.payload)),
   onRecording: (cb) => listen<boolean>('recording', (e) => cb(e.payload)),
@@ -148,15 +154,13 @@ function createMockApi(): Api {
   let recording: number | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let settings: Settings = {
-    provider: 'openrouter',
-    openrouterModel: 'google/gemini-2.5-flash',
+    baseUrl: 'https://openrouter.ai/api/v1',
+    model: 'google/gemini-2.5-flash',
     fallbackModel: '',
-    customUrl: 'http://localhost:11434/v1',
-    customModel: 'gemma3',
     language: 'auto',
-    hasKey: false,
-    hasCustomKey: false
+    hasKey: false
   };
+  const keys = new Set<string>();
   const day = 86_400_000;
   const meetings: Meeting[] = [
     { id: 3, title: 'Payments sync', startedAt: Date.now() - 2 * 3600_000, endedAt: Date.now() - 3600_000, notes: '- PAY-142 timeout\n- retry = 30s?\n- Budi owns fix, Fri', enhanced: '## PAY-142 checkout timeout\n\nThe retry logic **waits 30 seconds** before failing on staging.\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: add a regression test', language: 'auto' },
@@ -247,7 +251,16 @@ function createMockApi(): Api {
         segs.filter((s) => s.text.toLowerCase().includes(q.toLowerCase())).map((s) => ({ meetingId: Number(id), meetingTitle: get(Number(id)).title, startMs: s.startMs, snippet: s.text }))
       ),
     getSettings: async () => ({ ...settings }),
-    saveSettings: async (s, key) => void (settings = { ...s, hasKey: key && s.provider === 'openrouter' ? true : settings.hasKey, hasCustomKey: key && s.provider === 'custom' ? true : settings.hasCustomKey }),
+    saveSettings: async (s, key) => {
+      if (key) keys.add(s.baseUrl.trim());
+      settings = { ...s, hasKey: keys.has(s.baseUrl.trim()) };
+    },
+    keySaved: async (baseUrl) => keys.has(baseUrl.trim()),
+    forgetKey: async (baseUrl) => void keys.delete(baseUrl.trim()),
+    testLlm: async (s, key) => {
+      if (!key && !keys.has(s.baseUrl.trim()) && !/localhost|127\.0\.0\.1/.test(s.baseUrl)) throw 'The server needs an API key. Paste yours and try again.';
+      return 'Connected. ' + s.model + ' replied: ok';
+    },
     setMeetingLanguage: async (id, language) => void (get(id).language = language),
     openLivePanel: async () => {},
     onTranscript: (cb) => sub('transcript', cb),

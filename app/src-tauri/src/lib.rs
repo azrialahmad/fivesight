@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 const KEYRING_SERVICE: &str = "fivesight";
-/// Credential Manager entries: one key per provider so switching doesn't lose either.
-const KEY_OPENROUTER: &str = "openrouter";
-const KEY_CUSTOM: &str = "custom";
+/// Credential Manager entries from before keys were stored per server (see `key_slot`).
+const LEGACY_KEY_OPENROUTER: &str = "openrouter";
+const LEGACY_KEY_CUSTOM: &str = "custom";
+const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
 
 fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -34,46 +35,79 @@ fn err<E: std::fmt::Display>(e: E) -> String {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
-    /// "openrouter" or "custom" (any OpenAI-compatible server). Older files say "local".
-    provider: String,
-    openrouter_model: String,
+    /// Any OpenAI-compatible server: OpenRouter, OpenAI, Groq, Ollama, a company gateway...
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    model: String,
     fallback_model: String,
-    #[serde(alias = "localUrl")]
-    custom_url: String,
-    #[serde(alias = "localModel")]
-    custom_model: String,
     /// Language given to new meetings: "auto", "id" or "en". Each meeting can override it.
     language: String,
-    /// Filled in on read; never persisted (keys live in Windows Credential Manager).
+    /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
-    #[serde(default)]
-    has_custom_key: bool,
+    // Fields from before the provider was generalised. Read once to migrate, never written back.
+    #[serde(default, skip_serializing)]
+    provider: Option<String>,
+    #[serde(default, skip_serializing)]
+    openrouter_model: Option<String>,
+    #[serde(default, skip_serializing, alias = "localUrl")]
+    custom_url: Option<String>,
+    #[serde(default, skip_serializing, alias = "localModel")]
+    custom_model: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            provider: "openrouter".into(),
-            openrouter_model: "google/gemini-2.5-flash".into(),
+            base_url: OPENROUTER_URL.into(),
+            model: "google/gemini-2.5-flash".into(),
             fallback_model: String::new(),
-            custom_url: "http://localhost:11434/v1".into(),
-            custom_model: "gemma3".into(),
             language: "auto".into(),
             has_key: false,
-            has_custom_key: false,
+            provider: None,
+            openrouter_model: None,
+            custom_url: None,
+            custom_model: None,
         }
     }
 }
 
 impl Settings {
-    /// Settings files from before the provider was renamed say "local".
-    fn normalized(mut self) -> Self {
-        if self.provider == "local" {
-            self.provider = "custom".into();
+    /// Fold the old provider/openrouterModel/customUrl shape into `base_url` + `model`.
+    /// Returns the migrated settings and the legacy key slot that belonged to them, if any.
+    fn migrated(mut self) -> (Self, Option<&'static str>) {
+        let mut legacy_slot = None;
+        if self.base_url.trim().is_empty() {
+            match self.provider.as_deref() {
+                Some("custom") | Some("local") => {
+                    self.base_url = self.custom_url.clone().unwrap_or_default();
+                    self.model = self.custom_model.clone().unwrap_or_default();
+                    legacy_slot = Some(LEGACY_KEY_CUSTOM);
+                }
+                _ => {
+                    self.base_url = OPENROUTER_URL.into();
+                    self.model = self.openrouter_model.clone().unwrap_or_else(|| Settings::default().model);
+                    legacy_slot = Some(LEGACY_KEY_OPENROUTER);
+                }
+            }
         }
-        self
+        self.provider = None;
+        self.openrouter_model = None;
+        self.custom_url = None;
+        self.custom_model = None;
+        (self, legacy_slot)
     }
+}
+
+/// The Credential Manager entry for a server: one key per host, so each provider keeps its own
+/// and a key is never sent to a server it wasn't saved for.
+fn key_slot(base_url: &str) -> String {
+    let t = base_url.trim();
+    let rest = t.split_once("://").map_or(t, |(_, r)| r);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = host.rsplit('@').next().unwrap_or(host);
+    format!("key:{}", host.to_ascii_lowercase())
 }
 
 struct Recording {
@@ -109,21 +143,24 @@ fn stored_key(user: &str) -> Option<String> {
     keyring::Entry::new(KEYRING_SERVICE, user).ok()?.get_password().ok().filter(|k| !k.trim().is_empty())
 }
 
+fn build_config(s: &Settings, key: Option<String>) -> Result<LlmConfig, String> {
+    let url = s.base_url.trim();
+    if url.is_empty() || s.model.trim().is_empty() {
+        return Err("Set the server address and model name in Settings, under AI model.".into());
+    }
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err("The server address must start with http:// or https://.".into());
+    }
+    // The key is optional: local servers don't need one, hosted services do.
+    let mut cfg = LlmConfig::custom(url, key, &s.model);
+    cfg.fallback_model = Some(s.fallback_model.trim().to_string()).filter(|m| !m.is_empty());
+    Ok(cfg)
+}
+
 fn llm_config(state: &AppState) -> Result<LlmConfig, String> {
     let s = lock(&state.settings).clone();
-    let fallback = Some(s.fallback_model.trim().to_string()).filter(|m| !m.is_empty());
-    let mut cfg = if s.provider == "custom" {
-        if s.custom_url.trim().is_empty() || s.custom_model.trim().is_empty() {
-            return Err("Set the server address and model name in Settings, under AI model.".into());
-        }
-        // The key is optional: local servers don't need one, hosted services do.
-        LlmConfig::custom(&s.custom_url, stored_key(KEY_CUSTOM), &s.custom_model)
-    } else {
-        let key = stored_key(KEY_OPENROUTER).ok_or("Add your OpenRouter API key in Settings, under AI model.")?;
-        LlmConfig::openrouter(key, &s.openrouter_model)
-    };
-    cfg.fallback_model = fallback;
-    Ok(cfg)
+    let key = stored_key(&key_slot(&s.base_url));
+    build_config(&s, key)
 }
 
 fn lines(transcript: &[Segment]) -> Vec<prompts::Line> {
@@ -407,26 +444,55 @@ async fn ask(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>
 #[tauri::command]
 fn get_settings(state: State<'_, AppState>) -> Settings {
     let mut s = lock(&state.settings).clone();
-    s.has_key = stored_key(KEY_OPENROUTER).is_some();
-    s.has_custom_key = stored_key(KEY_CUSTOM).is_some();
+    s.has_key = stored_key(&key_slot(&s.base_url)).is_some();
     s
 }
 
-/// `api_key` is saved for whichever provider is being saved; the other provider's key is kept.
+/// Whether a key is saved for this server (the settings form asks while you type the address).
+#[tauri::command]
+fn key_saved(base_url: String) -> bool {
+    stored_key(&key_slot(&base_url)).is_some()
+}
+
+#[tauri::command]
+fn forget_key(base_url: String) -> Result<(), String> {
+    match keyring::Entry::new(KEYRING_SERVICE, &key_slot(&base_url)).map_err(err)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Couldn't remove the key: {e}")),
+    }
+}
+
+/// `api_key` is saved for the server address being saved; keys for other servers are kept.
 #[tauri::command]
 fn save_settings(state: State<'_, AppState>, settings: Settings, api_key: Option<String>) -> Result<(), String> {
-    let mut to_store = settings.normalized();
+    let (mut to_store, _) = settings.migrated();
+    to_store.base_url = to_store.base_url.trim().to_string();
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        let slot = if to_store.provider == "custom" { KEY_CUSTOM } else { KEY_OPENROUTER };
-        keyring::Entry::new(KEYRING_SERVICE, slot)
+        keyring::Entry::new(KEYRING_SERVICE, &key_slot(&to_store.base_url))
             .and_then(|e| e.set_password(key.trim()))
             .map_err(|e| format!("Couldn't save the key to Windows Credential Manager: {e}"))?;
     }
     to_store.has_key = false;
-    to_store.has_custom_key = false;
     std::fs::write(&state.settings_path, serde_json::to_string_pretty(&to_store).map_err(err)?).map_err(err)?;
     *lock(&state.settings) = to_store;
     Ok(())
+}
+
+/// Try the model with a one-word request, using the form's values (a typed key wins over a saved one).
+/// Nothing is saved.
+#[tauri::command]
+async fn test_llm(settings: Settings, api_key: Option<String>) -> Result<String, String> {
+    let (s, _) = settings.migrated();
+    let typed = api_key.filter(|k| !k.trim().is_empty());
+    let key = typed.or_else(|| stored_key(&key_slot(&s.base_url)));
+    let key_sent = key.is_some();
+    let mut cfg = build_config(&s, key)?;
+    cfg.fallback_model = None;
+    let msgs = [Message::user("Reply with the single word: ok")];
+    match chat_stream(&cfg, &msgs, |_| {}).await {
+        Ok(reply) => Ok(format!("Connected. {} replied: {}", cfg.model, reply.trim().chars().take(60).collect::<String>())),
+        Err(e) => Err(e.user_message(key_sent)),
+    }
 }
 
 // ---------- windows ----------
@@ -456,11 +522,26 @@ pub fn run() {
             std::fs::create_dir_all(&dir)?;
             let store = Store::open(&dir.join("fivesight.db"))?;
             let settings_path = dir.join("settings.json");
-            let settings = std::fs::read_to_string(&settings_path)
-                .ok()
-                .and_then(|t| serde_json::from_str::<Settings>(&t).ok())
-                .map(Settings::normalized)
-                .unwrap_or_default();
+            let loaded = std::fs::read_to_string(&settings_path).ok().and_then(|t| serde_json::from_str::<Settings>(&t).ok());
+            let settings = match loaded {
+                Some(old) => {
+                    let (settings, legacy_slot) = old.migrated();
+                    if let Some(slot) = legacy_slot {
+                        // Carry the old key over to the per-server slot, then rewrite the file in the new shape.
+                        let new_slot = key_slot(&settings.base_url);
+                        if stored_key(&new_slot).is_none() {
+                            if let Some(k) = stored_key(slot) {
+                                let _ = keyring::Entry::new(KEYRING_SERVICE, &new_slot).and_then(|e| e.set_password(&k));
+                            }
+                        }
+                        if let Ok(json) = serde_json::to_string_pretty(&settings) {
+                            let _ = std::fs::write(&settings_path, json);
+                        }
+                    }
+                    settings
+                }
+                None => Settings::default(),
+            };
             app.manage(AppState {
                 store: Mutex::new(store),
                 recording: Mutex::new(None),
@@ -485,8 +566,80 @@ pub fn run() {
             ask,
             get_settings,
             save_settings,
+            key_saved,
+            forget_key,
+            test_llm,
             open_live_panel
         ])
         .run(tauri::generate_context!())
         .expect("error while running fivesight");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> Settings {
+        serde_json::from_str(json).expect("settings json")
+    }
+
+    #[test]
+    fn key_slot_is_per_host() {
+        assert_eq!(key_slot("https://openrouter.ai/api/v1"), "key:openrouter.ai");
+        assert_eq!(key_slot(" HTTPS://API.OpenAI.com/v1/ "), "key:api.openai.com");
+        assert_eq!(key_slot("http://localhost:11434/v1"), "key:localhost:11434");
+        assert_eq!(key_slot("https://user:pw@gw.example.com/x?y=1"), "key:gw.example.com");
+        assert_ne!(key_slot("http://localhost:11434/v1"), key_slot("http://localhost:1234/v1"));
+    }
+
+    #[test]
+    fn migrates_old_openrouter_settings() {
+        let old = parse(
+            r#"{"provider":"openrouter","openrouterModel":"anthropic/claude-sonnet-4.5","fallbackModel":"","customUrl":"http://x/v1","customModel":"m","language":"id"}"#,
+        );
+        let (s, slot) = old.migrated();
+        assert_eq!(s.base_url, OPENROUTER_URL);
+        assert_eq!(s.model, "anthropic/claude-sonnet-4.5");
+        assert_eq!(s.language, "id");
+        assert_eq!(slot, Some(LEGACY_KEY_OPENROUTER));
+    }
+
+    #[test]
+    fn migrates_old_custom_and_local_settings() {
+        for provider in ["custom", "local"] {
+            let json = format!(
+                r#"{{"provider":"{provider}","openrouterModel":"a","fallbackModel":"f","localUrl":"https://gw.example.com/v1","localModel":"gpt-x","language":"auto"}}"#
+            );
+            let (s, slot) = parse(&json).migrated();
+            assert_eq!(s.base_url, "https://gw.example.com/v1");
+            assert_eq!(s.model, "gpt-x");
+            assert_eq!(s.fallback_model, "f");
+            assert_eq!(slot, Some(LEGACY_KEY_CUSTOM));
+        }
+    }
+
+    #[test]
+    fn new_shape_is_left_alone_and_legacy_fields_are_not_written() {
+        let (s, slot) = parse(r#"{"baseUrl":"https://api.groq.com/openai/v1","model":"llama","fallbackModel":"","language":"en"}"#).migrated();
+        assert_eq!(slot, None);
+        assert_eq!(s.base_url, "https://api.groq.com/openai/v1");
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(!out.contains("provider") && !out.contains("customUrl") && !out.contains("openrouterModel"));
+    }
+
+    #[test]
+    fn build_config_validates_and_keeps_the_key_for_that_server() {
+        let mut s = Settings { base_url: "https://api.openai.com/v1/chat/completions".into(), model: "gpt-4o-mini".into(), ..Settings::default() };
+        let cfg = build_config(&s, Some("sk-test".into())).unwrap();
+        assert_eq!(cfg.base_url, "https://api.openai.com/v1");
+        assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));
+
+        s.base_url = "api.openai.com/v1".into();
+        assert!(build_config(&s, None).is_err());
+        s.base_url = String::new();
+        assert!(build_config(&s, None).is_err());
+        s.base_url = "http://localhost:11434/v1".into();
+        s.model = " ".into();
+        assert!(build_config(&s, None).is_err());
+    }
 }

@@ -5,14 +5,11 @@ export { inTauri };
 export type View = 'home' | 'meeting' | 'settings';
 
 const DEFAULT_SETTINGS: Settings = {
-  provider: 'openrouter',
-  openrouterModel: 'google/gemini-2.5-flash',
+  baseUrl: 'https://openrouter.ai/api/v1',
+  model: 'google/gemini-2.5-flash',
   fallbackModel: '',
-  customUrl: 'http://localhost:11434/v1',
-  customModel: 'gemma3',
   language: 'auto',
-  hasKey: false,
-  hasCustomKey: false
+  hasKey: false
 };
 
 class Session {
