@@ -1,5 +1,5 @@
 import { api, inTauri } from './api';
-import type { ChatMsg, Hit, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
+import type { CallEvent, ChatMsg, Hit, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
 export { inTauri };
 export type View = 'home' | 'meeting' | 'settings';
@@ -32,6 +32,9 @@ class Session {
   asking = $state(false);
   answerLive = $state('');
 
+  /** A Meet call the extension saw start (offer to record) or end (offer to stop). */
+  callPrompt = $state<CallEvent | null>(null);
+
   drawer = $state(false);
   query = $state('');
   hits = $state<Hit[]>([]);
@@ -55,6 +58,7 @@ class Session {
           this.refreshMeetings();
         }
       }),
+      api.onCall((e) => this.onCall(e)),
       api.onEnhance((e) => this.onEnhance(e)),
       api.onAsk((e) => this.onAsk(e))
     ]);
@@ -95,13 +99,35 @@ class Session {
     await this.openMeeting(id);
   }
 
-  async startRecording() {
+  private onCall(e: CallEvent) {
+    if (e.state === 'joined') this.callPrompt = this.recording ? null : e;
+    else this.callPrompt = this.recording ? e : null;
+  }
+
+  dismissCall() {
+    this.callPrompt = null;
+  }
+
+  /** Start from the "call detected" prompt: always a new meeting, named after the call if it has a name. */
+  async startFromCall() {
+    const title = this.callPrompt?.title ?? null;
+    this.callPrompt = null;
+    await this.startRecording(true);
+    if (title && this.recording && this.current?.title === 'Untitled meeting') await this.rename(title);
+  }
+
+  async stopFromCall() {
+    this.callPrompt = null;
+    await this.stopRecording();
+  }
+
+  async startRecording(fresh = false) {
     if (this.busy || this.recording) return;
     this.busy = true;
     this.error = null;
     try {
       // Record into the meeting that's open (also when continuing a finished one).
-      const id = await api.startRecording(this.view === 'meeting' ? (this.current?.id ?? null) : null);
+      const id = await api.startRecording(!fresh && this.view === 'meeting' ? (this.current?.id ?? null) : null);
       this.recording = true;
       this.recordingMeetingId = id;
       this.startedAt = Date.now();
@@ -136,10 +162,11 @@ class Session {
     const key = `${ev.source}:${ev.segmentId}`;
     const final = ev.kind === 'final';
     const i = this.segs.findIndex((s) => s.key === key);
-    if (i === -1) this.segs.push({ key, source: ev.source, id: ev.segmentId, startMs: ev.startMs, text: ev.text, final });
+    if (i === -1) this.segs.push({ key, source: ev.source, id: ev.segmentId, startMs: ev.startMs, text: ev.text, final, speaker: ev.speaker ?? null });
     else if (!this.segs[i].final) {
       this.segs[i].text = ev.text;
       this.segs[i].final = final;
+      this.segs[i].speaker = ev.speaker ?? this.segs[i].speaker;
     }
   }
 
@@ -253,7 +280,7 @@ class Session {
 }
 
 function toSeg(s: StoredSeg): Seg {
-  return { key: `${s.source}:${s.segId}`, source: s.source, id: s.segId, startMs: s.startMs, text: s.text, final: true };
+  return { key: `${s.source}:${s.segId}`, source: s.source, id: s.segId, startMs: s.startMs, text: s.text, final: true, speaker: s.speaker ?? null };
 }
 
 export const session = new Session();

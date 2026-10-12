@@ -94,6 +94,8 @@ pub struct Segment {
     pub seg_id: i64,
     pub start_ms: i64,
     pub text: String,
+    /// Participant name from the Meet extension, when known. Only set for other people.
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,6 +146,14 @@ impl Store {
         )?;
         if has_language == 0 {
             conn.execute_batch("ALTER TABLE meetings ADD COLUMN language TEXT NOT NULL DEFAULT 'auto'")?;
+        }
+        let has_speaker: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name = 'speaker'",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_speaker == 0 {
+            conn.execute_batch("ALTER TABLE segments ADD COLUMN speaker TEXT")?;
         }
         Ok(Self { conn })
     }
@@ -243,19 +253,32 @@ impl Store {
     }
 
     pub fn add_segment(&self, meeting_id: i64, source: &str, seg_id: i64, start_ms: i64, text: &str) -> Result<()> {
+        self.add_segment_by(meeting_id, source, seg_id, start_ms, text, None)
+    }
+
+    /// Like add_segment, with the speaker's name when the Meet extension supplied one.
+    pub fn add_segment_by(
+        &self,
+        meeting_id: i64,
+        source: &str,
+        seg_id: i64,
+        start_ms: i64,
+        text: &str,
+        speaker: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO segments (meeting_id, source, seg_id, start_ms, text) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![meeting_id, source, seg_id, start_ms, text],
+            "INSERT INTO segments (meeting_id, source, seg_id, start_ms, text, speaker) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![meeting_id, source, seg_id, start_ms, text, speaker],
         )?;
         Ok(())
     }
 
     pub fn transcript(&self, meeting_id: i64) -> Result<Vec<Segment>> {
         let mut st = self.conn.prepare(
-            "SELECT source, seg_id, start_ms, text FROM segments WHERE meeting_id = ?1 ORDER BY start_ms, id",
+            "SELECT source, seg_id, start_ms, text, speaker FROM segments WHERE meeting_id = ?1 ORDER BY start_ms, id",
         )?;
         let rows = st.query_map(params![meeting_id], |r| {
-            Ok(Segment { source: r.get(0)?, seg_id: r.get(1)?, start_ms: r.get(2)?, text: r.get(3)? })
+            Ok(Segment { source: r.get(0)?, seg_id: r.get(1)?, start_ms: r.get(2)?, text: r.get(3)?, speaker: r.get(4)? })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -329,6 +352,33 @@ mod tests {
         let t = s.transcript(id).unwrap();
         assert_eq!(t.iter().map(|x| x.text.as_str()).collect::<Vec<_>>(), ["first", "second"]);
         assert_eq!(s.list_meetings().unwrap()[0].segment_count, 2);
+    }
+
+    #[test]
+    fn speaker_names_are_stored_and_old_databases_gain_the_column() {
+        let s = store();
+        let id = s.create_meeting("m", 0).unwrap();
+        s.add_segment_by(id, "loopback", 1, 1000, "hello", Some("Budi")).unwrap();
+        s.add_segment(id, "mic", 2, 2000, "hi").unwrap();
+        let t = s.transcript(id).unwrap();
+        assert_eq!(t[0].speaker.as_deref(), Some("Budi"));
+        assert_eq!(t[1].speaker, None);
+
+        // A database from before the column existed.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meetings (id INTEGER PRIMARY KEY, title TEXT NOT NULL, started_at INTEGER NOT NULL, ended_at INTEGER, notes TEXT NOT NULL DEFAULT '', enhanced TEXT NOT NULL DEFAULT '');
+             CREATE TABLE segments (id INTEGER PRIMARY KEY, meeting_id INTEGER NOT NULL, source TEXT NOT NULL, seg_id INTEGER NOT NULL, start_ms INTEGER NOT NULL, text TEXT NOT NULL);
+             INSERT INTO meetings (title, started_at) VALUES ('old', 1);
+             INSERT INTO segments (meeting_id, source, seg_id, start_ms, text) VALUES (1, 'mic', 1, 0, 'before');",
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let t = s.transcript(1).unwrap();
+        assert_eq!(t[0].text, "before");
+        assert_eq!(t[0].speaker, None);
+        s.add_segment_by(1, "loopback", 2, 5, "after", Some("Sari")).unwrap();
+        assert_eq!(s.transcript(1).unwrap()[1].speaker.as_deref(), Some("Sari"));
     }
 
     #[test]

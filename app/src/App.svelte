@@ -54,7 +54,28 @@
     </div>
   </aside>
 
-  <main class="my-3 mr-3 min-w-0 flex-1 overflow-hidden rounded-3xl border border-line bg-card">
+  <main class="relative my-3 mr-3 min-w-0 flex-1 overflow-hidden rounded-3xl border border-line bg-card">
+    {#if session.callPrompt}
+      {@const c = session.callPrompt}
+      <div class="rise absolute right-5 top-5 z-30 w-80 rounded-2xl border border-line bg-card p-4 shadow-[0_12px_40px_-12px_rgba(0,0,0,0.3)]" role="alert">
+        <p class="text-sm font-semibold">{c.state === 'joined' ? 'Google Meet call detected' : 'The call has ended'}</p>
+        <p class="mt-0.5 text-[13px] leading-snug text-muted">
+          {#if c.state === 'joined'}
+            {c.title ? c.title + '. ' : ''}Start taking notes? Tell everyone you're transcribing.
+          {:else}
+            Stop recording and write up the notes?
+          {/if}
+        </p>
+        <div class="mt-3 flex gap-2">
+          {#if c.state === 'joined'}
+            <button class="rounded-full bg-ink px-4 py-2 text-[13px] font-semibold text-white" onclick={() => session.startFromCall()}>Start recording</button>
+          {:else}
+            <button class="rounded-full bg-rec px-4 py-2 text-[13px] font-semibold text-white" onclick={() => session.stopFromCall()}>Stop recording</button>
+          {/if}
+          <button class="rounded-full px-4 py-2 text-[13px] font-medium text-muted hover:bg-soft" onclick={() => session.dismissCall()}>Not now</button>
+        </div>
+      </div>
+    {/if}
     {#if session.view === 'meeting' && session.current}
       <MeetingView />
     {:else if session.view === 'settings'}

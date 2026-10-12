@@ -26,16 +26,17 @@
   <ul class="flex flex-col {compact ? 'gap-4' : 'gap-5'}" aria-live="polite">
     {#each rows as r (r.key)}
       {@const me = r.source === 'mic'}
+      {@const who = me ? 'You' : (r.speaker ?? 'Others')}
       <li class="rise flex gap-3">
         <span
           class="grid shrink-0 place-items-center rounded-full font-semibold {compact ? 'h-7 w-7 text-[11px]' : 'h-8 w-8 text-xs'} {me
             ? 'bg-lime text-ink'
             : 'bg-soft text-ink'}"
-          aria-hidden="true">{me ? 'Y' : 'O'}</span
+          aria-hidden="true">{who.charAt(0).toUpperCase()}</span
         >
         <div class="min-w-0 flex-1">
           <div class="flex items-baseline gap-2">
-            <span class="text-xs font-semibold">{me ? 'You' : 'Others'}</span>
+            <span class="text-xs font-semibold">{who}</span>
             <span class="text-[11px] tabular-nums text-faint">{clock(r.startMs)}</span>
           </div>
           <p class="mt-0.5 {compact ? 'text-[13px]' : 'text-sm'} leading-relaxed {r.final ? 'text-ink' : 'text-muted'}">

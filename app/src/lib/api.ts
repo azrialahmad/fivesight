@@ -10,6 +10,8 @@ export interface Seg {
   startMs: number;
   text: string;
   final: boolean;
+  /** Participant name from the Meet extension, for what other people said. */
+  speaker?: string | null;
 }
 
 export interface Meeting {
@@ -36,6 +38,7 @@ export interface StoredSeg {
   segId: number;
   startMs: number;
   text: string;
+  speaker?: string | null;
 }
 
 export interface ChatMsg {
@@ -73,6 +76,23 @@ export interface TranscriptEvent {
   startMs: number;
   text: string;
   meetingId: number;
+  speaker?: string | null;
+}
+
+export interface BridgeStatus {
+  port: number;
+  /** Pairing code the browser extension asks for. */
+  token: string;
+  /** The extension has been heard from recently. */
+  connected: boolean;
+  inCall: boolean;
+  callTitle: string | null;
+  error: string | null;
+}
+
+export interface CallEvent {
+  state: 'joined' | 'left';
+  title: string | null;
 }
 
 export interface StreamEvent {
@@ -106,6 +126,8 @@ export interface Api {
   /** Sends a one-word request with the form's values; resolves with a message or rejects with a fix. */
   testLlm(s: Settings, apiKey: string | null): Promise<string>;
   openLivePanel(): Promise<void>;
+  getBridge(): Promise<BridgeStatus>;
+  onCall(cb: (e: CallEvent) => void): Promise<Off>;
   onTranscript(cb: (e: TranscriptEvent) => void): Promise<Off>;
   onRecording(cb: (recording: boolean) => void): Promise<Off>;
   onEnhance(cb: (e: StreamEvent) => void): Promise<Off>;
@@ -134,6 +156,8 @@ const tauriApi: Api = {
   forgetKey: (baseUrl) => invoke('forget_key', { baseUrl }),
   testLlm: (settings, apiKey) => invoke('test_llm', { settings, apiKey }),
   openLivePanel: () => invoke('open_live_panel'),
+  getBridge: () => invoke('get_bridge'),
+  onCall: (cb) => listen<CallEvent>('call', (e) => cb(e.payload)),
   onTranscript: (cb) => listen<TranscriptEvent>('transcript', (e) => cb(e.payload)),
   onRecording: (cb) => listen<boolean>('recording', (e) => cb(e.payload)),
   onEnhance: (cb) => listen<StreamEvent>('enhance-delta', (e) => cb(e.payload)),
@@ -263,6 +287,8 @@ function createMockApi(): Api {
     },
     setMeetingLanguage: async (id, language) => void (get(id).language = language),
     openLivePanel: async () => {},
+    getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: false, inCall: false, callTitle: null, error: null }),
+    onCall: (cb) => sub('call', cb),
     onTranscript: (cb) => sub('transcript', cb),
     onRecording: (cb) => sub('recording', cb),
     onEnhance: (cb) => sub('enhance-delta', cb),

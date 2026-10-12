@@ -24,4 +24,6 @@ fs-stt = { path = "../../crates/fs-stt", features = ["engine"] }
 fs-pipeline = { path = "../../crates/fs-pipeline" }
 fs-store = { path = "../../crates/fs-store" }
 fs-llm = { path = "../../crates/fs-llm" }
+fs-bridge = { path = "../../crates/fs-bridge" }
+getrandom = "0.3"
 keyring = { version = "3", features = ["windows-native"] }

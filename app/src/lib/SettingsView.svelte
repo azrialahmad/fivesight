@@ -2,7 +2,8 @@
   import Icon from './Icon.svelte';
   import { session, inTauri } from './session.svelte';
   import { api } from './api';
-  import type { Settings } from './api';
+  import type { BridgeStatus, Settings } from './api';
+  import { onMount } from 'svelte';
 
   let form = $state<Settings>({ ...session.settings });
   let apiKey = $state('');
@@ -25,6 +26,28 @@
     });
     return () => (stale = true);
   });
+
+  let bridge = $state<BridgeStatus | null>(null);
+  let copied = $state(false);
+  let showToken = $state(false);
+
+  onMount(() => {
+    const poll = () => api.getBridge().then((b) => (bridge = b)).catch(() => {});
+    poll();
+    const t = setInterval(poll, 3000);
+    return () => clearInterval(t);
+  });
+
+  async function copyToken() {
+    if (!bridge) return;
+    try {
+      await navigator.clipboard.writeText(bridge.token);
+      copied = true;
+      setTimeout(() => (copied = false), 1500);
+    } catch {
+      showToken = true;
+    }
+  }
 
   const languages: [string, string][] = [
     ['auto', 'Indonesian + English (switches per sentence)'],
@@ -184,6 +207,41 @@
       <p class="mt-3 text-xs text-muted">
         {isLocal ? 'Nothing leaves this PC.' : 'Meeting text is sent to this server when you enhance notes or ask a question.'}
       </p>
+    </section>
+
+    <section>
+      <h2 class="font-semibold">Google Meet</h2>
+      <p class="mt-0.5 text-sm text-muted">
+        The fivesight browser extension tells the app who is talking, so the transcript shows names instead of "Others". It also lets fivesight offer to record when you join a call. It never sends audio or video, and it shows nothing on the Meet page.
+      </p>
+      <div class="mt-3 flex items-center gap-2 text-sm">
+        {#if bridge?.error}
+          <span class="h-2 w-2 rounded-full bg-rec"></span><span class="text-rec">{bridge.error}</span>
+        {:else if bridge?.connected}
+          <span class="h-2 w-2 rounded-full bg-lime-deep"></span><span class="font-medium">Extension connected{bridge.inCall ? ' · in a call' : ''}</span>
+        {:else}
+          <span class="h-2 w-2 rounded-full bg-faint"></span><span class="text-muted">Extension not connected</span>
+        {/if}
+      </div>
+      <ol class="mt-3 list-decimal space-y-1 pl-5 text-sm text-muted">
+        <li>In Chrome, open <span class="font-medium text-ink">chrome://extensions</span>, turn on Developer mode, and choose Load unpacked.</li>
+        <li>Pick the <span class="font-medium text-ink">extension</span> folder from the fivesight project.</li>
+        <li>Open the extension's icon, paste the pairing code below, and press Connect.</li>
+      </ol>
+      <div class="mt-3 flex items-center gap-2">
+        <input
+          class="{field} mt-0 flex-1 font-mono text-xs"
+          readonly
+          type={showToken ? 'text' : 'password'}
+          value={bridge?.token ?? ''}
+          aria-label="Pairing code"
+          onfocus={() => (showToken = true)}
+        />
+        <button class="shrink-0 rounded-full border border-line px-4 py-2.5 text-[13px] font-medium hover:border-ink" onclick={copyToken}>
+          {copied ? 'Copied' : 'Copy code'}
+        </button>
+      </div>
+      <p class="mt-1.5 text-xs text-muted">Only your browser extension can use this code. It stays on this PC.</p>
     </section>
 
     <section>

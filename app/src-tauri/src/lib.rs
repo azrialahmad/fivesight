@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fs_audio::Source;
+use fs_bridge::{Bridge, CallState, Incoming, SpeakerLog};
 use fs_llm::{chat_stream, prompts, LlmConfig, Message};
 use fs_pipeline::{Kind, Pipeline, PipelineConfig, TranscriptEvent};
 use fs_stt::lang::LangMode;
@@ -121,6 +122,107 @@ struct AppState {
     recording: Mutex<Option<Recording>>,
     settings: Mutex<Settings>,
     settings_path: PathBuf,
+    /// What the Meet extension reports: who is speaking, and whether a call is on.
+    meet: Mutex<MeetState>,
+}
+
+#[derive(Default)]
+struct MeetState {
+    speakers: SpeakerLog,
+    /// Pairing secret the extension must present.
+    token: String,
+    port: u16,
+    /// Why the local endpoint couldn't start, if it couldn't.
+    error: Option<String>,
+    last_seen: i64,
+    in_call: bool,
+    call_title: Option<String>,
+}
+
+/// Extension events older than this mean the browser isn't sending any (tab closed, extension off).
+const MEET_STALE_MS: i64 = 45_000;
+
+fn pairing_token() -> String {
+    if let Some(t) = stored_key("bridge-token") {
+        return t;
+    }
+    let mut bytes = [0u8; 16];
+    if getrandom::fill(&mut bytes).is_err() {
+        let n = now_ms() as u128 * 0x9E37_79B9_7F4A_7C15;
+        bytes.copy_from_slice(&n.to_le_bytes());
+    }
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let _ = keyring::Entry::new(KEYRING_SERVICE, "bridge-token").and_then(|e| e.set_password(&token));
+    token
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallEvent {
+    state: &'static str,
+    title: Option<String>,
+}
+
+fn handle_meet_event(app: &AppHandle, ev: Incoming) {
+    let st = app.state::<AppState>();
+    let now = now_ms();
+    let mut call: Option<CallEvent> = None;
+    {
+        let mut meet = lock(&st.meet);
+        meet.last_seen = now;
+        match ev {
+            Incoming::Hello => {}
+            Incoming::Speaking { name, speaking, at } => {
+                // Trust the browser's clock only if it agrees with ours; otherwise use ours.
+                let at = if (at - now).abs() < 5_000 { at } else { now };
+                meet.speakers.apply(&name, speaking, at);
+            }
+            Incoming::Call { state, title, .. } => match state {
+                CallState::Joined => {
+                    if !meet.in_call {
+                        call = Some(CallEvent { state: "joined", title: title.clone() });
+                    }
+                    meet.in_call = true;
+                    meet.call_title = title;
+                }
+                CallState::Left => {
+                    if meet.in_call {
+                        call = Some(CallEvent { state: "left", title: meet.call_title.clone() });
+                    }
+                    meet.in_call = false;
+                    meet.speakers.stop_all(now);
+                }
+            },
+        }
+    }
+    if let Some(c) = call {
+        let _ = app.emit("call", c);
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BridgeStatus {
+    port: u16,
+    token: String,
+    /// The extension has been heard from recently.
+    connected: bool,
+    in_call: bool,
+    call_title: Option<String>,
+    error: Option<String>,
+}
+
+#[tauri::command]
+fn get_bridge(state: State<'_, AppState>) -> BridgeStatus {
+    let m = lock(&state.meet);
+    BridgeStatus {
+        port: m.port,
+        token: m.token.clone(),
+        connected: m.error.is_none() && now_ms() - m.last_seen < MEET_STALE_MS,
+        in_call: m.in_call && now_ms() - m.last_seen < MEET_STALE_MS,
+        call_title: m.call_title.clone(),
+        error: m.error.clone(),
+    }
 }
 
 /// Where the speech models live. Order: `FIVESIGHT_MODELS`, `%LOCALAPPDATA%\fivesight\models`,
@@ -167,7 +269,11 @@ fn lines(transcript: &[Segment]) -> Vec<prompts::Line> {
     transcript
         .iter()
         .map(|s| prompts::Line {
-            speaker: if s.source == "mic" { "You".into() } else { "Others".into() },
+            speaker: match (s.source.as_str(), &s.speaker) {
+                ("mic", _) => "You".into(),
+                (_, Some(name)) => name.clone(),
+                _ => "Others".into(),
+            },
             start_ms: s.start_ms.max(0) as u64,
             text: s.text.clone(),
         })
@@ -265,6 +371,8 @@ struct TranscriptPayload<'a> {
     #[serde(flatten)]
     ev: &'a TranscriptEvent,
     meeting_id: i64,
+    /// Who was speaking, from the Meet extension. Only for what other people said.
+    speaker: Option<String>,
 }
 
 #[tauri::command]
@@ -283,7 +391,7 @@ async fn start_recording(
 
     // Reuse the meeting or create one. Times in the transcript are measured from when the
     // meeting was created, and segment ids continue after any earlier recording in it.
-    let (mid, offset_ms, seg_base, language) = {
+    let (mid, offset_ms, seg_base, language, meeting_started) = {
         let st = lock(&state.store);
         let id = match meeting_id {
             Some(id) => {
@@ -294,7 +402,7 @@ async fn start_recording(
         };
         let meeting = st.get_meeting(id).map_err(err)?;
         let base = st.transcript(id).map_err(err)?.iter().map(|s| s.seg_id).max().unwrap_or(0);
-        (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language)
+        (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language, meeting.started_at)
     };
     let mut cfg = PipelineConfig::new(dir.join("ggml-large-v3-turbo.bin"), dir.join("silero_vad.onnx"));
     cfg.language = LangMode::parse(&language);
@@ -316,18 +424,35 @@ async fn start_recording(
             }
             ev.start_ms += offset_ms;
             ev.segment_id += seg_base;
+            // Other people's lines get the name of whoever Meet showed as speaking meanwhile.
+            let speaker = match ev.source {
+                Source::Loopback => {
+                    let st = forward.state::<AppState>();
+                    let wall_start = meeting_started + ev.start_ms as i64;
+                    let found = lock(&st.meet).speakers.speaker_for(wall_start, now_ms());
+                    found
+                }
+                Source::Mic => None,
+            };
             if ev.kind == Kind::Final && !ev.text.trim().is_empty() {
                 let source = match ev.source {
                     Source::Mic => "mic",
                     Source::Loopback => "loopback",
                 };
                 let st = forward.state::<AppState>();
-                let saved = lock(&st.store).add_segment(mid, source, ev.segment_id as i64, ev.start_ms as i64, &ev.text);
+                let saved = lock(&st.store).add_segment_by(
+                    mid,
+                    source,
+                    ev.segment_id as i64,
+                    ev.start_ms as i64,
+                    &ev.text,
+                    speaker.as_deref(),
+                );
                 if let Err(e) = saved {
                     tracing::error!("saving transcript line: {e}");
                 }
             }
-            let _ = forward.emit("transcript", &TranscriptPayload { ev: &ev, meeting_id: mid });
+            let _ = forward.emit("transcript", &TranscriptPayload { ev: &ev, meeting_id: mid, speaker });
         }
     });
     let _ = app.emit("recording", true);
@@ -547,7 +672,31 @@ pub fn run() {
                 recording: Mutex::new(None),
                 settings: Mutex::new(settings),
                 settings_path,
+                meet: Mutex::new(MeetState::default()),
             });
+
+            // The Meet extension reports speaker names here. Failing to listen is not fatal.
+            let token = pairing_token();
+            let handle = app.handle().clone();
+            let started = Bridge::start(fs_bridge::DEFAULT_PORT, token.clone(), move |ev| handle_meet_event(&handle, ev));
+            {
+                let st = app.state::<AppState>();
+                let mut meet = lock(&st.meet);
+                meet.token = token;
+                meet.port = fs_bridge::DEFAULT_PORT;
+                match started {
+                    Ok(b) => {
+                        app.manage(b);
+                    }
+                    Err(e) => {
+                        tracing::warn!("meet bridge: {e}");
+                        meet.error = Some(format!(
+                            "Couldn't listen on port {}. Another program may be using it. ({e})",
+                            fs_bridge::DEFAULT_PORT
+                        ));
+                    }
+                }
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -566,6 +715,7 @@ pub fn run() {
             ask,
             get_settings,
             save_settings,
+            get_bridge,
             key_saved,
             forget_key,
             test_llm,
