@@ -119,6 +119,9 @@ export interface KbAddResult {
 export interface AtlassianStatus {
   installed: boolean;
   jiraSite: string | null;
+  /** confluence-cli and Node are installed. */
+  confluenceCli: boolean;
+  /** confluence-cli is set up and answered. */
   confluence: boolean;
 }
 
@@ -382,7 +385,7 @@ function createMockApi(): Api {
     onAskSources: (cb) => sub('ask-sources', cb),
     atlassianStatus: async () => {
       await new Promise((r) => setTimeout(r, 400));
-      return { installed: true, jiraSite: 'yourcompany.atlassian.net', confluence: false };
+      return { installed: true, jiraSite: 'yourcompany.atlassian.net', confluenceCli: true, confluence: false };
     },
     onAskLookup: (cb) => sub('ask-lookup', cb),
     getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: false, inCall: false, callTitle: null, error: null }),
