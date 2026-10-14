@@ -85,63 +85,6 @@ fn tidy(t: &str) -> String {
     out.trim().to_string()
 }
 
-/// Strip HTML to text, keeping line breaks at block elements. Enough for Confluence page bodies.
-pub fn html_to_text(html: &str) -> String {
-    let mut out = String::new();
-    let mut tag = String::new();
-    let mut in_tag = false;
-    let mut skip = false; // inside <script> or <style>
-    for c in html.chars() {
-        match (in_tag, c) {
-            (false, '<') => {
-                in_tag = true;
-                tag.clear();
-            }
-            (true, '>') => {
-                in_tag = false;
-                let name: String = tag
-                    .trim_start_matches('/')
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric())
-                    .collect::<String>()
-                    .to_ascii_lowercase();
-                if name == "script" || name == "style" {
-                    skip = !tag.starts_with('/');
-                }
-                let closing = tag.starts_with('/');
-                let block = matches!(
-                    name.as_str(),
-                    "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "table"
-                );
-                // Break after a block ends (and at <br>), not at both ends, to avoid blank lines.
-                if (block && closing) || name == "br" {
-                    out.push('\n');
-                }
-                if name == "li" && !tag.starts_with('/') {
-                    out.push_str("- ");
-                }
-                if (name == "td" || name == "th") && tag.starts_with('/') {
-                    out.push_str(" | ");
-                }
-            }
-            (true, c) => tag.push(c),
-            (false, c) if !skip => out.push(c),
-            _ => {}
-        }
-    }
-    let decoded = out
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&rsquo;", "'")
-        .replace("&ldquo;", "\"")
-        .replace("&rdquo;", "\"")
-        .replace("&amp;", "&");
-    tidy(&decoded)
-}
-
 fn issue_line(i: &Value) -> String {
     let f = i.get("fields").unwrap_or(&Value::Null);
     let key = s(i, &["key"]).unwrap_or("?");
@@ -210,23 +153,6 @@ pub fn format_issue(v: &Value) -> String {
     out
 }
 
-/// A Confluence page: title, then the body as text.
-pub fn format_page(v: &Value) -> String {
-    let title = s(v, &["title"]).unwrap_or("(untitled page)");
-    let body = s(v, &["body", "view", "value"])
-        .or_else(|| s(v, &["body", "storage", "value"]))
-        .or_else(|| s(v, &["body", "export_view", "value"]))
-        .map(html_to_text)
-        .unwrap_or_default();
-    let mut out = format!("Confluence page: {title}");
-    if let Some(space) = s(v, &["spaceId"]) {
-        out.push_str(&format!(" (space {space})"));
-    }
-    out.push_str("\n\n");
-    out.push_str(if body.is_empty() { "(no readable body)" } else { &body });
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,17 +212,5 @@ mod tests {
         assert!(!t.contains("note 2") && t.contains("note 3") && t.contains("note 7"), "{t}");
         let empty = format_issue(&json!({"key": "X-1", "fields": {"summary": "s", "description": null}}));
         assert!(empty.contains("Description:\n(none)"));
-    }
-
-    #[test]
-    fn confluence_html_becomes_text() {
-        let v = json!({"title": "Payments runbook", "body": {"view": {"value":
-            "<h1>Retries</h1><p>Wait&nbsp;30&nbsp;s &amp; then fail.</p><ul><li>Page on-call</li><li>Post in #incidents</li></ul><script>x()</script><table><tr><td>a</td><td>b</td></tr></table>"}}});
-        let t = format_page(&v);
-        assert!(t.starts_with("Confluence page: Payments runbook"), "{t}");
-        assert!(t.contains("Retries\nWait 30 s & then fail."), "{t}");
-        assert!(t.contains("- Page on-call") && t.contains("- Post in #incidents"), "{t}");
-        assert!(!t.contains("x()") && !t.contains('<'), "{t}");
-        assert!(t.contains("a | b |"), "{t}");
     }
 }
