@@ -11,6 +11,8 @@ const DEFAULT_SETTINGS: Settings = {
   language: 'auto',
   atlassian: true,
   autoNotes: true,
+  speechModel: 'large-v3-turbo',
+  setupDone: true,
   hasKey: false
 };
 
@@ -59,6 +61,9 @@ class Session {
   /** Jira/Confluence reads made for the latest answer. */
   lookups = $state<AskLookup[]>([]);
 
+  /** The first-run setup is showing (on first start, or from Settings → Run setup). */
+  setupOpen = $state(false);
+
   drawer = $state(false);
   query = $state('');
   hits = $state<Hit[]>([]);
@@ -99,13 +104,18 @@ class Session {
         if (this.view === 'knowledge') this.addFiles(paths);
       }),
       api.onEnhance((e) => this.onEnhance(e)),
-      api.onAsk((e) => this.onAsk(e))
+      api.onAsk((e) => this.onAsk(e)),
+      // A download started in setup can finish after setup closes.
+      api.onModelDownload(async (e) => {
+        if (e.done) this.modelsDir = (await api.status()).modelsDir;
+      })
     ]);
     const [status, settings] = await Promise.all([api.status(), api.getSettings()]);
     this.recording = status.recording;
     this.recordingMeetingId = status.recordingMeetingId;
     this.modelsDir = status.modelsDir;
     this.settings = settings;
+    if (!settings.setupDone) this.setupOpen = true;
     await Promise.all([this.refreshMeetings(), this.loadKb()]);
     if (status.recording && status.recordingMeetingId !== null) {
       this.recordingStarted();
@@ -435,6 +445,17 @@ class Session {
   async saveSettings(s: Settings, apiKey: string | null) {
     await api.saveSettings(s, apiKey);
     this.settings = await api.getSettings();
+  }
+
+  openSetup() {
+    this.setupOpen = true;
+  }
+
+  /** Save what the setup chose and close it. Also used to skip it (with the current settings). */
+  async finishSetup(s: Settings, apiKey: string | null) {
+    await this.saveSettings({ ...s, setupDone: true }, apiKey);
+    this.modelsDir = (await api.status()).modelsDir;
+    this.setupOpen = false;
   }
 
   openLivePanel() {

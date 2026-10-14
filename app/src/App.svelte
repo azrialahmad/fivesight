@@ -5,6 +5,7 @@
   import MeetingView from './lib/MeetingView.svelte';
   import SettingsView from './lib/SettingsView.svelte';
   import KnowledgeView from './lib/KnowledgeView.svelte';
+  import Setup from './lib/Setup.svelte';
   import { session, inTauri } from './lib/session.svelte';
 
   onMount(() => session.init());
@@ -12,6 +13,11 @@
   const nav = 'flex w-full items-center gap-3 rounded-full px-4 py-2.5 text-left text-sm transition-colors';
 </script>
 
+{#if session.setupOpen}
+  <div class="h-full p-3">
+    <div class="h-full overflow-hidden rounded-3xl border border-line bg-card"><Setup /></div>
+  </div>
+{:else}
 <div class="flex h-full">
   <aside class="flex w-56 shrink-0 flex-col px-3 py-4">
     <button class="flex items-center gap-2.5 px-3 pb-5 pt-1" onclick={() => session.go('home')} aria-label="fivesight home">
@@ -91,3 +97,4 @@
     {/if}
   </main>
 </div>
+{/if}

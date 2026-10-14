@@ -16,6 +16,8 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 
 mod logging;
 mod lookups;
+mod models;
+mod system;
 
 const KEYRING_SERVICE: &str = "fivesight";
 /// Credential Manager entries from before keys were stored per server (see `key_slot`).
@@ -58,6 +60,12 @@ struct Settings {
     /// Keep the AI notes up to date on their own while recording (one AI request every minute or so).
     #[serde(default = "enabled")]
     auto_notes: bool,
+    /// Which Whisper model to transcribe with (an id from `models::SPEECH_MODELS`).
+    #[serde(default = "default_speech_model")]
+    speech_model: String,
+    /// The first-run setup was finished (or skipped); it opens on start until then.
+    #[serde(default)]
+    setup_done: bool,
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
@@ -81,6 +89,8 @@ impl Default for Settings {
             language: "auto".into(),
             atlassian: true,
             auto_notes: true,
+            speech_model: default_speech_model(),
+            setup_done: false,
             has_key: false,
             provider: None,
             openrouter_model: None,
@@ -125,6 +135,10 @@ fn auto_language() -> String {
     "auto".into()
 }
 
+fn default_speech_model() -> String {
+    models::DEFAULT_SPEECH_MODEL.into()
+}
+
 /// The Credential Manager entry for a server: one key per host, so each provider keeps its own
 /// and a key is never sent to a server it wasn't saved for.
 fn key_slot(base_url: &str) -> String {
@@ -148,6 +162,9 @@ struct AppState {
     settings_path: PathBuf,
     /// Set when `settings.json` couldn't be read at startup; Settings shows it until the next save.
     settings_notice: Mutex<Option<String>>,
+    /// A model download is running, and the flag that stops it.
+    downloading: std::sync::atomic::AtomicBool,
+    download_cancel: std::sync::atomic::AtomicBool,
     /// What the Meet extension reports: who is speaking, and whether a call is on.
     meet: Mutex<MeetState>,
     /// Last known acli login state; refreshed when Settings opens.
@@ -255,16 +272,16 @@ fn get_bridge(state: State<'_, AppState>) -> BridgeStatus {
 
 /// Where the speech models live. Order: `FIVESIGHT_MODELS`, `%LOCALAPPDATA%\fivesight\models`,
 /// then the repo's `models/` folder (development).
-fn models_dir() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(p) = std::env::var("FIVESIGHT_MODELS") {
-        candidates.push(PathBuf::from(p));
-    }
-    if let Ok(p) = std::env::var("LOCALAPPDATA") {
-        candidates.push(PathBuf::from(p).join("fivesight").join("models"));
-    }
-    candidates.push(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models")));
-    candidates.into_iter().find(|d| d.join("ggml-large-v3-turbo.bin").exists() && d.join("silero_vad.onnx").exists())
+/// The chosen Whisper model and the voice-activity model, if both are on disk.
+fn model_paths(s: &Settings) -> Result<(PathBuf, PathBuf), String> {
+    let chosen = models::speech_model(&s.speech_model)
+        .ok_or_else(|| format!("Unknown speech model \"{}\". Choose one in Settings → Run setup.", s.speech_model))?;
+    let whisper = models::find(&chosen.file).ok_or_else(|| {
+        format!("The speech model ({}) isn't downloaded yet. Open Settings → Run setup to get it.", chosen.label)
+    })?;
+    let vad = models::find(&models::VAD)
+        .ok_or("The voice detection model isn't downloaded yet. Open Settings → Run setup to get it.")?;
+    Ok((whisper, vad))
 }
 
 fn stored_key(user: &str) -> Option<String> {
@@ -322,7 +339,9 @@ fn get_status(state: State<'_, AppState>) -> Status {
     Status {
         recording: rec.is_some(),
         recording_meeting_id: rec.as_ref().map(|r| r.meeting_id),
-        models_dir: models_dir().map(|p| p.display().to_string()),
+        models_dir: model_paths(&lock(&state.settings))
+            .ok()
+            .and_then(|(w, _)| w.parent().map(|p| p.display().to_string())),
     }
 }
 
@@ -406,9 +425,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
     if lock(&state.recording).is_some() {
         return Err("Already recording.".into());
     }
-    let dir = models_dir().ok_or(
-        "Speech models not found. Put ggml-large-v3-turbo.bin and silero_vad.onnx in %LOCALAPPDATA%\\fivesight\\models.",
-    )?;
+    let (whisper_path, vad_path) = model_paths(&lock(&state.settings))?;
     let default_language = lock(&state.settings).language.clone();
 
     // Reuse the meeting or create one. Times in the transcript are measured from when the
@@ -426,7 +443,8 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
         let base = st.transcript(id).map_err(err)?.iter().map(|s| s.seg_id).max().unwrap_or(0);
         (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language, meeting.started_at)
     };
-    let mut cfg = PipelineConfig::new(dir.join("ggml-large-v3-turbo.bin"), dir.join("silero_vad.onnx"));
+    tracing::info!("recording with {}", whisper_path.display());
+    let mut cfg = PipelineConfig::new(whisper_path, vad_path);
     cfg.language = LangMode::parse(&language);
 
     let (tx, rx) = std::sync::mpsc::channel::<TranscriptEvent>();
@@ -762,6 +780,9 @@ fn save_settings(state: State<'_, AppState>, settings: Settings, api_key: Option
     to_store.base_url = to_store.base_url.trim().to_string();
     to_store.model = to_store.model.trim().to_string();
     to_store.fallback_model = to_store.fallback_model.trim().to_string();
+    if models::speech_model(&to_store.speech_model).is_none() {
+        return Err(format!("Unknown speech model \"{}\".", to_store.speech_model));
+    }
     for (field, value) in [("Model", &to_store.model), ("Fallback model", &to_store.fallback_model)] {
         if looks_like_address(value) {
             return Err(format!(
@@ -842,6 +863,186 @@ async fn test_llm(settings: Settings, api_key: Option<String>) -> Result<String,
     }
 }
 
+// ---------- first-run setup ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SpeechModelInfo {
+    id: &'static str,
+    label: &'static str,
+    note: &'static str,
+    vram_mb: u64,
+    bytes: u64,
+    /// Already on disk, nothing to download.
+    present: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SetupInfo {
+    system: system::SystemInfo,
+    recommendation: models::Recommendation,
+    speech_models: Vec<SpeechModelInfo>,
+    vad_present: bool,
+    download_dir: Option<String>,
+}
+
+/// Look at this PC and say which speech model suits it.
+#[tauri::command]
+async fn setup_info() -> Result<SetupInfo, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let dir = models::download_dir().unwrap_or_else(std::env::temp_dir);
+        let system = system::detect(&dir);
+        tracing::info!(
+            "system: {} ({} threads), {} MB RAM, gpus {:?}, {:?} MB free",
+            system.cpu,
+            system.cores,
+            system.ram_mb,
+            system.gpus,
+            system.free_disk_mb
+        );
+        SetupInfo {
+            recommendation: models::recommend(&system),
+            system,
+            speech_models: models::SPEECH_MODELS
+                .iter()
+                .map(|m| SpeechModelInfo {
+                    id: m.id,
+                    label: m.label,
+                    note: m.note,
+                    vram_mb: m.vram_mb,
+                    bytes: m.file.bytes,
+                    present: models::find(&m.file).is_some(),
+                })
+                .collect(),
+            vad_present: models::find(&models::VAD).is_some(),
+            download_dir: models::download_dir().map(|d| d.display().to_string()),
+        }
+    })
+    .await
+    .map_err(err)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalServer {
+    name: &'static str,
+    base_url: &'static str,
+    models: Vec<String>,
+}
+
+/// AI servers already running on this PC (Ollama, LM Studio) and the models they have.
+#[tauri::command]
+async fn detect_local_llms() -> Vec<LocalServer> {
+    let Ok(client) = reqwest::Client::builder().timeout(std::time::Duration::from_millis(1500)).build() else {
+        return Vec::new();
+    };
+    let get = |url: &'static str| {
+        let client = client.clone();
+        async move {
+            let text = client.get(url).send().await.ok()?.error_for_status().ok()?.text().await.ok()?;
+            serde_json::from_str::<serde_json::Value>(&text).ok()
+        }
+    };
+    let names = |v: &serde_json::Value, list: &str, key: &str| -> Vec<String> {
+        v[list].as_array().into_iter().flatten().filter_map(|m| m[key].as_str().map(str::to_string)).collect()
+    };
+    let (ollama, lmstudio) =
+        futures_util::join!(get("http://127.0.0.1:11434/api/tags"), get("http://127.0.0.1:1234/v1/models"));
+    let mut out = Vec::new();
+    if let Some(v) = ollama {
+        out.push(LocalServer {
+            name: "Ollama",
+            base_url: "http://localhost:11434/v1",
+            models: names(&v, "models", "name"),
+        });
+    }
+    if let Some(v) = lmstudio {
+        out.push(LocalServer {
+            name: "LM Studio",
+            base_url: "http://localhost:1234/v1",
+            models: names(&v, "data", "id"),
+        });
+    }
+    out
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadEvent {
+    file: String,
+    /// Position of this file in the queue (0-based) and the queue length.
+    index: usize,
+    count: usize,
+    received: u64,
+    total: u64,
+    /// Everything in the queue is downloaded.
+    done: bool,
+    error: Option<String>,
+}
+
+/// Download the voice detection model if it's missing, plus the chosen speech models that
+/// aren't on disk yet. Progress arrives as "model-download" events. Returns the files queued.
+#[tauri::command]
+async fn download_models(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    speech_models: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let mut queue: Vec<models::ModelFile> = Vec::new();
+    if models::find(&models::VAD).is_none() {
+        queue.push(models::VAD);
+    }
+    for id in &speech_models {
+        let m = models::speech_model(id).ok_or_else(|| format!("Unknown speech model \"{id}\"."))?;
+        if models::find(&m.file).is_none() && !queue.iter().any(|f| f.file == m.file.file) {
+            queue.push(m.file);
+        }
+    }
+    let dir = models::download_dir().ok_or("Couldn't find the local app data folder.")?;
+    if state.downloading.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("A download is already running.".into());
+    }
+    state.download_cancel.store(false, std::sync::atomic::Ordering::SeqCst);
+    let files: Vec<String> = queue.iter().map(|f| f.file.to_string()).collect();
+
+    tauri::async_runtime::spawn(async move {
+        let st = app.state::<AppState>();
+        let count = queue.len();
+        let ev = |file: &str, index: usize, received: u64, total: u64, done: bool, error: Option<String>| {
+            let _ = app.emit(
+                "model-download",
+                DownloadEvent { file: file.into(), index, count, received, total, done, error },
+            );
+        };
+        let client = reqwest::Client::new();
+        let mut failed = false;
+        for (index, f) in queue.iter().enumerate() {
+            tracing::info!("downloading {} ({} bytes)", f.file, f.bytes);
+            let result =
+                models::download(&client, f, &dir, &st.download_cancel, |r, t| ev(f.file, index, r, t, false, None))
+                    .await;
+            if let Err(e) = result {
+                tracing::warn!("download {}: {e}", f.file);
+                ev(f.file, index, 0, f.bytes, false, Some(e));
+                failed = true;
+                break;
+            }
+        }
+        if !failed {
+            ev("", count, 0, 0, true, None);
+        }
+        st.downloading.store(false, std::sync::atomic::Ordering::SeqCst);
+    });
+    Ok(files)
+}
+
+/// Stop the running download. The partial file is kept so the next try resumes.
+#[tauri::command]
+fn cancel_download(state: State<'_, AppState>) {
+    state.download_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 // ---------- windows ----------
 
 /// Show the compact always-on-top live panel, creating it on first use.
@@ -898,6 +1099,8 @@ pub fn run() {
                 settings: Mutex::new(settings),
                 settings_path,
                 settings_notice: Mutex::new(settings_notice),
+                downloading: Default::default(),
+                download_cancel: Default::default(),
                 meet: Mutex::new(MeetState::default()),
                 atlassian: Mutex::new(fs_atlassian::Status::default()),
             });
@@ -950,6 +1153,10 @@ pub fn run() {
             get_settings,
             save_settings,
             settings_notice,
+            setup_info,
+            detect_local_llms,
+            download_models,
+            cancel_download,
             get_bridge,
             atlassian_status,
             kb_list,
