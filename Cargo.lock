@@ -1011,13 +1011,16 @@ dependencies = [
  "futures-util",
  "getrandom 0.3.4",
  "keyring",
+ "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tracing",
  "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]

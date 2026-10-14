@@ -2,6 +2,7 @@
   import Icon from './Icon.svelte';
   import { session, inTauri } from './session.svelte';
   import { api, looksLikeAddress } from './api';
+  import { presets, presetFor, isLocalUrl } from './providers';
   import type { AtlassianStatus, BridgeStatus, Settings } from './api';
   import { onMount } from 'svelte';
 
@@ -67,20 +68,17 @@
     ['en', 'English']
   ];
 
-  /** One-click starting points. All of them speak the OpenAI chat API; the address stays editable. */
-  const presets = [
-    { id: 'openrouter', label: 'OpenRouter', url: 'https://openrouter.ai/api/v1', model: 'google/gemini-2.5-flash' },
-    { id: 'openai', label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
-    { id: 'gemini', label: 'Google Gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai', model: 'gemini-2.5-flash' },
-    { id: 'groq', label: 'Groq', url: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile' },
-    { id: 'together', label: 'Together', url: 'https://api.together.xyz/v1', model: 'meta-llama/Llama-3.3-70B-Instruct-Turbo' },
-    { id: 'ollama', label: 'Ollama (local)', url: 'http://localhost:11434/v1', model: 'gemma3' },
-    { id: 'lmstudio', label: 'LM Studio (local)', url: 'http://localhost:1234/v1', model: '' }
-  ];
+  const speechLabels: Record<string, string> = {
+    'large-v3-turbo': 'Large v3 Turbo',
+    'large-v3-turbo-q8_0': 'Large v3 Turbo (8-bit)',
+    'large-v3-turbo-q5_0': 'Large v3 Turbo (5-bit)',
+    'large-v3': 'Large v3',
+    'small-q5_1': 'Small (5-bit)'
+  };
+  const speechLabel = $derived(speechLabels[session.settings.speechModel] ?? session.settings.speechModel);
 
-  const norm = (u: string) => u.trim().replace(/\/+$/, '').toLowerCase();
-  const selected = $derived(presets.find((p) => norm(p.url) === norm(form.baseUrl))?.id ?? 'custom');
-  const isLocal = $derived(/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/i.test(form.baseUrl.trim()));
+  const selected = $derived(presetFor(form.baseUrl));
+  const isLocal = $derived(isLocalUrl(form.baseUrl));
   const insecure = $derived(/^http:\/\//i.test(form.baseUrl.trim()) && !isLocal);
 
   function pick(id: string) {
@@ -343,9 +341,15 @@
     </section>
 
     <section>
-      <h2 class="font-semibold">Speech models</h2>
-      <p class="mt-1 break-all text-sm text-muted">
-        {session.modelsDir ?? (inTauri ? 'Not found. Put ggml-large-v3-turbo.bin and silero_vad.onnx in %LOCALAPPDATA%\\fivesight\\models.' : 'Not available in browser preview.')}
+      <div class="flex items-center gap-3">
+        <h2 class="font-semibold">Speech model</h2>
+        <button class="ml-auto rounded-full border border-line px-4 py-1.5 text-[13px] font-medium hover:border-ink" onclick={() => session.openSetup()}>
+          Run setup again
+        </button>
+      </div>
+      <p class="mt-1 text-sm">{speechLabel}</p>
+      <p class="mt-0.5 break-all text-sm text-muted">
+        {session.modelsDir ?? (inTauri ? 'Not downloaded yet. Run setup to pick and download it.' : 'Not available in browser preview.')}
       </p>
     </section>
 

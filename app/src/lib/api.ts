@@ -65,6 +65,10 @@ export interface Settings {
   atlassian: boolean;
   /** Keep the AI notes up to date on their own while recording. */
   autoNotes: boolean;
+  /** Whisper model id, from the setup's speech model list. */
+  speechModel: string;
+  /** First-run setup finished or skipped. */
+  setupDone: boolean;
   /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
   hasKey: boolean;
 }
@@ -83,6 +87,64 @@ export interface TranscriptEvent {
   text: string;
   meetingId: number;
   speaker?: string | null;
+}
+
+export interface Gpu {
+  name: string;
+  vramMb: number;
+  nvidia: boolean;
+}
+
+export interface SystemInfo {
+  cpu: string;
+  cores: number;
+  ramMb: number;
+  gpus: Gpu[];
+  freeDiskMb: number | null;
+}
+
+export interface Recommendation {
+  /** False when this PC can't transcribe with this build (no NVIDIA card). */
+  supported: boolean;
+  speechModel: string | null;
+  summary: string;
+  warnings: string[];
+  localLlmHint: string;
+}
+
+export interface SpeechModelInfo {
+  id: string;
+  label: string;
+  note: string;
+  vramMb: number;
+  bytes: number;
+  present: boolean;
+}
+
+export interface SetupInfo {
+  system: SystemInfo;
+  recommendation: Recommendation;
+  speechModels: SpeechModelInfo[];
+  vadPresent: boolean;
+  downloadDir: string | null;
+}
+
+/** An AI server already running on this PC. */
+export interface LocalServer {
+  name: string;
+  baseUrl: string;
+  models: string[];
+}
+
+export interface DownloadEvent {
+  file: string;
+  index: number;
+  count: number;
+  received: number;
+  total: number;
+  /** Everything queued is downloaded. */
+  done: boolean;
+  error: string | null;
 }
 
 export interface BridgeStatus {
@@ -176,6 +238,12 @@ export interface Api {
   testLlm(s: Settings, apiKey: string | null): Promise<string>;
   openLivePanel(): Promise<void>;
   getBridge(): Promise<BridgeStatus>;
+  setupInfo(): Promise<SetupInfo>;
+  detectLocalLlms(): Promise<LocalServer[]>;
+  /** Queue the voice detection model (if missing) and these speech models; returns the files queued. */
+  downloadModels(speechModels: string[]): Promise<string[]>;
+  cancelDownload(): Promise<void>;
+  onModelDownload(cb: (e: DownloadEvent) => void): Promise<Off>;
   kbList(): Promise<KbDoc[]>;
   kbAdd(paths: string[]): Promise<KbAddResult[]>;
   kbRefresh(id: number): Promise<void>;
@@ -223,6 +291,11 @@ const tauriApi: Api = {
   testLlm: (settings, apiKey) => invoke('test_llm', { settings, apiKey }),
   openLivePanel: () => invoke('open_live_panel'),
   getBridge: () => invoke('get_bridge'),
+  setupInfo: () => invoke('setup_info'),
+  detectLocalLlms: () => invoke('detect_local_llms'),
+  downloadModels: (speechModels) => invoke('download_models', { speechModels }),
+  cancelDownload: () => invoke('cancel_download'),
+  onModelDownload: (cb) => listen<DownloadEvent>('model-download', (e) => cb(e.payload)),
   kbList: () => invoke('kb_list'),
   kbAdd: (paths) => invoke('kb_add', { paths }),
   kbRefresh: (id) => invoke('kb_refresh', { id }),
@@ -265,8 +338,20 @@ function createMockApi(): Api {
     language: 'auto',
     atlassian: true,
     autoNotes: true,
+    speechModel: 'large-v3-turbo',
+    // The preview opens on the home screen; Settings → Run setup shows the wizard.
+    setupDone: true,
     hasKey: false
   };
+  const speechModels: SpeechModelInfo[] = [
+    { id: 'large-v3-turbo', label: 'Large v3 Turbo', note: 'Best balance of accuracy and speed for live meetings.', vramMb: 2300, bytes: 1_624_555_275, present: false },
+    { id: 'large-v3-turbo-q8_0', label: 'Large v3 Turbo (8-bit)', note: 'Almost the same accuracy in about half the memory.', vramMb: 1500, bytes: 874_188_075, present: false },
+    { id: 'large-v3-turbo-q5_0', label: 'Large v3 Turbo (5-bit)', note: 'For cards with little memory. Slightly less accurate.', vramMb: 1100, bytes: 574_041_195, present: false },
+    { id: 'large-v3', label: 'Large v3', note: 'Most accurate, but several times slower. Needs a strong card to keep up live.', vramMb: 4200, bytes: 3_095_033_483, present: false },
+    { id: 'small-q5_1', label: 'Small (5-bit)', note: 'Fastest and smallest. Noticeably weaker, especially for Indonesian.', vramMb: 600, bytes: 190_085_487, present: false }
+  ];
+  let vadPresent = false;
+  let cancelDl = false;
   const keys = new Set<string>();
   let kbNext = 3;
   let kb: KbDoc[] = [
@@ -412,6 +497,49 @@ function createMockApi(): Api {
     },
     onAskLookup: (cb) => sub('ask-lookup', cb),
     getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: false, inCall: false, callTitle: null, error: null }),
+    setupInfo: async () => {
+      await new Promise((r) => setTimeout(r, 500));
+      return {
+        system: { cpu: 'AMD Ryzen 7 5700X3D 8-Core Processor', cores: 16, ramMb: 32_671, gpus: [{ name: 'NVIDIA GeForce RTX 5070', vramMb: 11_944, nvidia: true }], freeDiskMb: 1_080_092 },
+        recommendation: {
+          supported: true,
+          speechModel: 'large-v3-turbo',
+          summary: 'NVIDIA GeForce RTX 5070 with 12 GB of graphics memory: Large v3 Turbo fits comfortably.',
+          warnings: [],
+          localLlmHint: 'A local 7-8B model (e.g. qwen3:8b or llama3.1:8b) fits next to speech recognition.'
+        },
+        speechModels: speechModels.map((m) => ({ ...m })),
+        vadPresent,
+        downloadDir: 'C:\\Users\\you\\AppData\\Local\\fivesight\\models'
+      };
+    },
+    detectLocalLlms: async () => {
+      await new Promise((r) => setTimeout(r, 300));
+      return [{ name: 'Ollama', baseUrl: 'http://localhost:11434/v1', models: ['qwen3:8b', 'gemma3:4b'] }];
+    },
+    downloadModels: async (ids) => {
+      const queue = [...(vadPresent ? [] : [{ file: 'silero_vad.onnx', bytes: 2_327_524, done: () => (vadPresent = true) }])];
+      for (const id of ids) {
+        const m = speechModels.find((x) => x.id === id);
+        if (m && !m.present) queue.push({ file: `ggml-${m.id}.bin`, bytes: m.bytes, done: () => (m.present = true) });
+      }
+      cancelDl = false;
+      (async () => {
+        for (const [index, q] of queue.entries()) {
+          // Pretend the whole file takes about three seconds.
+          for (let got = 0; got < q.bytes; got += q.bytes / 20) {
+            if (cancelDl) return emit<DownloadEvent>('model-download', { file: q.file, index, count: queue.length, received: got, total: q.bytes, done: false, error: 'Download cancelled.' });
+            emit<DownloadEvent>('model-download', { file: q.file, index, count: queue.length, received: got, total: q.bytes, done: false, error: null });
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          q.done();
+        }
+        emit<DownloadEvent>('model-download', { file: '', index: queue.length, count: queue.length, received: 0, total: 0, done: true, error: null });
+      })();
+      return queue.map((q) => q.file);
+    },
+    cancelDownload: async () => void (cancelDl = true),
+    onModelDownload: (cb) => sub('model-download', cb),
     onCall: (cb) => sub('call', cb),
     onTranscript: (cb) => sub('transcript', cb),
     onRecording: (cb) => sub('recording', cb),
