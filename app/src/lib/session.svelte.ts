@@ -1,5 +1,5 @@
 import { api, inTauri } from './api';
-import type { AskSources, CallEvent, ChatMsg, Hit, KbAddResult, KbDoc, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
+import type { AskLookup, AskSources, CallEvent, ChatMsg, Hit, KbAddResult, KbDoc, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
 export { inTauri };
 export type View = 'home' | 'meeting' | 'settings' | 'knowledge';
@@ -9,6 +9,7 @@ const DEFAULT_SETTINGS: Settings = {
   model: 'google/gemini-2.5-flash',
   fallbackModel: '',
   language: 'auto',
+  atlassian: true,
   hasKey: false
 };
 
@@ -41,6 +42,8 @@ class Session {
   kbErrors = $state<KbAddResult[]>([]);
   /** Files the latest answer drew on. */
   answerSources = $state<string[]>([]);
+  /** Jira/Confluence reads made for the latest answer. */
+  lookups = $state<AskLookup[]>([]);
 
   drawer = $state(false);
   query = $state('');
@@ -67,6 +70,7 @@ class Session {
       }),
       api.onCall((e) => this.onCall(e)),
       api.onAskSources((e) => this.onAskSources(e)),
+      api.onAskLookup((e) => this.onAskLookup(e)),
       api.onFileDrop((paths) => {
         if (this.view === 'knowledge') this.addFiles(paths);
       }),
@@ -253,6 +257,7 @@ class Session {
     if (!q || this.asking) return;
     this.chat.push({ role: 'user', content: q });
     this.answerSources = [];
+    this.lookups = [];
     this.asking = true;
     this.answerLive = '';
     this.error = null;
@@ -278,6 +283,13 @@ class Session {
 
   private onAskSources(e: AskSources) {
     if (e.meetingId === (this.current?.id ?? null)) this.answerSources = e.files;
+  }
+
+  private onAskLookup(e: AskLookup) {
+    if (e.meetingId !== (this.current?.id ?? null)) return;
+    const i = this.lookups.findIndex((l) => l.id === e.id);
+    if (i === -1) this.lookups.push(e);
+    else this.lookups[i] = e;
   }
 
   async loadKb() {

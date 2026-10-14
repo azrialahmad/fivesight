@@ -2,7 +2,7 @@
   import Icon from './Icon.svelte';
   import { session, inTauri } from './session.svelte';
   import { api } from './api';
-  import type { BridgeStatus, Settings } from './api';
+  import type { AtlassianStatus, BridgeStatus, Settings } from './api';
   import { onMount } from 'svelte';
 
   let form = $state<Settings>({ ...session.settings });
@@ -28,6 +28,18 @@
   });
 
   let bridge = $state<BridgeStatus | null>(null);
+  let atl = $state<AtlassianStatus | null>(null);
+  let atlChecking = $state(false);
+
+  async function checkAtlassian() {
+    atlChecking = true;
+    try {
+      atl = await api.atlassianStatus();
+    } finally {
+      atlChecking = false;
+    }
+  }
+  onMount(() => void checkAtlassian());
   let copied = $state(false);
   let showToken = $state(false);
 
@@ -207,6 +219,42 @@
       <p class="mt-3 text-xs text-muted">
         {isLocal ? 'Nothing leaves this PC.' : 'Meeting text is sent to this server when you enhance notes or ask a question.'}
       </p>
+    </section>
+
+    <section>
+      <div class="flex items-center gap-3">
+        <h2 class="font-semibold">Jira & Confluence</h2>
+        <span class="rounded-full bg-soft px-2.5 py-0.5 text-[11px] font-semibold tracking-wide">READ-ONLY</span>
+      </div>
+      <p class="mt-0.5 text-sm text-muted">
+        Ask can search and read tickets, and read Confluence pages you link, through Atlassian's own command-line tool (acli). It can never create, edit, comment on, assign or move anything.
+      </p>
+      <div class="mt-3 space-y-1.5 text-sm">
+        {#if atlChecking && !atl}
+          <p class="text-muted">Checking acli…</p>
+        {:else if atl && !atl.installed}
+          <p class="flex items-center gap-2"><span class="h-2 w-2 rounded-full bg-faint"></span><span class="text-muted">acli isn't installed. See Atlassian's install guide, then come back here.</span></p>
+        {:else if atl}
+          <p class="flex items-center gap-2">
+            <span class="h-2 w-2 rounded-full {atl.jiraSite ? 'bg-lime-deep' : 'bg-faint'}"></span>
+            {#if atl.jiraSite}<span>Jira: <span class="font-medium">{atl.jiraSite}</span></span>{:else}<span class="text-muted">Jira: not logged in. Run <code class="rounded bg-soft px-1.5 py-0.5 text-xs">acli jira auth login --web</code></span>{/if}
+          </p>
+          <p class="flex items-center gap-2">
+            <span class="h-2 w-2 rounded-full {atl.confluence ? 'bg-lime-deep' : 'bg-faint'}"></span>
+            {#if atl.confluence}<span>Confluence: logged in</span>{:else}<span class="text-muted">Confluence: not logged in. Run <code class="rounded bg-soft px-1.5 py-0.5 text-xs">acli confluence auth login --web</code></span>{/if}
+          </p>
+        {/if}
+      </div>
+      <div class="mt-3 flex flex-wrap items-center gap-3">
+        <label class="flex cursor-pointer items-center gap-2.5 text-sm">
+          <input type="checkbox" class="h-4 w-4 accent-ink" bind:checked={form.atlassian} />
+          Let Ask look things up in Jira and Confluence
+        </label>
+        <button class="ml-auto rounded-full border border-line px-4 py-1.5 text-[13px] font-medium hover:border-ink disabled:opacity-50" disabled={atlChecking} onclick={checkAtlassian}>
+          {atlChecking ? 'Checking…' : 'Check again'}
+        </button>
+      </div>
+      <p class="mt-1.5 text-xs text-muted">Ticket text goes to your AI model only when a question needs it. Each lookup is shown under the answer.</p>
     </section>
 
     <section>
