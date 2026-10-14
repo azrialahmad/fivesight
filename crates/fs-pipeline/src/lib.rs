@@ -424,7 +424,7 @@ fn worker_loop(
                 Verdict::Drop(why) => rejected.push(format!("{why}: {}", s.text)),
             }
         }
-        let text = kept.join(" ");
+        let text = trim_ellipsis(&kept.join(" "));
 
         let ev = if level < min_rms && job.kind == Kind::Final {
             let all = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
@@ -480,6 +480,20 @@ fn worker_loop(
     }
 }
 
+/// Drop the "..." Whisper puts where audio was cut mid-sentence: at the end of every partial
+/// (transcribed while the speaker is still talking) and of finals split at a pause.
+fn trim_ellipsis(text: &str) -> String {
+    let dots = |c: char| c == '.' || c == '…' || c.is_whitespace();
+    // Only an actual ellipsis counts, not a full stop or ".NET".
+    let is_ellipsis = |run: &str| run.contains('…') || run.matches('.').count() >= 2;
+    let t = text.trim();
+    let rest = t.trim_start_matches(dots);
+    let t = if is_ellipsis(&t[..t.len() - rest.len()]) { rest } else { t };
+    let cut = t.trim_end_matches(dots);
+    let t = if is_ellipsis(&t[cut.len()..]) { cut } else { t };
+    t.to_string()
+}
+
 /// Send held mic lines that can be judged now. Returns false once nobody is listening.
 fn release_held(
     echo: &mut Option<EchoGuard>,
@@ -493,4 +507,21 @@ fn release_held(
     let settled = !shared.other.speaking.load(Ordering::Relaxed)
         && shared.other.finals_sent.load(Ordering::Relaxed) == other_finals_done;
     g.release(settled, Instant::now()).into_iter().all(|ev| events.send(ev).is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_ellipsis;
+
+    #[test]
+    fn trims_cut_off_ellipses_only() {
+        assert_eq!(trim_ellipsis("Ya, jadi kenapa sih..."), "Ya, jadi kenapa sih");
+        assert_eq!(trim_ellipsis(" ...dan nanti kita deploy… "), "dan nanti kita deploy");
+        assert_eq!(trim_ellipsis("Contohnya. . ."), "Contohnya");
+        assert_eq!(trim_ellipsis("..."), "");
+        assert_eq!(trim_ellipsis("Oke, selesai."), "Oke, selesai.");
+        assert_eq!(trim_ellipsis(".NET 8 sudah rilis?"), ".NET 8 sudah rilis?");
+        assert_eq!(trim_ellipsis("Versi 3.5 ya"), "Versi 3.5 ya");
+        assert_eq!(trim_ellipsis("Jadi... itu dia"), "Jadi... itu dia");
+    }
 }

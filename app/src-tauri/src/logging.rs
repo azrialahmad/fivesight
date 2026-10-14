@@ -21,11 +21,13 @@ pub fn init(data_dir: &Path) {
         File::create(current)
     });
 
-    // Our own crates at debug, everything else (tauri, wry, ...) at info.
+    // Our own crates at debug, everything else (tauri, wry, ...) at info, ort at warn.
     let filter = Targets::new()
         .with_default(LevelFilter::INFO)
         .with_target("fivesight_app_lib", LevelFilter::DEBUG)
-        .with_target("fs_pipeline", LevelFilter::DEBUG);
+        .with_target("fs_pipeline", LevelFilter::DEBUG)
+        // ONNX Runtime (Silero VAD) logs every allocation at info.
+        .with_target("ort", LevelFilter::WARN);
     let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr).with_filter(filter.clone());
     let (file, open_err) = match file {
         Ok(f) => (Some(f), None),
