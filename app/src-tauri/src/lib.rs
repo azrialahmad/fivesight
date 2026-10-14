@@ -422,9 +422,10 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
     let forward = app.clone();
     std::thread::spawn(move || {
         for mut ev in rx {
-            if let Some(why) = &ev.dropped {
-                tracing::debug!("dropped final: {why}");
-                continue;
+            if let Some(why) = ev.dropped.take() {
+                tracing::debug!("dropped final ({why}): {}", ev.text);
+                // Still tell the UI, so it clears the partial it is showing for this line.
+                ev.text.clear();
             }
             ev.start_ms += offset_ms;
             ev.segment_id += seg_base;

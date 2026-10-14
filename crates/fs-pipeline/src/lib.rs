@@ -7,16 +7,20 @@
 //! ```
 //!
 //! Partials are coalesced: a stream never has more than one partial job in flight, so a
-//! slow GPU cannot build a backlog. Finals are always queued.
+//! slow GPU cannot build a backlog. Finals are always queued. Mic lines that repeat what
+//! the other side just said (speakers picked up by the mic) are dropped, see [`echo`].
+
+pub mod echo;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use echo::{EchoConfig, EchoGuard};
 use fs_audio::{rms, Capture, Source};
 use fs_stt::engine::Engine;
 use fs_stt::filter::{judge, FilterConfig, SegmentStats, Verdict};
@@ -43,6 +47,8 @@ pub struct PipelineConfig {
     pub barge_in: bool,
     pub final_beam: i32,
     pub filter: FilterConfig,
+    /// Drop mic lines that are the call echoing from the speakers. `None` turns it off.
+    pub echo: Option<EchoConfig>,
 }
 
 impl PipelineConfig {
@@ -61,6 +67,7 @@ impl PipelineConfig {
             barge_in: true,
             final_beam: 3,
             filter: FilterConfig::default(),
+            echo: Some(EchoConfig::default()),
         }
     }
 }
@@ -118,19 +125,25 @@ impl Pipeline {
         let inflight_mic = Arc::new(AtomicBool::new(false));
         let inflight_out = Arc::new(AtomicBool::new(false));
         let barge = Arc::new(AtomicBool::new(false));
+        let other = Arc::new(OtherSide::default());
 
         // Whisper worker owns the engine; load it here and report errors synchronously.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
         let worker = {
             let cfg = cfg.clone();
             let events = events.clone();
-            let (im, io) = (inflight_mic.clone(), inflight_out.clone());
+            let shared = WorkerShared {
+                inflight_mic: inflight_mic.clone(),
+                inflight_out: inflight_out.clone(),
+                barge: barge.clone(),
+                other: other.clone(),
+            };
             thread::Builder::new()
                 .name("whisper-worker".into())
                 .spawn(move || match Engine::load(&cfg.whisper_model, true) {
                     Ok(engine) => {
                         let _ = ready_tx.send(Ok(()));
-                        worker_loop(engine, cfg, job_rx, events, im, io);
+                        worker_loop(engine, cfg, job_rx, events, shared);
                     }
                     Err(e) => {
                         let _ = ready_tx.send(Err(e.to_string()));
@@ -158,9 +171,9 @@ impl Pipeline {
                     Source::Mic => cfg.min_rms_me,
                     Source::Loopback => cfg.min_rms_others,
                 },
-                barge_in: cfg.barge_in,
                 inflight,
                 barge: barge.clone(),
+                other: other.clone(),
                 jobs: job_tx.clone(),
             };
             threads.push(
@@ -193,10 +206,18 @@ struct StreamCtx {
     partial_interval: Duration,
     partial_window: usize,
     min_rms: f32,
-    barge_in: bool,
     inflight: Arc<AtomicBool>,
     barge: Arc<AtomicBool>,
+    other: Arc<OtherSide>,
     jobs: SyncSender<Job>,
+}
+
+/// What the loopback stream is doing, so the worker knows whether a mic line that might
+/// be echo can be judged yet.
+#[derive(Default)]
+struct OtherSide {
+    speaking: AtomicBool,
+    finals_sent: AtomicU64,
 }
 
 fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: Receiver<Vec<f32>>) {
@@ -205,6 +226,9 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
     let mut last_partial = Instant::now();
 
     let send_final = |ctx: &StreamCtx, id: u64, start_sample: u64, audio: Vec<f32>| {
+        if ctx.source == Source::Loopback {
+            ctx.other.finals_sent.fetch_add(1, Ordering::Relaxed);
+        }
         let _ = ctx.jobs.send(Job { source: ctx.source, segment_id: id, kind: Kind::Final, audio, start_sample });
     };
 
@@ -228,9 +252,6 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
                     segment_id += 1;
                     seg_start = at_sample;
                     last_partial = Instant::now();
-                    if ctx.source == Source::Mic && ctx.barge_in && rms(ep.current_audio()) >= ctx.min_rms {
-                        ctx.barge.store(true, Ordering::Relaxed);
-                    }
                 }
                 Event::End { start_sample, audio, .. } => send_final(&ctx, segment_id, start_sample, audio),
                 Event::Dropped => {}
@@ -238,10 +259,14 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
         }
 
         // Barge-in: the local user started talking, so close the other side's open segment.
+        // The worker raises the flag once a mic partial is known not to be echo.
         if ctx.source == Source::Loopback && ctx.barge.swap(false, Ordering::Relaxed) && ep.is_speaking() {
             if let Some(Event::End { start_sample, audio, .. }) = ep.force_finalize() {
                 send_final(&ctx, segment_id, start_sample, audio);
             }
+        }
+        if ctx.source == Source::Loopback {
+            ctx.other.speaking.store(ep.is_speaking(), Ordering::Relaxed);
         }
 
         // Streaming partial over the tail of the current segment.
@@ -281,13 +306,19 @@ fn detect_and_choose(engine: &Engine, tracker: &mut LangTracker, audio: &[f32], 
     }
 }
 
+struct WorkerShared {
+    inflight_mic: Arc<AtomicBool>,
+    inflight_out: Arc<AtomicBool>,
+    barge: Arc<AtomicBool>,
+    other: Arc<OtherSide>,
+}
+
 fn worker_loop(
     engine: Engine,
     cfg: PipelineConfig,
     jobs: Receiver<Job>,
     events: Sender<TranscriptEvent>,
-    inflight_mic: Arc<AtomicBool>,
-    inflight_out: Arc<AtomicBool>,
+    shared: WorkerShared,
 ) {
     let prompt = match cfg.language {
         LangMode::En => None,
@@ -298,7 +329,25 @@ fn worker_loop(
     let mut trackers = [LangTracker::default(), LangTracker::default()];
     let mut seg_lang: HashMap<(usize, u64), &'static str> = HashMap::new();
 
-    for job in jobs {
+    let mut echo = cfg.echo.clone().map(EchoGuard::new);
+    let mut other_finals_done = 0u64;
+    let mut barged_seg = 0u64; // mic utterance that already closed the other side's segment
+
+    loop {
+        // Wake up regularly even without jobs: held mic lines wait on the other side.
+        let job = match jobs.recv_timeout(Duration::from_millis(150)) {
+            Ok(job) => job,
+            Err(RecvTimeoutError::Timeout) => {
+                if !release_held(&mut echo, &shared, other_finals_done, &events) {
+                    return;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+        if job.source == Source::Loopback && job.kind == Kind::Final {
+            other_finals_done += 1;
+        }
         let src = match job.source {
             Source::Mic => 0,
             Source::Loopback => 1,
@@ -349,8 +398,8 @@ fn worker_loop(
         };
         if job.kind == Kind::Partial {
             match job.source {
-                Source::Mic => inflight_mic.store(false, Ordering::Relaxed),
-                Source::Loopback => inflight_out.store(false, Ordering::Relaxed),
+                Source::Mic => shared.inflight_mic.store(false, Ordering::Relaxed),
+                Source::Loopback => shared.inflight_out.store(false, Ordering::Relaxed),
             }
         }
         let segments = match result {
@@ -387,10 +436,61 @@ fn worker_loop(
         } else {
             None
         };
-        if let Some(ev) = ev {
+        let end_ms = start_ms + job.audio.len() as u64 * 1000 / SAMPLE_RATE as u64;
+        let other_talking = shared.other.speaking.load(Ordering::Relaxed);
+        let mut out = Vec::new();
+        match (echo.as_mut(), job.source, ev) {
+            (Some(g), Source::Loopback, ev) => {
+                let heard = ev.as_ref().filter(|e| e.dropped.is_none()).map_or("", |e| e.text.as_str());
+                let end = (job.kind == Kind::Final).then_some(end_ms);
+                out.extend(g.hear_other(job.segment_id, start_ms, end, heard));
+                out.extend(ev);
+            }
+            (Some(g), Source::Mic, Some(ev)) if ev.dropped.is_none() => match job.kind {
+                Kind::Partial => out.extend((!g.is_echo(&ev.text, start_ms, end_ms)).then_some(ev)),
+                Kind::Final => out.extend(g.mic_final(ev, end_ms, other_talking, Instant::now())),
+            },
+            (_, _, ev) => out.extend(ev),
+        }
+
+        // A mic partial with real words (not echo) means the local user is talking. While the
+        // other side talks, wait until there is something of theirs to rule out echo with.
+        let speaking_up = job.source == Source::Mic
+            && job.kind == Kind::Partial
+            && out.iter().any(|e| e.dropped.is_none() && !e.text.trim().is_empty())
+            && (!other_talking || echo.as_ref().is_none_or(|g| g.heard_near(start_ms, end_ms)));
+        if cfg.barge_in && speaking_up && barged_seg != job.segment_id {
+            barged_seg = job.segment_id;
+            shared.barge.store(true, Ordering::Relaxed);
+        }
+
+        for ev in out {
             if events.send(ev).is_err() {
-                break;
+                return;
             }
         }
+        if !release_held(&mut echo, &shared, other_finals_done, &events) {
+            return;
+        }
     }
+    if let Some(g) = echo.as_mut() {
+        for ev in g.release(true, Instant::now()) {
+            let _ = events.send(ev);
+        }
+    }
+}
+
+/// Send held mic lines that can be judged now. Returns false once nobody is listening.
+fn release_held(
+    echo: &mut Option<EchoGuard>,
+    shared: &WorkerShared,
+    other_finals_done: u64,
+    events: &Sender<TranscriptEvent>,
+) -> bool {
+    let Some(g) = echo.as_mut().filter(|g| g.holding()) else {
+        return true;
+    };
+    let settled = !shared.other.speaking.load(Ordering::Relaxed)
+        && shared.other.finals_sent.load(Ordering::Relaxed) == other_finals_done;
+    g.release(settled, Instant::now()).into_iter().all(|ev| events.send(ev).is_ok())
 }
