@@ -61,6 +61,8 @@ export interface Settings {
   model: string;
   fallbackModel: string;
   language: string;
+  /** Let Ask read Jira and Confluence through acli (read-only). */
+  atlassian: boolean;
   /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
   hasKey: boolean;
 }
@@ -114,6 +116,21 @@ export interface KbAddResult {
   error: string | null;
 }
 
+export interface AtlassianStatus {
+  installed: boolean;
+  jiraSite: string | null;
+  confluence: boolean;
+}
+
+/** One Jira/Confluence read made while answering. */
+export interface AskLookup {
+  meetingId: number | null;
+  id: string;
+  label: string;
+  state: 'running' | 'done' | 'failed';
+  error: string | null;
+}
+
 export interface AskSources {
   meetingId: number | null;
   files: string[];
@@ -159,6 +176,8 @@ export interface Api {
   pickFiles(): Promise<string[] | null>;
   onFileDrop(cb: (paths: string[]) => void): Promise<Off>;
   onAskSources(cb: (e: AskSources) => void): Promise<Off>;
+  atlassianStatus(): Promise<AtlassianStatus>;
+  onAskLookup(cb: (e: AskLookup) => void): Promise<Off>;
   onCall(cb: (e: CallEvent) => void): Promise<Off>;
   onTranscript(cb: (e: TranscriptEvent) => void): Promise<Off>;
   onRecording(cb: (recording: boolean) => void): Promise<Off>;
@@ -202,6 +221,8 @@ const tauriApi: Api = {
       if (e.payload.type === 'drop') cb(e.payload.paths);
     }),
   onAskSources: (cb) => listen<AskSources>('ask-sources', (e) => cb(e.payload)),
+  atlassianStatus: () => invoke('atlassian_status'),
+  onAskLookup: (cb) => listen<AskLookup>('ask-lookup', (e) => cb(e.payload)),
   onCall: (cb) => listen<CallEvent>('call', (e) => cb(e.payload)),
   onTranscript: (cb) => listen<TranscriptEvent>('transcript', (e) => cb(e.payload)),
   onRecording: (cb) => listen<boolean>('recording', (e) => cb(e.payload)),
@@ -227,6 +248,7 @@ function createMockApi(): Api {
     model: 'google/gemini-2.5-flash',
     fallbackModel: '',
     language: 'auto',
+    atlassian: true,
     hasKey: false
   };
   const keys = new Set<string>();
@@ -318,6 +340,11 @@ function createMockApi(): Api {
       const a = `Based on the transcript, the checkout timeout comes from the retry logic waiting thirty seconds before failing [0:07]. Budi was asked to ship a fix by Friday [0:15].\n\n(Mock answer to: "${question}")`;
       if (meetingId !== null) (chats[meetingId] ??= []).push({ role: 'user', content: question });
       emit<AskSources>('ask-sources', { meetingId, files: kb.length ? [kb[0].title] : [] });
+      if (settings.atlassian && /PAY-\d+|ticket|jira/i.test(question)) {
+        emit<AskLookup>('ask-lookup', { meetingId, id: 'm1', label: 'Read PAY-142', state: 'running', error: null });
+        await new Promise((r) => setTimeout(r, 600));
+        emit<AskLookup>('ask-lookup', { meetingId, id: 'm1', label: 'Read PAY-142', state: 'done', error: null });
+      }
       await stream('ask-delta', meetingId, a);
       if (meetingId !== null) chats[meetingId].push({ role: 'assistant', content: a });
     },
@@ -353,6 +380,11 @@ function createMockApi(): Api {
     pickFiles: async () => ['C:\\Users\\you\\Documents\\Onboarding notes.md'],
     onFileDrop: async () => () => {},
     onAskSources: (cb) => sub('ask-sources', cb),
+    atlassianStatus: async () => {
+      await new Promise((r) => setTimeout(r, 400));
+      return { installed: true, jiraSite: 'yourcompany.atlassian.net', confluence: false };
+    },
+    onAskLookup: (cb) => sub('ask-lookup', cb),
     getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: false, inCall: false, callTitle: null, error: null }),
     onCall: (cb) => sub('call', cb),
     onTranscript: (cb) => sub('transcript', cb),

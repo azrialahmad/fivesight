@@ -37,6 +37,20 @@
           <div class="rise max-w-[92%] rounded-2xl rounded-bl-md bg-paper px-4 py-3"><Markdown text={m.content} /></div>
         {/if}
       {/each}
+      {#if session.lookups.length && (session.asking || session.chat.at(-1)?.role === 'assistant')}
+        <div class="flex flex-wrap items-center gap-1.5 pl-1 text-[11px] text-muted" aria-live="polite">
+          <span class="font-semibold tracking-wide text-faint">JIRA</span>
+          {#each session.lookups as l (l.id)}
+            <span
+              class="flex items-center gap-1 rounded-full px-2 py-0.5 font-medium {l.state === 'failed' ? 'bg-rec-soft text-rec' : 'bg-soft text-ink'}"
+              title={l.error ?? ''}
+            >
+              {#if l.state === 'running'}<span class="h-2 w-2 animate-pulse rounded-full bg-lime-deep"></span>{:else if l.state === 'done'}<Icon name="check" size={12} />{/if}
+              {l.label}{l.state === 'failed' ? ' (failed)' : ''}
+            </span>
+          {/each}
+        </div>
+      {/if}
       {#if session.answerSources.length && session.chat.at(-1)?.role === 'assistant' && !session.asking}
         <p class="flex flex-wrap items-center gap-1.5 pl-1 text-[11px] text-muted">
           <Icon name="book" size={13} /> From your files:

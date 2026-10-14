@@ -77,22 +77,101 @@ impl LlmConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Message {
     pub role: String,
     pub content: String,
+    /// Set on an assistant turn that asked for tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+    /// Set on a `tool` turn: which call this is the result of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
 }
 
 impl Message {
+    fn new(role: &str, c: impl Into<String>) -> Self {
+        Self { role: role.into(), content: c.into(), ..Default::default() }
+    }
     pub fn system(c: impl Into<String>) -> Self {
-        Self { role: "system".into(), content: c.into() }
+        Self::new("system", c)
     }
     pub fn user(c: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: c.into() }
+        Self::new("user", c)
     }
     pub fn assistant(c: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: c.into() }
+        Self::new("assistant", c)
     }
+    /// An assistant turn that requested tool calls.
+    pub fn assistant_calls(c: impl Into<String>, calls: Vec<ToolCall>) -> Self {
+        Self { tool_calls: Some(calls), ..Self::new("assistant", c) }
+    }
+    /// The result of one tool call.
+    pub fn tool(call_id: impl Into<String>, c: impl Into<String>) -> Self {
+        Self { tool_call_id: Some(call_id.into()), ..Self::new("tool", c) }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    #[serde(rename = "type", default = "function_kind")]
+    pub kind: String,
+    pub function: FunctionCall,
+}
+
+fn function_kind() -> String {
+    "function".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FunctionCall {
+    pub name: String,
+    /// JSON text, as the model wrote it.
+    #[serde(default)]
+    pub arguments: String,
+}
+
+/// A complete (non-streamed) reply: either text, or a request to call tools.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reply {
+    pub content: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// One non-streamed request offering `tools` (OpenAI function-calling format).
+/// Servers or models without tool support usually answer 400/404/422; callers can then
+/// fall back to a plain [`chat_stream`].
+pub async fn chat_with_tools(cfg: &LlmConfig, messages: &[Message], tools: &serde_json::Value) -> Result<Reply, LlmError> {
+    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
+    let mut req = reqwest::Client::new().post(url).json(&serde_json::json!({
+        "model": cfg.model,
+        "messages": messages,
+        "tools": tools,
+        "tool_choice": "auto",
+        "stream": false,
+    }));
+    if let Some(k) = &cfg.api_key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let body = resp.text().await?;
+    if !status.is_success() {
+        return Err(LlmError::Api { status: status.as_u16(), body: body.chars().take(400).collect() });
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| LlmError::Stream(format!("unreadable reply: {e}")))?;
+    if let Some(err) = v.get("error") {
+        return Err(LlmError::Stream(err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error").to_string()));
+    }
+    let msg = &v["choices"][0]["message"];
+    let content = msg["content"].as_str().unwrap_or("").to_string();
+    let tool_calls: Vec<ToolCall> = msg
+        .get("tool_calls")
+        .and_then(|t| serde_json::from_value(t.clone()).ok())
+        .unwrap_or_default();
+    Ok(Reply { content, tool_calls })
 }
 
 async fn stream_once(
@@ -193,7 +272,11 @@ mod tests {
                         if req.len() >= h + 4 + len || n == 0 {
                             let body_json = &text[h + 4..];
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(body_json) {
-                                seen.lock().unwrap().push(v["model"].as_str().unwrap_or("").to_string());
+                                let mut rec = v["model"].as_str().unwrap_or("").to_string();
+                                if v.get("tools").is_some() {
+                                    rec.push_str("+tools");
+                                }
+                                seen.lock().unwrap().push(rec);
                             }
                             break;
                         }
@@ -283,6 +366,49 @@ mod tests {
         let full = chat_stream(&cfg, &[Message::user("hi")], |d| seen.push(d.to_string())).await.unwrap();
         assert_eq!(full, "Hello world");
         assert_eq!(seen, ["Hel", "lo ", "world"]);
+    }
+
+    #[tokio::test]
+    async fn tool_calls_are_requested_and_parsed() {
+        let reply = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"jira_view","arguments":"{\"key\":\"PAY-142\"}"}}]}}]}"#;
+        let (url, seen) = fake_seq(vec![("200 OK", reply.into())]).await;
+        let cfg = LlmConfig::local(&url, "m");
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "jira_view", "parameters": {}}}]);
+        let r = chat_with_tools(&cfg, &[Message::user("what is PAY-142?")], &tools).await.unwrap();
+        assert_eq!(r.content, "");
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].function.name, "jira_view");
+        assert_eq!(r.tool_calls[0].function.arguments, r#"{"key":"PAY-142"}"#);
+        assert_eq!(seen.lock().unwrap().as_slice(), ["m+tools"]);
+    }
+
+    #[tokio::test]
+    async fn a_plain_answer_comes_back_as_content() {
+        let reply = r#"{"choices":[{"message":{"role":"assistant","content":"No lookup needed."}}]}"#;
+        let url = fake("200 OK", reply.into()).await;
+        let r = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([])).await.unwrap();
+        assert_eq!(r, Reply { content: "No lookup needed.".into(), tool_calls: vec![] });
+    }
+
+    #[tokio::test]
+    async fn tool_support_errors_surface_for_fallback() {
+        let url = fake("400 Bad Request", r#"{"error":{"message":"tools not supported"}}"#.into()).await;
+        let err = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([])).await.unwrap_err();
+        assert!(matches!(err, LlmError::Api { status: 400, .. }), "{err}");
+    }
+
+    #[test]
+    fn tool_turns_serialize_in_openai_shape() {
+        let call = ToolCall { id: "c1".into(), kind: "function".into(), function: FunctionCall { name: "jira_view".into(), arguments: "{}".into() } };
+        let a = serde_json::to_value(Message::assistant_calls("", vec![call])).unwrap();
+        assert_eq!(a["tool_calls"][0]["type"], "function");
+        assert_eq!(a["tool_calls"][0]["function"]["name"], "jira_view");
+        let t = serde_json::to_value(Message::tool("c1", "result")).unwrap();
+        assert_eq!(t["role"], "tool");
+        assert_eq!(t["tool_call_id"], "c1");
+        // Plain turns stay exactly {role, content}.
+        assert_eq!(serde_json::to_value(Message::user("hi")).unwrap(), serde_json::json!({"role": "user", "content": "hi"}));
     }
 
     #[tokio::test]

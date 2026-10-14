@@ -14,6 +14,8 @@ use fs_store::{ChatMessage, KbDoc, Meeting, MeetingSummary, SearchHit, Segment, 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+mod lookups;
+
 const KEYRING_SERVICE: &str = "fivesight";
 /// Credential Manager entries from before keys were stored per server (see `key_slot`).
 const LEGACY_KEY_OPENROUTER: &str = "openrouter";
@@ -44,6 +46,9 @@ struct Settings {
     fallback_model: String,
     /// Language given to new meetings: "auto", "id" or "en". Each meeting can override it.
     language: String,
+    /// Let Ask read Jira and Confluence through acli (read-only).
+    #[serde(default = "enabled")]
+    atlassian: bool,
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
@@ -65,6 +70,7 @@ impl Default for Settings {
             model: "google/gemini-2.5-flash".into(),
             fallback_model: String::new(),
             language: "auto".into(),
+            atlassian: true,
             has_key: false,
             provider: None,
             openrouter_model: None,
@@ -101,6 +107,10 @@ impl Settings {
     }
 }
 
+fn enabled() -> bool {
+    true
+}
+
 /// The Credential Manager entry for a server: one key per host, so each provider keeps its own
 /// and a key is never sent to a server it wasn't saved for.
 fn key_slot(base_url: &str) -> String {
@@ -124,6 +134,8 @@ struct AppState {
     settings_path: PathBuf,
     /// What the Meet extension reports: who is speaking, and whether a call is on.
     meet: Mutex<MeetState>,
+    /// Last known acli login state; refreshed when Settings opens.
+    atlassian: Mutex<fs_atlassian::Status>,
 }
 
 #[derive(Default)]
@@ -526,7 +538,7 @@ async fn ask(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>
             .chat_history(meeting_id)
             .map_err(err)?
             .into_iter()
-            .map(|m| Message { role: m.role, content: m.content })
+            .map(|m| Message { role: m.role, content: m.content, ..Default::default() })
             .collect();
         st.add_chat(meeting_id, "user", &question, now).map_err(err)?;
         let (mut docs, used) = file_context(&st, &question).map_err(err)?;
@@ -554,8 +566,25 @@ async fn ask(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>
         }
     };
     let _ = app.emit("ask-sources", AskSources { meeting_id, files: sources });
+    let use_atlassian = lock(&state.settings).atlassian && fs_atlassian::find_acli().is_some();
+    let confluence = lock(&state.atlassian).confluence;
 
     tauri::async_runtime::spawn(async move {
+        let mut msgs = msgs;
+        if use_atlassian {
+            let answered = lookups::run_lookups(&app, meeting_id, &cfg, &mut msgs, &question, confluence).await;
+            if let Some(text) = answered {
+                // The AI finished while using tools; show it as one piece.
+                emit_stream(&app, "ask-delta", meeting_id, &text, false, None);
+                let st = app.state::<AppState>();
+                let saved = lock(&st.store).add_chat(meeting_id, "assistant", &text, now_ms());
+                if let Err(e) = saved {
+                    tracing::error!("saving answer: {e}");
+                }
+                emit_stream(&app, "ask-delta", meeting_id, "", true, None);
+                return;
+            }
+        }
         let result = chat_stream(&cfg, &msgs, |d| emit_stream(&app, "ask-delta", meeting_id, d, false, None)).await;
         match result {
             Ok(full) => {
@@ -603,6 +632,16 @@ fn file_context(st: &Store, question: &str) -> fs_store::Result<(Vec<prompts::Co
         docs.push(prompts::ContextDoc { title: format!("file: {}", h.title), text: h.text });
     }
     Ok((docs, titles))
+}
+
+// ---------- jira & confluence ----------
+
+/// Ask acli who is logged in (a second or two), remember it, and return it.
+#[tauri::command]
+async fn atlassian_status(app: AppHandle) -> Result<fs_atlassian::Status, String> {
+    let s = tauri::async_runtime::spawn_blocking(fs_atlassian::status).await.map_err(err)?;
+    *lock(&app.state::<AppState>().atlassian) = s.clone();
+    Ok(s)
 }
 
 // ---------- knowledge base ----------
@@ -781,6 +820,13 @@ pub fn run() {
                 settings: Mutex::new(settings),
                 settings_path,
                 meet: Mutex::new(MeetState::default()),
+                atlassian: Mutex::new(fs_atlassian::Status::default()),
+            });
+            // Asking acli who is logged in takes a second or two; don't hold up startup.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let s = fs_atlassian::status();
+                *lock(&handle.state::<AppState>().atlassian) = s;
             });
 
             // The Meet extension reports speaker names here. Failing to listen is not fatal.
@@ -824,6 +870,7 @@ pub fn run() {
             get_settings,
             save_settings,
             get_bridge,
+            atlassian_status,
             kb_list,
             kb_add,
             kb_refresh,

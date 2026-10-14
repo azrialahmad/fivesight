@@ -1000,6 +1000,7 @@ checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 name = "fivesight-app"
 version = "0.1.0"
 dependencies = [
+ "fs-atlassian",
  "fs-audio",
  "fs-bridge",
  "fs-kb",
@@ -1007,6 +1008,7 @@ dependencies = [
  "fs-pipeline",
  "fs-store",
  "fs-stt",
+ "futures-util",
  "getrandom 0.3.4",
  "keyring",
  "serde",
