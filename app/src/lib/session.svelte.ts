@@ -13,6 +13,7 @@ const DEFAULT_SETTINGS: Settings = {
   autoNotes: true,
   speechModel: 'large-v3-turbo',
   setupDone: true,
+  vocabulary: '',
   hasKey: false
 };
 

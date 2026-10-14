@@ -15,7 +15,7 @@ fn read_wav_16k_mono(path: &str) -> Result<Vec<f32>> {
 }
 
 #[cfg(feature = "engine")]
-fn bench(model: &str, wav: &str, lang: Option<&str>) -> Result<()> {
+fn bench(model: &str, wav: &str, lang: Option<&str>, prompt: Option<&str>) -> Result<()> {
     use std::time::Instant;
     let samples = read_wav_16k_mono(wav)?;
     let audio_s = samples.len() as f32 / 16_000.0;
@@ -30,7 +30,7 @@ fn bench(model: &str, wav: &str, lang: Option<&str>) -> Result<()> {
 
     for beam in [1, 3] {
         let t = Instant::now();
-        let segs = eng.transcribe(&samples, lang, beam, None)?;
+        let segs = eng.transcribe(&samples, lang, beam, prompt)?;
         let dt = t.elapsed().as_secs_f32();
         println!("\nbeam {beam}: {dt:.2}s for {audio_s:.1}s audio (RTF {:.3})", dt / audio_s);
         for s in segs {
@@ -95,6 +95,7 @@ fn live(secs: u64, lang: Option<String>) -> Result<()> {
 
     let mut cfg = PipelineConfig::new("models/ggml-large-v3-turbo.bin".into(), "models/silero_vad.onnx".into());
     cfg.language = fs_stt::lang::LangMode::parse(lang.as_deref().unwrap_or("auto"));
+    cfg.initial_prompt = cfg.language.base_prompt().map(Into::into);
     let (tx, rx) = std::sync::mpsc::channel();
     println!("loading models ...");
     let pipeline = Pipeline::start(cfg, tx)?;
@@ -130,9 +131,10 @@ fn main() -> Result<()> {
         #[cfg(feature = "engine")]
         Some("bench") => {
             let (Some(model), Some(wav)) = (args.get(2), args.get(3)) else {
-                bail!("usage: fivesight-cli bench <ggml-model> <wav16k-mono> [lang]");
+                bail!("usage: fivesight-cli bench <ggml-model> <wav16k-mono> [lang] [prompt]");
             };
-            bench(model, wav, args.get(4).map(String::as_str))
+            let lang = args.get(4).map(String::as_str).filter(|l| *l != "auto");
+            bench(model, wav, lang, args.get(5).map(String::as_str))
         }
         #[cfg(not(feature = "engine"))]
         Some("bench") => bail!("built without the engine feature; rebuild with --features cuda"),

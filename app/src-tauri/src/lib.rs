@@ -10,6 +10,7 @@ use fs_bridge::{Bridge, CallState, Incoming, SpeakerLog};
 use fs_llm::{chat_stream, prompts, LlmConfig, Message};
 use fs_pipeline::{Kind, Pipeline, PipelineConfig, TranscriptEvent};
 use fs_store::{ChatMessage, KbDoc, Meeting, MeetingSummary, SearchHit, Segment, Store};
+use fs_stt::hints;
 use fs_stt::lang::LangMode;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
@@ -66,6 +67,9 @@ struct Settings {
     /// The first-run setup was finished (or skipped); it opens on start until then.
     #[serde(default)]
     setup_done: bool,
+    /// Names and jargon Whisper should listen for, separated by commas or new lines.
+    #[serde(default)]
+    vocabulary: String,
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
@@ -91,6 +95,7 @@ impl Default for Settings {
             auto_notes: true,
             speech_model: default_speech_model(),
             setup_done: false,
+            vocabulary: String::new(),
             has_key: false,
             provider: None,
             openrouter_model: None,
@@ -151,8 +156,57 @@ fn key_slot(base_url: &str) -> String {
 
 struct Recording {
     /// Dropping it stops capture and joins the worker threads.
-    _pipeline: Pipeline,
+    pipeline: Pipeline,
     meeting_id: i64,
+    language: LangMode,
+    /// People heard in this meeting, for the vocabulary hints.
+    names: Vec<String>,
+    /// The prompt Whisper has now, so it's only replaced when it changes.
+    prompt: Option<String>,
+}
+
+/// Whisper's prompt for a meeting: the user's word list, who's on the call, the title and
+/// terms from the notes, so names and jargon come out spelled right.
+fn meeting_prompt(state: &AppState, meeting_id: i64, language: LangMode, names: &[String]) -> Option<String> {
+    let vocabulary = hints::split_list(&lock(&state.settings).vocabulary);
+    let meeting = lock(&state.store).get_meeting(meeting_id).ok();
+    let call_title = lock(&state.meet).call_title.clone();
+    // Meet's own titles are often just the room code (abc-defg-hij).
+    let code_like = |t: &str| t.chars().all(|c| c.is_ascii_lowercase() || c == '-');
+    let title = meeting
+        .as_ref()
+        .map(|m| m.title.clone())
+        .filter(|t| t != "Untitled meeting")
+        .or(call_title.filter(|t| !code_like(t)));
+    let h = hints::Hints {
+        vocabulary,
+        names: names.to_vec(),
+        title,
+        terms: meeting.map(|m| hints::terms_from(&m.notes)).unwrap_or_default(),
+    };
+    hints::build_prompt(language.base_prompt(), &h)
+}
+
+/// Rebuild the running recording's prompt after its notes, title, people or word list change.
+fn refresh_hints(state: &AppState) {
+    let Some((mid, language, names)) =
+        lock(&state.recording).as_ref().map(|r| (r.meeting_id, r.language, r.names.clone()))
+    else {
+        return;
+    };
+    let prompt = meeting_prompt(state, mid, language, &names);
+    let mut rec = lock(&state.recording);
+    if let Some(r) = rec.as_mut().filter(|r| r.meeting_id == mid && r.prompt != prompt) {
+        tracing::debug!("whisper prompt: {}", prompt.as_deref().unwrap_or(""));
+        r.pipeline.set_prompt(prompt.clone());
+        r.prompt = prompt;
+    }
+}
+
+/// Meet's tile names that aren't people.
+fn is_person(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && !n.eq_ignore_ascii_case("you") && !n.to_lowercase().contains("presentation")
 }
 
 struct AppState {
@@ -212,6 +266,7 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     let st = app.state::<AppState>();
     let now = now_ms();
     let mut call: Option<CallEvent> = None;
+    let mut new_name: Option<String> = None;
     {
         let mut meet = lock(&st.meet);
         meet.last_seen = now;
@@ -221,6 +276,7 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
                 // Trust the browser's clock only if it agrees with ours; otherwise use ours.
                 let at = if (at - now).abs() < 5_000 { at } else { now };
                 meet.speakers.apply(&name, speaking, at);
+                new_name = Some(name);
             }
             Incoming::Call { state, title, .. } => match state {
                 CallState::Joined => {
@@ -242,6 +298,19 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     }
     if let Some(c) = call {
         let _ = app.emit("call", c);
+    }
+    // Someone new on the call: add their name to the hints.
+    if let Some(name) = new_name.filter(|n| is_person(n)) {
+        let added = lock(&st.recording).as_mut().is_some_and(|r| {
+            let new = !r.names.iter().any(|n| n == &name);
+            if new {
+                r.names.push(name);
+            }
+            new
+        });
+        if added {
+            refresh_hints(&st);
+        }
     }
 }
 
@@ -387,12 +456,16 @@ fn get_meeting(state: State<'_, AppState>, id: i64) -> Result<MeetingDetail, Str
 
 #[tauri::command]
 fn set_notes(state: State<'_, AppState>, id: i64, notes: String) -> Result<(), String> {
-    lock(&state.store).set_notes(id, &notes).map_err(err)
+    lock(&state.store).set_notes(id, &notes).map_err(err)?;
+    refresh_hints(&state);
+    Ok(())
 }
 
 #[tauri::command]
 fn rename_meeting(state: State<'_, AppState>, id: i64, title: String) -> Result<(), String> {
-    lock(&state.store).rename_meeting(id, &title).map_err(err)
+    lock(&state.store).rename_meeting(id, &title).map_err(err)?;
+    refresh_hints(&state);
+    Ok(())
 }
 
 #[tauri::command]
@@ -430,7 +503,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
 
     // Reuse the meeting or create one. Times in the transcript are measured from when the
     // meeting was created, and segment ids continue after any earlier recording in it.
-    let (mid, offset_ms, seg_base, language, meeting_started) = {
+    let (mid, offset_ms, seg_base, language, meeting_started, names) = {
         let st = lock(&state.store);
         let id = match meeting_id {
             Some(id) => {
@@ -440,18 +513,30 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
             None => st.create_meeting_in("Untitled meeting", now_ms(), &default_language).map_err(err)?,
         };
         let meeting = st.get_meeting(id).map_err(err)?;
-        let base = st.transcript(id).map_err(err)?.iter().map(|s| s.seg_id).max().unwrap_or(0);
-        (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language, meeting.started_at)
+        let transcript = st.transcript(id).map_err(err)?;
+        let base = transcript.iter().map(|s| s.seg_id).max().unwrap_or(0);
+        // People from an earlier recording of this meeting.
+        let mut names: Vec<String> = Vec::new();
+        for n in transcript.into_iter().filter_map(|s| s.speaker) {
+            if is_person(&n) && !names.contains(&n) {
+                names.push(n);
+            }
+        }
+        (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language, meeting.started_at, names)
     };
     tracing::info!("recording with {}", whisper_path.display());
     let mut cfg = PipelineConfig::new(whisper_path, vad_path);
     cfg.language = LangMode::parse(&language);
+    cfg.initial_prompt = meeting_prompt(&state, mid, cfg.language, &names);
+    let prompt = cfg.initial_prompt.clone();
+    tracing::debug!("whisper prompt: {}", prompt.as_deref().unwrap_or(""));
 
     let (tx, rx) = std::sync::mpsc::channel::<TranscriptEvent>();
     // Loading the model takes a few seconds; keep it off the async runtime.
+    let language = cfg.language;
     let pipeline =
         tauri::async_runtime::spawn_blocking(move || Pipeline::start(cfg, tx)).await.map_err(err)?.map_err(err)?;
-    *lock(&state.recording) = Some(Recording { _pipeline: pipeline, meeting_id: mid });
+    *lock(&state.recording) = Some(Recording { pipeline, meeting_id: mid, language, names, prompt });
 
     let forward = app.clone();
     std::thread::spawn(move || {
@@ -801,6 +886,7 @@ fn save_settings(state: State<'_, AppState>, settings: Settings, api_key: Option
     *lock(&state.settings) = to_store;
     *lock(&state.settings_notice) = None;
     tracing::info!("settings saved");
+    refresh_hints(&state);
     Ok(())
 }
 

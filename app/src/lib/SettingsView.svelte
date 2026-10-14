@@ -107,6 +107,7 @@
       form.language !== s.language ||
       form.atlassian !== s.atlassian ||
       form.autoNotes !== s.autoNotes ||
+      form.vocabulary.trim() !== s.vocabulary.trim() ||
       apiKey.trim() !== ''
     );
   });
@@ -166,6 +167,22 @@
       <select id="lang" class={field} bind:value={form.language}>
         {#each languages as [v, label]}<option value={v}>{label}</option>{/each}
       </select>
+    </section>
+
+    <section>
+      <label class="font-semibold" for="vocab">Words to listen for</label>
+      <p class="mt-0.5 text-sm text-muted">
+        Names, products and jargon the transcript keeps getting wrong. Separate them with commas or new lines.
+        The meeting title, people on the call and names in your notes are picked up on their own.
+      </p>
+      <textarea
+        id="vocab"
+        rows="3"
+        class="{field} resize-y"
+        placeholder="Playwright, Claude, backend engineer"
+        spellcheck="false"
+        bind:value={form.vocabulary}
+      ></textarea>
     </section>
 
     <section>
