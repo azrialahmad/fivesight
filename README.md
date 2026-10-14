@@ -10,6 +10,13 @@ audio), so it works with any meeting app.
 
 > **Status:** early. It runs well on the author's machine; expect rough edges elsewhere.
 
+![A meeting in fivesight: your shorthand notes on the left, AI notes on the right, and an answer to "What's the status of PAY-142?" that read the Jira ticket and a runbook](docs/screenshots/meeting.png)
+
+| | | |
+|---|---|---|
+| ![Home: start recording or take notes, with past meetings below](docs/screenshots/home.png) | ![The transcript drawer, with lines from you and from others](docs/screenshots/transcript.png) | ![Your files: Markdown and PDF files Ask can draw on](docs/screenshots/files.png) |
+| Meetings | Transcript drawer | Your files |
+
 ## Features
 
 - **Notes first.** Your notes on the left, AI-expanded notes on the right, written from your
@@ -18,9 +25,10 @@ audio), so it works with any meeting app.
   timestamp citations.
 - **Your files.** Add Markdown, text and PDF files; Ask uses the passages that match a question
   and says which file it used. Files are indexed on your PC.
-- **Jira and Confluence, read-only.** Through Atlassian's official CLI (`acli`). Ask can search
-  and read tickets and read linked Confluence pages. It can't create, edit, comment, assign or
-  move anything: every command is checked against an exact allowlist before it runs.
+- **Jira and Confluence, read-only.** Jira through Atlassian's official CLI (`acli`), Confluence
+  through [confluence-cli](https://github.com/pchuri/confluence-cli). Ask can search and read
+  tickets, and search and read Confluence pages. It can't create, edit, comment, assign or move
+  anything: every command is checked against an exact allowlist before it runs.
 - **Indonesian and English.** Per-meeting language: Indonesian, English, or both with sticky
   per-sentence detection for code-switching.
 - **Google Meet extension (optional).** Names who is speaking in the transcript and offers to
@@ -85,11 +93,19 @@ See [extension/README.md](extension/README.md) for how it works.
 
 ### Jira and Confluence
 
-Install [acli](https://developer.atlassian.com/cloud/acli/guides/install-windows/), then log in:
+For Jira, install [acli](https://developer.atlassian.com/cloud/acli/guides/install-windows/) and
+log in:
 
 ```
 acli jira auth login --web
-acli confluence auth login --web
+```
+
+For Confluence, install [confluence-cli](https://github.com/pchuri/confluence-cli) and set it up
+with your site and an API token:
+
+```
+npm install -g confluence-cli
+confluence init
 ```
 
 **Settings → Jira & Confluence** shows what fivesight can see.
@@ -106,7 +122,7 @@ acli confluence auth login --web
 | `crates/fs-store` | SQLite storage and full-text search |
 | `crates/fs-llm` | OpenAI-compatible streaming client, tool calls, prompts |
 | `crates/fs-kb` | Reads and splits Markdown, text and PDF files |
-| `crates/fs-atlassian` | Read-only `acli` wrapper and its allowlist |
+| `crates/fs-atlassian` | Read-only `acli` and `confluence-cli` wrappers and their allowlists |
 | `crates/fs-bridge` | Local endpoint for the Meet extension |
 | `extension/` | Chrome extension for Google Meet speaker names |
 | `cli/` | Headless benchmark and live-transcription tool for tuning |
