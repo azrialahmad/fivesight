@@ -1,5 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWebview } from '@tauri-apps/api/webview';
+import { open } from '@tauri-apps/plugin-dialog';
 
 export type Source = 'mic' | 'loopback';
 
@@ -95,6 +97,28 @@ export interface CallEvent {
   title: string | null;
 }
 
+export interface KbDoc {
+  id: number;
+  path: string;
+  title: string;
+  kind: 'md' | 'txt' | 'pdf' | string;
+  bytes: number;
+  modified: number;
+  addedAt: number;
+  chunks: number;
+}
+
+export interface KbAddResult {
+  path: string;
+  title: string | null;
+  error: string | null;
+}
+
+export interface AskSources {
+  meetingId: number | null;
+  files: string[];
+}
+
 export interface StreamEvent {
   meetingId: number | null;
   delta: string;
@@ -127,6 +151,14 @@ export interface Api {
   testLlm(s: Settings, apiKey: string | null): Promise<string>;
   openLivePanel(): Promise<void>;
   getBridge(): Promise<BridgeStatus>;
+  kbList(): Promise<KbDoc[]>;
+  kbAdd(paths: string[]): Promise<KbAddResult[]>;
+  kbRefresh(id: number): Promise<void>;
+  kbRemove(id: number): Promise<void>;
+  /** Native file picker; null if cancelled. */
+  pickFiles(): Promise<string[] | null>;
+  onFileDrop(cb: (paths: string[]) => void): Promise<Off>;
+  onAskSources(cb: (e: AskSources) => void): Promise<Off>;
   onCall(cb: (e: CallEvent) => void): Promise<Off>;
   onTranscript(cb: (e: TranscriptEvent) => void): Promise<Off>;
   onRecording(cb: (recording: boolean) => void): Promise<Off>;
@@ -157,6 +189,19 @@ const tauriApi: Api = {
   testLlm: (settings, apiKey) => invoke('test_llm', { settings, apiKey }),
   openLivePanel: () => invoke('open_live_panel'),
   getBridge: () => invoke('get_bridge'),
+  kbList: () => invoke('kb_list'),
+  kbAdd: (paths) => invoke('kb_add', { paths }),
+  kbRefresh: (id) => invoke('kb_refresh', { id }),
+  kbRemove: (id) => invoke('kb_remove', { id }),
+  pickFiles: async () => {
+    const r = await open({ multiple: true, title: 'Add files to fivesight', filters: [{ name: 'Documents', extensions: ['md', 'markdown', 'txt', 'pdf'] }] });
+    return r === null ? null : Array.isArray(r) ? r : [r];
+  },
+  onFileDrop: (cb) =>
+    getCurrentWebview().onDragDropEvent((e) => {
+      if (e.payload.type === 'drop') cb(e.payload.paths);
+    }),
+  onAskSources: (cb) => listen<AskSources>('ask-sources', (e) => cb(e.payload)),
   onCall: (cb) => listen<CallEvent>('call', (e) => cb(e.payload)),
   onTranscript: (cb) => listen<TranscriptEvent>('transcript', (e) => cb(e.payload)),
   onRecording: (cb) => listen<boolean>('recording', (e) => cb(e.payload)),
@@ -185,6 +230,11 @@ function createMockApi(): Api {
     hasKey: false
   };
   const keys = new Set<string>();
+  let kbNext = 3;
+  let kb: KbDoc[] = [
+    { id: 2, path: 'C:\\Users\\you\\Documents\\payments-runbook.md', title: 'Payments runbook', kind: 'md', bytes: 18_400, modified: Date.now() - 86_400_000, addedAt: Date.now() - 3_600_000, chunks: 14 },
+    { id: 1, path: 'C:\\Users\\you\\Documents\\Checkout spec v3.pdf', title: 'Checkout spec v3', kind: 'pdf', bytes: 412_000, modified: Date.now() - 5 * 86_400_000, addedAt: Date.now() - 2 * 86_400_000, chunks: 61 }
+  ];
   const day = 86_400_000;
   const meetings: Meeting[] = [
     { id: 3, title: 'Payments sync', startedAt: Date.now() - 2 * 3600_000, endedAt: Date.now() - 3600_000, notes: '- PAY-142 timeout\n- retry = 30s?\n- Budi owns fix, Fri', enhanced: '## PAY-142 checkout timeout\n\nThe retry logic **waits 30 seconds** before failing on staging.\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: add a regression test', language: 'auto' },
@@ -267,6 +317,7 @@ function createMockApi(): Api {
     ask: async (meetingId, question) => {
       const a = `Based on the transcript, the checkout timeout comes from the retry logic waiting thirty seconds before failing [0:07]. Budi was asked to ship a fix by Friday [0:15].\n\n(Mock answer to: "${question}")`;
       if (meetingId !== null) (chats[meetingId] ??= []).push({ role: 'user', content: question });
+      emit<AskSources>('ask-sources', { meetingId, files: kb.length ? [kb[0].title] : [] });
       await stream('ask-delta', meetingId, a);
       if (meetingId !== null) chats[meetingId].push({ role: 'assistant', content: a });
     },
@@ -287,6 +338,21 @@ function createMockApi(): Api {
     },
     setMeetingLanguage: async (id, language) => void (get(id).language = language),
     openLivePanel: async () => {},
+    kbList: async () => kb.map((d) => ({ ...d })),
+    kbAdd: async (paths) =>
+      paths.map((p) => {
+        const name = p.split(/[\\/]/).pop() || p;
+        if (!/\.(md|markdown|txt|pdf)$/i.test(name)) return { path: p, title: null, error: name + " isn't a supported file (use .md, .txt or .pdf)" };
+        const title = name.replace(/\.[^.]+$/, '');
+        kb = kb.filter((d) => d.path !== p);
+        kb.unshift({ id: kbNext++, path: p, title, kind: name.split('.').pop()!.toLowerCase(), bytes: 2048, modified: Date.now(), addedAt: Date.now(), chunks: 3 });
+        return { path: p, title, error: null };
+      }),
+    kbRefresh: async () => {},
+    kbRemove: async (id) => void (kb = kb.filter((d) => d.id !== id)),
+    pickFiles: async () => ['C:\\Users\\you\\Documents\\Onboarding notes.md'],
+    onFileDrop: async () => () => {},
+    onAskSources: (cb) => sub('ask-sources', cb),
     getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: false, inCall: false, callTitle: null, error: null }),
     onCall: (cb) => sub('call', cb),
     onTranscript: (cb) => sub('transcript', cb),

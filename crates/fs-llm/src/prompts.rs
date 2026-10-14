@@ -75,8 +75,10 @@ pub fn ask(
     history: &[Message],
 ) -> Vec<Message> {
     let system = format!(
-        "You answer questions about a meeting using only the provided material.\n\
+        "You answer questions about a meeting using only the provided material: the user's notes, \
+         the transcript, and passages from the user's own files.\n\
          - Cite when something was said as [m:ss] using the transcript timestamps.\n\
+         - When you use a file passage, name the file in brackets, e.g. [Payments runbook].\n\
          - If the answer is not in the material, say you can't find it. Do not guess.\n\
          - Be concise. Mirror the language of the question.\n{UNTRUSTED}"
     );

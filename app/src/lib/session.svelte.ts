@@ -1,8 +1,8 @@
 import { api, inTauri } from './api';
-import type { CallEvent, ChatMsg, Hit, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
+import type { AskSources, CallEvent, ChatMsg, Hit, KbAddResult, KbDoc, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
 export { inTauri };
-export type View = 'home' | 'meeting' | 'settings';
+export type View = 'home' | 'meeting' | 'settings' | 'knowledge';
 
 const DEFAULT_SETTINGS: Settings = {
   baseUrl: 'https://openrouter.ai/api/v1',
@@ -35,6 +35,13 @@ class Session {
   /** A Meet call the extension saw start (offer to record) or end (offer to stop). */
   callPrompt = $state<CallEvent | null>(null);
 
+  kb = $state<KbDoc[]>([]);
+  kbBusy = $state(false);
+  /** Files that couldn't be added, from the last add. */
+  kbErrors = $state<KbAddResult[]>([]);
+  /** Files the latest answer drew on. */
+  answerSources = $state<string[]>([]);
+
   drawer = $state(false);
   query = $state('');
   hits = $state<Hit[]>([]);
@@ -59,6 +66,10 @@ class Session {
         }
       }),
       api.onCall((e) => this.onCall(e)),
+      api.onAskSources((e) => this.onAskSources(e)),
+      api.onFileDrop((paths) => {
+        if (this.view === 'knowledge') this.addFiles(paths);
+      }),
       api.onEnhance((e) => this.onEnhance(e)),
       api.onAsk((e) => this.onAsk(e))
     ]);
@@ -67,7 +78,7 @@ class Session {
     this.recordingMeetingId = status.recordingMeetingId;
     this.modelsDir = status.modelsDir;
     this.settings = settings;
-    await this.refreshMeetings();
+    await Promise.all([this.refreshMeetings(), this.loadKb()]);
     if (status.recording && status.recordingMeetingId !== null) await this.openMeeting(status.recordingMeetingId);
   }
 
@@ -241,6 +252,7 @@ class Session {
     const q = question.trim();
     if (!q || this.asking) return;
     this.chat.push({ role: 'user', content: q });
+    this.answerSources = [];
     this.asking = true;
     this.answerLive = '';
     this.error = null;
@@ -262,6 +274,50 @@ class Session {
       this.chat.push({ role: 'assistant', content: this.answerLive });
       this.answerLive = '';
     } else this.answerLive += e.delta;
+  }
+
+  private onAskSources(e: AskSources) {
+    if (e.meetingId === (this.current?.id ?? null)) this.answerSources = e.files;
+  }
+
+  async loadKb() {
+    this.kb = await api.kbList();
+  }
+
+  async addFiles(paths: string[]) {
+    if (!paths.length || this.kbBusy) return;
+    this.kbBusy = true;
+    this.kbErrors = [];
+    try {
+      const results = await api.kbAdd(paths);
+      this.kbErrors = results.filter((r) => r.error);
+      await this.loadKb();
+    } catch (e) {
+      this.kbErrors = [{ path: '', title: null, error: String(e) }];
+    } finally {
+      this.kbBusy = false;
+    }
+  }
+
+  async pickFiles() {
+    const paths = await api.pickFiles();
+    if (paths) await this.addFiles(paths);
+  }
+
+  async refreshDoc(id: number) {
+    this.kbErrors = [];
+    try {
+      await api.kbRefresh(id);
+    } catch (e) {
+      const d = this.kb.find((x) => x.id === id);
+      this.kbErrors = [{ path: d?.path ?? '', title: d?.title ?? null, error: String(e) }];
+    }
+    await this.loadKb();
+  }
+
+  async removeDoc(id: number) {
+    await api.kbRemove(id);
+    await this.loadKb();
   }
 
   async runSearch(q: string) {

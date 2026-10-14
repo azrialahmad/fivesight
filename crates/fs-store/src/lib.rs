@@ -58,6 +58,32 @@ CREATE TABLE IF NOT EXISTS chat (
     created_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS chat_meeting ON chat(meeting_id, id);
+
+CREATE TABLE IF NOT EXISTS kb_docs (
+    id          INTEGER PRIMARY KEY,
+    path        TEXT NOT NULL UNIQUE,
+    title       TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    bytes       INTEGER NOT NULL,
+    modified    INTEGER NOT NULL,
+    added_at    INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kb_chunks (
+    id          INTEGER PRIMARY KEY,
+    doc_id      INTEGER NOT NULL REFERENCES kb_docs(id) ON DELETE CASCADE,
+    ord         INTEGER NOT NULL,
+    text        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS kb_chunks_doc ON kb_chunks(doc_id, ord);
+CREATE VIRTUAL TABLE IF NOT EXISTS kb_fts USING fts5(
+    text, content='kb_chunks', content_rowid='id', tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS kb_chunks_ai AFTER INSERT ON kb_chunks BEGIN
+    INSERT INTO kb_fts(rowid, text) VALUES (new.id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS kb_chunks_ad AFTER DELETE ON kb_chunks BEGIN
+    INSERT INTO kb_fts(kb_fts, rowid, text) VALUES ('delete', old.id, old.text);
+END;
 ";
 
 pub struct Store {
@@ -115,6 +141,55 @@ pub struct ChatMessage {
 }
 
 /// Turn free text into a safe FTS5 query: each word quoted, joined with AND.
+/// A file in the knowledge base.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KbDoc {
+    pub id: i64,
+    pub path: String,
+    pub title: String,
+    pub kind: String,
+    pub bytes: i64,
+    pub modified: i64,
+    pub added_at: i64,
+    pub chunks: i64,
+}
+
+/// A passage from the knowledge base that matched a question.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KbHit {
+    pub doc_id: i64,
+    pub title: String,
+    pub path: String,
+    pub text: String,
+}
+
+/// Words that say nothing about the topic, in English and Indonesian.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "at", "by", "with", "from", "is", "are", "was",
+    "were", "be", "been", "it", "this", "that", "these", "those", "what", "which", "who", "whom", "when", "where",
+    "why", "how", "do", "does", "did", "can", "could", "should", "would", "will", "about", "we", "you", "i", "our",
+    "my", "me", "us", "they", "them", "there", "here", "any", "some", "tell", "please", "yang", "dan", "di", "ke",
+    "dari", "ini", "itu", "apa", "siapa", "kapan", "dimana", "mana", "bagaimana", "gimana", "kenapa", "mengapa",
+    "untuk", "dengan", "pada", "adalah", "akan", "sudah", "udah", "belum", "kita", "kami", "saya", "aku", "kamu",
+    "anda", "mereka", "tolong", "ada", "atau", "juga", "tidak", "nggak", "gak", "ya", "dong", "sih", "kah",
+];
+
+/// Any of the question's meaningful words, best matches first (for finding context, not for the search box).
+fn relevant_query(q: &str) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let terms: Vec<String> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .map(|w| w.to_lowercase())
+        .filter(|w| w.chars().count() >= 2 && !STOPWORDS.contains(&w.as_str()))
+        .filter(|w| seen.insert(w.clone()))
+        .take(16)
+        .map(|w| format!("\"{w}\""))
+        .collect();
+    (!terms.is_empty()).then(|| terms.join(" OR "))
+}
+
 fn fts_query(q: &str) -> Option<String> {
     let terms: Vec<String> = q
         .split_whitespace()
@@ -285,7 +360,21 @@ impl Store {
 
     /// Full-text search across every meeting's transcript.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
-        let Some(q) = fts_query(query) else { return Ok(Vec::new()) };
+        match fts_query(query) {
+            Some(q) => self.search_fts(&q, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Transcript lines sharing any meaningful word with a question, best first.
+    pub fn search_relevant(&self, question: &str, limit: usize) -> Result<Vec<SearchHit>> {
+        match relevant_query(question) {
+            Some(q) => self.search_fts(&q, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn search_fts(&self, q: &str, limit: usize) -> Result<Vec<SearchHit>> {
         let mut st = self.conn.prepare(
             "SELECT s.meeting_id, m.title, s.start_ms, snippet(segments_fts, 0, '[', ']', '…', 12)
              FROM segments_fts
@@ -296,6 +385,84 @@ impl Store {
         )?;
         let rows = st.query_map(params![q, limit as i64], |r| {
             Ok(SearchHit { meeting_id: r.get(0)?, meeting_title: r.get(1)?, start_ms: r.get(2)?, snippet: r.get(3)? })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---------- knowledge base ----------
+
+    /// Add a file, or replace it if that path is already in the knowledge base.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kb_put(
+        &self,
+        path: &str,
+        title: &str,
+        kind: &str,
+        bytes: i64,
+        modified: i64,
+        now: i64,
+        chunks: &[String],
+    ) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM kb_docs WHERE path = ?1", params![path])?;
+        tx.execute(
+            "INSERT INTO kb_docs (path, title, kind, bytes, modified, added_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![path, title, kind, bytes, modified, now],
+        )?;
+        let id = tx.last_insert_rowid();
+        {
+            let mut ins = tx.prepare("INSERT INTO kb_chunks (doc_id, ord, text) VALUES (?1, ?2, ?3)")?;
+            for (i, c) in chunks.iter().enumerate() {
+                ins.execute(params![id, i as i64, c])?;
+            }
+        }
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn kb_docs(&self) -> Result<Vec<KbDoc>> {
+        let mut st = self.conn.prepare(
+            "SELECT d.id, d.path, d.title, d.kind, d.bytes, d.modified, d.added_at,
+                    (SELECT COUNT(*) FROM kb_chunks c WHERE c.doc_id = d.id)
+             FROM kb_docs d ORDER BY d.added_at DESC, d.id DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(KbDoc {
+                id: r.get(0)?,
+                path: r.get(1)?,
+                title: r.get(2)?,
+                kind: r.get(3)?,
+                bytes: r.get(4)?,
+                modified: r.get(5)?,
+                added_at: r.get(6)?,
+                chunks: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    pub fn kb_doc(&self, id: i64) -> Result<KbDoc> {
+        self.kb_docs()?.into_iter().find(|d| d.id == id).ok_or(StoreError::NotFound(id))
+    }
+
+    pub fn kb_remove(&self, id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM kb_docs WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Passages that share meaningful words with the question, best first.
+    pub fn kb_search(&self, question: &str, limit: usize) -> Result<Vec<KbHit>> {
+        let Some(q) = relevant_query(question) else { return Ok(Vec::new()) };
+        let mut st = self.conn.prepare(
+            "SELECT c.doc_id, d.title, d.path, c.text
+             FROM kb_fts
+             JOIN kb_chunks c ON c.id = kb_fts.rowid
+             JOIN kb_docs d ON d.id = c.doc_id
+             WHERE kb_fts MATCH ?1
+             ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![q, limit as i64], |r| {
+            Ok(KbHit { doc_id: r.get(0)?, title: r.get(1)?, path: r.get(2)?, text: r.get(3)? })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -379,6 +546,52 @@ mod tests {
         assert_eq!(t[0].speaker, None);
         s.add_segment_by(1, "loopback", 2, 5, "after", Some("Sari")).unwrap();
         assert_eq!(s.transcript(1).unwrap()[1].speaker.as_deref(), Some("Sari"));
+    }
+
+    #[test]
+    fn knowledge_base_finds_passages_for_a_natural_question() {
+        let s = store();
+        let chunks = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let a = s
+            .kb_put("C:/docs/runbook.md", "Payments runbook", "md", 100, 1, 10, &chunks(&["# Retry\nThe checkout retry waits 30 seconds before failing.", "# On-call\nPage Budi."]))
+            .unwrap();
+        s.kb_put("C:/docs/menu.txt", "Lunch", "txt", 10, 1, 11, &chunks(&["Nasi goreng on Fridays."])).unwrap();
+
+        // Every word must match for the search box, but not for finding context.
+        let hits = s.kb_search("How long does the checkout retry wait?", 5).unwrap();
+        assert_eq!(hits[0].doc_id, a);
+        assert!(hits[0].text.contains("30 seconds"));
+        assert!(s.kb_search("what is the", 5).unwrap().is_empty(), "stop words alone match nothing");
+        assert!(s.kb_search("\"); DROP TABLE kb_docs; --", 5).is_ok());
+
+        let docs = s.kb_docs().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].title, "Lunch", "newest first");
+        assert_eq!(docs[1].chunks, 2);
+    }
+
+    #[test]
+    fn knowledge_base_replaces_by_path_and_removal_cleans_the_index() {
+        let s = store();
+        let one = vec!["old text about deploys".to_string()];
+        let two = vec!["new text about rollbacks".to_string()];
+        s.kb_put("C:/a.md", "A", "md", 1, 1, 1, &one).unwrap();
+        let id = s.kb_put("C:/a.md", "A v2", "md", 1, 2, 2, &two).unwrap();
+        assert_eq!(s.kb_docs().unwrap().len(), 1);
+        assert!(s.kb_search("deploys", 5).unwrap().is_empty(), "replaced text must not linger in search");
+        assert_eq!(s.kb_search("rollbacks", 5).unwrap()[0].title, "A v2");
+        s.kb_remove(id).unwrap();
+        assert!(s.kb_docs().unwrap().is_empty());
+        assert!(s.kb_search("rollbacks", 5).unwrap().is_empty());
+    }
+
+    #[test]
+    fn relevant_transcript_search_matches_any_word() {
+        let s = store();
+        let id = s.create_meeting("Payments sync", 0).unwrap();
+        s.add_segment(id, "loopback", 1, 0, "the checkout timeout is thirty seconds").unwrap();
+        assert!(s.search("what was the checkout timeout again", 5).unwrap().is_empty());
+        assert_eq!(s.search_relevant("what was the checkout timeout again", 5).unwrap().len(), 1);
     }
 
     #[test]

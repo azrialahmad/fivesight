@@ -4,6 +4,7 @@
   import Icon from './lib/Icon.svelte';
   import MeetingView from './lib/MeetingView.svelte';
   import SettingsView from './lib/SettingsView.svelte';
+  import KnowledgeView from './lib/KnowledgeView.svelte';
   import { session, inTauri } from './lib/session.svelte';
 
   onMount(() => session.init());
@@ -29,6 +30,9 @@
     <nav class="flex flex-col gap-0.5" aria-label="Main">
       <button class="{nav} {session.view === 'home' ? 'bg-card font-semibold shadow-sm' : 'text-muted hover:bg-soft'}" aria-current={session.view === 'home' ? 'page' : undefined} onclick={() => session.go('home')}>
         <Icon name="home" size={19} /> Meetings
+      </button>
+      <button class="{nav} {session.view === 'knowledge' ? 'bg-card font-semibold shadow-sm' : 'text-muted hover:bg-soft'}" aria-current={session.view === 'knowledge' ? 'page' : undefined} onclick={() => session.go('knowledge')}>
+        <Icon name="book" size={19} /> Your files
       </button>
       <button class="{nav} {session.view === 'settings' ? 'bg-card font-semibold shadow-sm' : 'text-muted hover:bg-soft'}" aria-current={session.view === 'settings' ? 'page' : undefined} onclick={() => session.go('settings')}>
         <Icon name="settings" size={19} /> Settings
@@ -80,6 +84,8 @@
       <MeetingView />
     {:else if session.view === 'settings'}
       <SettingsView />
+    {:else if session.view === 'knowledge'}
+      <KnowledgeView />
     {:else}
       <Home />
     {/if}

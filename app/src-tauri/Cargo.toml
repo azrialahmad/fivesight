@@ -25,5 +25,7 @@ fs-pipeline = { path = "../../crates/fs-pipeline" }
 fs-store = { path = "../../crates/fs-store" }
 fs-llm = { path = "../../crates/fs-llm" }
 fs-bridge = { path = "../../crates/fs-bridge" }
+fs-kb = { path = "../../crates/fs-kb" }
+tauri-plugin-dialog = "2"
 getrandom = "0.3"
 keyring = { version = "3", features = ["windows-native"] }

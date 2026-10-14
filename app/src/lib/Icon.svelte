@@ -1,7 +1,8 @@
 <script lang="ts">
   type Name =
     | 'mic' | 'stop' | 'history' | 'settings' | 'pip' | 'close' | 'delete' | 'spark'
-    | 'plus' | 'search' | 'send' | 'lines' | 'home' | 'chevron' | 'check';
+    | 'plus' | 'search' | 'send' | 'lines' | 'home' | 'chevron' | 'check'
+    | 'book' | 'refresh' | 'upload';
 
   let { name, size = 20 }: { name: Name; size?: number } = $props();
 
@@ -22,7 +23,10 @@
     lines: 'M3 18h12v-2H3v2zM3 6v2h18V6H3zm0 7h18v-2H3v2z',
     home: 'M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z',
     chevron: 'M10 6 8.59 7.41 13.17 12l-4.58 4.59L10 18l6-6z',
-    check: 'M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z'
+    check: 'M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z',
+    book: 'M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 4h5v8l-2.5-1.5L6 12V4z',
+    refresh: 'M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
+    upload: 'M5 20h14v-2H5v2zm0-10h4v6h6v-6h4l-7-7-7 7z'
   };
 </script>
 

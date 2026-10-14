@@ -37,6 +37,12 @@
           <div class="rise max-w-[92%] rounded-2xl rounded-bl-md bg-paper px-4 py-3"><Markdown text={m.content} /></div>
         {/if}
       {/each}
+      {#if session.answerSources.length && session.chat.at(-1)?.role === 'assistant' && !session.asking}
+        <p class="flex flex-wrap items-center gap-1.5 pl-1 text-[11px] text-muted">
+          <Icon name="book" size={13} /> From your files:
+          {#each session.answerSources as f}<span class="rounded-full bg-soft px-2 py-0.5 font-medium text-ink">{f}</span>{/each}
+        </p>
+      {/if}
       {#if session.asking}
         <div class="max-w-[92%] rounded-2xl rounded-bl-md bg-paper px-4 py-3">
           {#if session.answerLive}
@@ -69,7 +75,7 @@
   >
     <input
       class="min-w-0 flex-1 bg-transparent py-1.5 text-sm outline-none placeholder:text-faint"
-      placeholder="Ask about this meeting…"
+      placeholder={session.kb.length ? 'Ask about this meeting or your files…' : 'Ask about this meeting…'}
       aria-label="Ask about this meeting"
       bind:value={text}
     />

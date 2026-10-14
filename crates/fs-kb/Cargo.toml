@@ -1,0 +1,8 @@
+[package]
+name = "fs-kb"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+pdf-extract = "0.9"

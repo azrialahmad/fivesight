@@ -10,7 +10,7 @@ use fs_bridge::{Bridge, CallState, Incoming, SpeakerLog};
 use fs_llm::{chat_stream, prompts, LlmConfig, Message};
 use fs_pipeline::{Kind, Pipeline, PipelineConfig, TranscriptEvent};
 use fs_stt::lang::LangMode;
-use fs_store::{ChatMessage, Meeting, MeetingSummary, SearchHit, Segment, Store};
+use fs_store::{ChatMessage, KbDoc, Meeting, MeetingSummary, SearchHit, Segment, Store};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -519,6 +519,7 @@ async fn ask(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>
     let cfg = llm_config(&state)?;
     let now = now_ms();
     let key_sent = cfg.api_key.is_some();
+    let sources: Vec<String>;
     let msgs = {
         let st = lock(&state.store);
         let history: Vec<Message> = st
@@ -528,24 +529,31 @@ async fn ask(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>
             .map(|m| Message { role: m.role, content: m.content })
             .collect();
         st.add_chat(meeting_id, "user", &question, now).map_err(err)?;
+        let (mut docs, used) = file_context(&st, &question).map_err(err)?;
+        sources = used;
         match meeting_id {
             Some(id) => {
                 let m = st.get_meeting(id).map_err(err)?;
                 let t = st.transcript(id).map_err(err)?;
-                prompts::ask(&question, &m.notes, &prompts::format_transcript(&lines(&t), 60_000), &[], &history)
+                prompts::ask(&question, &m.notes, &prompts::format_transcript(&lines(&t), 60_000), &docs, &history)
             }
             None => {
-                // No meeting open: ground the answer in the best-matching transcript lines.
-                let docs: Vec<prompts::ContextDoc> = st
-                    .search(&question, 8)
+                // No meeting open: ground the answer in the best-matching transcript lines too.
+                let mut found: Vec<prompts::ContextDoc> = st
+                    .search_relevant(&question, 8)
                     .map_err(err)?
                     .into_iter()
-                    .map(|h| prompts::ContextDoc { title: format!("{} at {}", h.meeting_title, h.start_ms / 1000), text: h.snippet })
+                    .map(|h| prompts::ContextDoc {
+                        title: format!("{} at {}", h.meeting_title, clock_label(h.start_ms)),
+                        text: h.snippet,
+                    })
                     .collect();
-                prompts::ask(&question, "", "", &docs, &history)
+                found.append(&mut docs);
+                prompts::ask(&question, "", "", &found, &history)
             }
         }
     };
+    let _ = app.emit("ask-sources", AskSources { meeting_id, files: sources });
 
     tauri::async_runtime::spawn(async move {
         let result = chat_stream(&cfg, &msgs, |d| emit_stream(&app, "ask-delta", meeting_id, d, false, None)).await;
@@ -562,6 +570,105 @@ async fn ask(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>
         }
     });
     Ok(())
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AskSources {
+    meeting_id: Option<i64>,
+    /// Titles of the files whose passages were given to the model.
+    files: Vec<String>,
+}
+
+fn clock_label(ms: i64) -> String {
+    let s = ms.max(0) / 1000;
+    format!("{}:{:02}", s / 60, s % 60)
+}
+
+/// Up to five passages from the user's files that share words with the question,
+/// capped so they never crowd out the meeting itself.
+fn file_context(st: &Store, question: &str) -> fs_store::Result<(Vec<prompts::ContextDoc>, Vec<String>)> {
+    const BUDGET: usize = 8_000;
+    let mut docs = Vec::new();
+    let mut titles: Vec<String> = Vec::new();
+    let mut used = 0;
+    for h in st.kb_search(question, 5)? {
+        if used + h.text.len() > BUDGET {
+            break;
+        }
+        used += h.text.len();
+        if !titles.contains(&h.title) {
+            titles.push(h.title.clone());
+        }
+        docs.push(prompts::ContextDoc { title: format!("file: {}", h.title), text: h.text });
+    }
+    Ok((docs, titles))
+}
+
+// ---------- knowledge base ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KbAddResult {
+    path: String,
+    title: Option<String>,
+    error: Option<String>,
+}
+
+fn index_file(st: &AppState, path: &std::path::Path) -> Result<String, String> {
+    let extracted = fs_kb::extract(path).map_err(err)?;
+    let chunks = fs_kb::chunk(&extracted.text);
+    let meta = std::fs::metadata(path).map_err(err)?;
+    let modified = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let shown = path.to_string_lossy().to_string();
+    lock(&st.store)
+        .kb_put(&shown, &extracted.title, extracted.kind.as_str(), meta.len() as i64, modified, now_ms(), &chunks)
+        .map_err(err)?;
+    Ok(extracted.title)
+}
+
+#[tauri::command]
+fn kb_list(state: State<'_, AppState>) -> Result<Vec<KbDoc>, String> {
+    lock(&state.store).kb_docs().map_err(err)
+}
+
+/// Read and index files. PDFs can take a moment, so this runs off the UI thread.
+#[tauri::command]
+async fn kb_add(app: AppHandle, paths: Vec<String>) -> Result<Vec<KbAddResult>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        paths
+            .into_iter()
+            .map(|p| match index_file(&st, std::path::Path::new(&p)) {
+                Ok(title) => KbAddResult { path: p, title: Some(title), error: None },
+                Err(e) => KbAddResult { path: p, title: None, error: Some(e) },
+            })
+            .collect()
+    })
+    .await
+    .map_err(err)
+}
+
+/// Re-read a file that changed on disk.
+#[tauri::command]
+async fn kb_refresh(app: AppHandle, id: i64) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let st = app.state::<AppState>();
+        let path = lock(&st.store).kb_doc(id).map_err(err)?.path;
+        index_file(&st, std::path::Path::new(&path)).map(|_| ())
+    })
+    .await
+    .map_err(err)?
+}
+
+#[tauri::command]
+fn kb_remove(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    lock(&state.store).kb_remove(id).map_err(err)
 }
 
 // ---------- settings ----------
@@ -642,6 +749,7 @@ async fn open_live_panel(app: AppHandle) -> Result<(), String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -716,6 +824,10 @@ pub fn run() {
             get_settings,
             save_settings,
             get_bridge,
+            kb_list,
+            kb_add,
+            kb_refresh,
+            kb_remove,
             key_saved,
             forget_key,
             test_llm,
