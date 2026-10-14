@@ -177,6 +177,11 @@ class Session {
     const key = `${ev.source}:${ev.segmentId}`;
     const final = ev.kind === 'final';
     const i = this.segs.findIndex((s) => s.key === key);
+    // An empty final means the line was dropped (noise, or echo of the call).
+    if (final && !ev.text.trim()) {
+      if (i !== -1 && !this.segs[i].final) this.segs.splice(i, 1);
+      return;
+    }
     if (i === -1) this.segs.push({ key, source: ev.source, id: ev.segmentId, startMs: ev.startMs, text: ev.text, final, speaker: ev.speaker ?? null });
     else if (!this.segs[i].final) {
       this.segs[i].text = ev.text;
