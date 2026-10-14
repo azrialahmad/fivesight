@@ -2,7 +2,7 @@
   type Name =
     | 'mic' | 'stop' | 'history' | 'settings' | 'pip' | 'close' | 'delete' | 'spark'
     | 'plus' | 'search' | 'send' | 'lines' | 'home' | 'chevron' | 'check'
-    | 'book' | 'refresh' | 'upload';
+    | 'book' | 'refresh' | 'upload' | 'logo';
 
   let { name, size = 20 }: { name: Name; size?: number } = $props();
 
@@ -26,7 +26,9 @@
     check: 'M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z',
     book: 'M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 4h5v8l-2.5-1.5L6 12V4z',
     refresh: 'M17.65 6.35A7.958 7.958 0 0 0 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0 1 12 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
-    upload: 'M5 20h14v-2H5v2zm0-10h4v6h6v-6h4l-7-7-7 7z'
+    upload: 'M5 20h14v-2H5v2zm0-10h4v6h6v-6h4l-7-7-7 7z',
+    // The fivesight mark, same shapes as src-tauri/icons/icon.svg.
+    logo: 'M10.5 5.55Q11.8 12.2 18.45 13.5Q11.8 14.8 10.5 21.45Q9.2 14.8 2.55 13.5Q9.2 12.2 10.5 5.55ZM18 3.15Q18.55 5.9 21.3 6.45Q18.55 7 18 9.75Q17.45 7 14.7 6.45Q17.45 5.9 18 3.15Z'
   };
 </script>
 

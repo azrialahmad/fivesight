@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- fivesight: lime sparkle on an ink tile, same mark as the in-app logo. -->
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="#101010"/>
+  <path fill="#cdf23f" d="M452 254 Q504 520 770 572 Q504 624 452 890 Q400 624 134 572 Q400 520 452 254Z"/>
+  <path fill="#cdf23f" d="M752 158 Q774 268 884 290 Q774 312 752 422 Q730 312 620 290 Q730 268 752 158Z"/>
+</svg>
