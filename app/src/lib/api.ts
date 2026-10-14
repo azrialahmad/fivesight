@@ -165,6 +165,8 @@ export interface Api {
   search(query: string): Promise<Hit[]>;
   getSettings(): Promise<Settings>;
   saveSettings(s: Settings, apiKey: string | null): Promise<void>;
+  /** Why settings fell back to defaults at startup, if they did. */
+  settingsNotice(): Promise<string | null>;
   keySaved(baseUrl: string): Promise<boolean>;
   forgetKey(baseUrl: string): Promise<void>;
   /** Sends a one-word request with the form's values; resolves with a message or rejects with a fix. */
@@ -190,6 +192,12 @@ export interface Api {
 
 export const inTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
+/** Model names never contain "://" or start with "www."; server addresses do. Mirrors the backend check. */
+export const looksLikeAddress = (s: string) => {
+  const v = s.trim().toLowerCase();
+  return v.includes('://') || v.startsWith('www.');
+};
+
 const tauriApi: Api = {
   status: () => invoke('get_status'),
   startRecording: (meetingId) => invoke('start_recording', { meetingId }),
@@ -206,6 +214,7 @@ const tauriApi: Api = {
   search: (query) => invoke('search', { query }),
   getSettings: () => invoke('get_settings'),
   saveSettings: (settings, apiKey) => invoke('save_settings', { settings, apiKey }),
+  settingsNotice: () => invoke('settings_notice'),
   keySaved: (baseUrl) => invoke('key_saved', { baseUrl }),
   forgetKey: (baseUrl) => invoke('forget_key', { baseUrl }),
   testLlm: (settings, apiKey) => invoke('test_llm', { settings, apiKey }),
@@ -357,9 +366,13 @@ function createMockApi(): Api {
       ),
     getSettings: async () => ({ ...settings }),
     saveSettings: async (s, key) => {
+      for (const [field, value] of [['Model', s.model], ['Fallback model', s.fallbackModel]]) {
+        if (looksLikeAddress(value)) throw `${field} should be a model name, not a server address. Put the address in Server address.`;
+      }
       if (key) keys.add(s.baseUrl.trim());
       settings = { ...s, hasKey: keys.has(s.baseUrl.trim()) };
     },
+    settingsNotice: async () => null,
     keySaved: async (baseUrl) => keys.has(baseUrl.trim()),
     forgetKey: async (baseUrl) => void keys.delete(baseUrl.trim()),
     testLlm: async (s, key) => {
