@@ -108,6 +108,7 @@
       form.fallbackModel.trim() !== s.fallbackModel.trim() ||
       form.language !== s.language ||
       form.atlassian !== s.atlassian ||
+      form.autoNotes !== s.autoNotes ||
       apiKey.trim() !== ''
     );
   });
@@ -253,8 +254,18 @@
         {/if}
       </div>
 
+      <label class="mt-5 flex cursor-pointer items-start gap-2.5 text-sm">
+        <input type="checkbox" class="mt-0.5 h-4 w-4 accent-ink" bind:checked={form.autoNotes} />
+        <span>
+          Update AI notes automatically while recording
+          <span class="mt-0.5 block text-xs text-muted">
+            When you pause typing and as the meeting goes on: about one AI request a minute while things change, and one when you stop.
+          </span>
+        </span>
+      </label>
+
       <p class="mt-3 text-xs text-muted">
-        {isLocal ? 'Nothing leaves this PC.' : 'Meeting text is sent to this server when you enhance notes or ask a question.'}
+        {isLocal ? 'Nothing leaves this PC.' : 'Meeting text is sent to this server when AI notes are written or you ask a question.'}
       </p>
     </section>
 

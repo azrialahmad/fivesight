@@ -10,8 +10,18 @@ const DEFAULT_SETTINGS: Settings = {
   fallbackModel: '',
   language: 'auto',
   atlassian: true,
+  autoNotes: true,
   hasKey: false
 };
+
+/** Automatic AI notes while recording: at most one pass this often... */
+const AUTO_MIN_GAP_MS = 45_000;
+/** ...after the user stops typing in their notes for this long... */
+const AUTO_TYPING_PAUSE_MS = 4_000;
+/** ...or once this many new transcript lines are in... */
+const AUTO_NEW_LINES = 6;
+/** ...or after this long with any new line at all. */
+const AUTO_MAX_WAIT_MS = 90_000;
 
 class Session {
   view = $state<View>('home');
@@ -28,8 +38,12 @@ class Session {
   error = $state<string | null>(null);
   modelsDir = $state<string | null>(null);
 
-  enhancing = $state(false);
+  /** Meeting whose AI notes are being written, and whether that is an automatic pass. */
+  enhancingId = $state<number | null>(null);
+  enhancingAuto = $state(false);
   enhancedLive = $state('');
+  /** Last automatic pass that failed; shown quietly, it retries on the next pass. */
+  autoError = $state<string | null>(null);
   asking = $state(false);
   answerLive = $state('');
 
@@ -51,9 +65,18 @@ class Session {
 
   sorted = $derived([...this.segs].sort((a, b) => a.startMs - b.startMs));
   isRecordingCurrent = $derived(this.recording && this.recordingMeetingId === this.current?.id);
+  enhancing = $derived(this.enhancingId !== null && this.enhancingId === this.current?.id);
 
   private notesTimer: ReturnType<typeof setTimeout> | null = null;
   private ready = false;
+
+  // Automatic AI notes for the meeting being recorded (which need not be the one on screen).
+  private autoTimer: ReturnType<typeof setInterval> | null = null;
+  private lastAutoAt = 0;
+  private newLines = 0;
+  private notesEditedAt = 0;
+  /** Recording stopped with changes the last pass hasn't seen: run once more, not live. */
+  private finalPassFor: number | null = null;
 
   async init() {
     if (this.ready) return;
@@ -61,6 +84,7 @@ class Session {
     await Promise.all([
       api.onTranscript((e) => this.ingest(e)),
       api.onRecording((r) => {
+        if (!r && this.recordingMeetingId !== null) this.recordingEnded(this.recordingMeetingId);
         this.recording = r;
         if (!r) {
           this.recordingMeetingId = null;
@@ -83,7 +107,10 @@ class Session {
     this.modelsDir = status.modelsDir;
     this.settings = settings;
     await Promise.all([this.refreshMeetings(), this.loadKb()]);
-    if (status.recording && status.recordingMeetingId !== null) await this.openMeeting(status.recordingMeetingId);
+    if (status.recording && status.recordingMeetingId !== null) {
+      this.recordingStarted();
+      await this.openMeeting(status.recordingMeetingId);
+    }
   }
 
   async refreshMeetings() {
@@ -146,6 +173,7 @@ class Session {
       this.recording = true;
       this.recordingMeetingId = id;
       this.startedAt = Date.now();
+      this.recordingStarted();
       await this.refreshMeetings();
       if (this.current?.id !== id) await this.openMeeting(id);
     } catch (e) {
@@ -159,7 +187,9 @@ class Session {
     if (this.busy || !this.recording) return;
     this.busy = true;
     try {
+      const id = this.recordingMeetingId;
       await api.stopRecording();
+      if (id !== null) this.recordingEnded(id);
       this.recording = false;
       this.recordingMeetingId = null;
       this.startedAt = null;
@@ -173,6 +203,7 @@ class Session {
   }
 
   private ingest(ev: TranscriptEvent) {
+    if (ev.kind === 'final' && ev.text.trim() && ev.meetingId === this.recordingMeetingId) this.newLines++;
     if (ev.meetingId !== this.current?.id) return;
     const key = `${ev.source}:${ev.segmentId}`;
     const final = ev.kind === 'final';
@@ -193,6 +224,7 @@ class Session {
   setNotes(text: string) {
     if (!this.current) return;
     this.current.notes = text;
+    if (this.current.id === this.recordingMeetingId) this.notesEditedAt = Date.now();
     if (this.notesTimer) clearTimeout(this.notesTimer);
     this.notesTimer = setTimeout(() => this.flushNotes(), 600);
   }
@@ -231,30 +263,88 @@ class Session {
     await this.refreshMeetings();
   }
 
+  /** Write the AI notes from scratch now (the Enhance button). */
   async enhance() {
-    if (!this.current || this.enhancing) return;
-    await this.flushNotes();
-    this.enhancing = true;
-    this.enhancedLive = '';
+    if (!this.current || this.enhancingId !== null) return;
     this.error = null;
+    await this.runEnhance(this.current.id, false);
+  }
+
+  private async runEnhance(id: number, auto: boolean) {
+    if (this.current?.id === id) await this.flushNotes();
+    this.enhancingId = id;
+    this.enhancingAuto = auto;
+    this.enhancedLive = '';
     try {
-      await api.enhance(this.current.id);
+      // Automatic passes build on the last AI notes so they don't churn.
+      await api.enhance(id, auto);
     } catch (e) {
-      this.enhancing = false;
-      this.error = String(e);
+      this.enhanceFailed(String(e));
     }
   }
 
+  private enhanceFailed(message: string) {
+    if (this.enhancingAuto) this.autoError = message;
+    else this.error = message;
+    this.enhancingId = null;
+    this.enhancedLive = '';
+  }
+
   private onEnhance(e: StreamEvent) {
-    if (e.meetingId !== this.current?.id) return;
+    if (e.meetingId === null || e.meetingId !== this.enhancingId) return;
     if (e.error) {
-      this.enhancing = false;
-      this.error = e.error;
+      this.enhanceFailed(e.error);
     } else if (e.done) {
-      this.enhancing = false;
-      if (this.current) this.current.enhanced = this.enhancedLive;
+      if (this.current?.id === e.meetingId) this.current.enhanced = this.enhancedLive;
+      if (this.enhancingAuto) this.autoError = null;
+      this.enhancingId = null;
       this.enhancedLive = '';
+      this.autoTick();
     } else this.enhancedLive += e.delta;
+  }
+
+  private recordingStarted() {
+    this.lastAutoAt = Date.now();
+    this.newLines = 0;
+    this.notesEditedAt = 0;
+    this.finalPassFor = null;
+    this.autoError = null;
+    if (!this.autoTimer) this.autoTimer = setInterval(() => this.autoTick(), 2_000);
+  }
+
+  private recordingEnded(id: number) {
+    if (this.autoTimer) clearInterval(this.autoTimer);
+    this.autoTimer = null;
+    // Called from both stopRecording and the backend's "recording" event; the second call
+    // finds nothing changed because the final pass stamps lastAutoAt.
+    const changed = this.newLines > 0 || this.notesEditedAt > this.lastAutoAt;
+    if (this.settings.autoNotes && changed) {
+      this.finalPassFor = id;
+      this.autoTick();
+    }
+  }
+
+  /** Start an automatic pass when one is due and nothing else is being written. */
+  private autoTick() {
+    if (this.enhancingId !== null || !this.settings.autoNotes) return;
+    if (this.finalPassFor !== null) {
+      const id = this.finalPassFor;
+      this.finalPassFor = null;
+      this.lastAutoAt = Date.now();
+      this.newLines = 0;
+      this.runEnhance(id, true);
+      return;
+    }
+    const id = this.recordingMeetingId;
+    if (!this.recording || id === null) return;
+    const now = Date.now();
+    if (now - this.lastAutoAt < AUTO_MIN_GAP_MS) return;
+    const typedThenPaused = this.notesEditedAt > this.lastAutoAt && now - this.notesEditedAt >= AUTO_TYPING_PAUSE_MS;
+    const enoughNew = this.newLines >= AUTO_NEW_LINES || (this.newLines > 0 && now - this.lastAutoAt >= AUTO_MAX_WAIT_MS);
+    if (!typedThenPaused && !enoughNew) return;
+    this.lastAutoAt = now;
+    this.newLines = 0;
+    this.runEnhance(id, true);
   }
 
   async ask(question: string) {

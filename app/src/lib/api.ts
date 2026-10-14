@@ -63,6 +63,8 @@ export interface Settings {
   language: string;
   /** Let Ask read Jira and Confluence through acli (read-only). */
   atlassian: boolean;
+  /** Keep the AI notes up to date on their own while recording. */
+  autoNotes: boolean;
   /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
   hasKey: boolean;
 }
@@ -160,7 +162,8 @@ export interface Api {
   setNotes(id: number, notes: string): Promise<void>;
   renameMeeting(id: number, title: string): Promise<void>;
   deleteMeeting(id: number): Promise<void>;
-  enhance(id: number): Promise<void>;
+  /** `update` builds on the last AI notes (automatic passes) instead of starting over. */
+  enhance(id: number, update: boolean): Promise<void>;
   ask(meetingId: number | null, question: string): Promise<void>;
   search(query: string): Promise<Hit[]>;
   getSettings(): Promise<Settings>;
@@ -209,7 +212,7 @@ const tauriApi: Api = {
   setNotes: (id, notes) => invoke('set_notes', { id, notes }),
   renameMeeting: (id, title) => invoke('rename_meeting', { id, title }),
   deleteMeeting: (id) => invoke('delete_meeting', { id }),
-  enhance: (id) => invoke('enhance_notes', { id }),
+  enhance: (id, update) => invoke('enhance_notes', { id, update }),
   ask: (meetingId, question) => invoke('ask', { meetingId, question }),
   search: (query) => invoke('search', { query }),
   getSettings: () => invoke('get_settings'),
@@ -261,6 +264,7 @@ function createMockApi(): Api {
     fallbackModel: '',
     language: 'auto',
     atlassian: true,
+    autoNotes: true,
     hasKey: false
   };
   const keys = new Set<string>();
@@ -271,7 +275,7 @@ function createMockApi(): Api {
   ];
   const day = 86_400_000;
   const meetings: Meeting[] = [
-    { id: 3, title: 'Payments sync', startedAt: Date.now() - 2 * 3600_000, endedAt: Date.now() - 3600_000, notes: '- PAY-142 timeout\n- retry = 30s?\n- Budi owns fix, Fri', enhanced: '## PAY-142 checkout timeout\n\nThe retry logic **waits 30 seconds** before failing on staging.\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: add a regression test', language: 'auto' },
+    { id: 3, title: 'Payments sync', startedAt: Date.now() - 2 * 3600_000, endedAt: Date.now() - 3600_000, notes: '- PAY-142 timeout\n- retry = 30s?\n- Budi owns fix, Fri', enhanced: '- PAY-142 timeout\n  - Checkout times out on staging; reproduced yesterday [0:07]\n- retry = 30s?\n  - Confirmed: the retry logic waits **30 seconds** before failing [0:07]\n- Budi owns fix, Fri\n  - The fix goes to the backend team, due Friday [0:15]\n\n## Also discussed\n\n- Update the Confluence page with the root cause [0:15]\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: update the Confluence page', language: 'auto' },
     { id: 2, title: 'Design review', startedAt: Date.now() - day, endedAt: Date.now() - day + 2400_000, notes: '', enhanced: '', language: 'auto' },
     { id: 1, title: 'Weekly planning', startedAt: Date.now() - 3 * day, endedAt: Date.now() - 3 * day + 3000_000, notes: '', enhanced: '', language: 'auto' }
   ];
@@ -344,7 +348,13 @@ function createMockApi(): Api {
     deleteMeeting: async (id) => void meetings.splice(meetings.findIndex((m) => m.id === id), 1),
     enhance: async (id) => {
       const m = get(id);
-      const md = `## ${m.title}\n\nThe team went through **PAY-142**. The retry logic waits thirty seconds before failing on staging, which is why checkout times out.\n\n## Decisions\n\n- Fix the retry window rather than raising the timeout\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: add a regression test and share the pull request\n`;
+      // Mirrors the real prompt: the user's lines are the skeleton, details go underneath.
+      const mine = m.notes.split('\n').map((l) => l.replace(/^\s*[-*]\s*/, '').trim()).filter(Boolean);
+      const details = ['Reproduced on staging; the retry waits thirty seconds [0:07]', 'Owner and date agreed in the call [0:15]', 'Came up again near the end'];
+      const body = mine.length
+        ? mine.map((l, i) => `- ${l}\n  - ${details[i % details.length]}`).join('\n')
+        : '## PAY-142 checkout timeout\n\n- The retry logic waits thirty seconds before failing [0:07]';
+      const md = `${body}\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: update the Confluence page\n`;
       await stream('enhance-delta', id, md);
       m.enhanced = md;
     },

@@ -22,7 +22,11 @@
   const live = $derived(session.isRecordingCurrent);
   const elapsed = $derived(session.startedAt ? clock(now - session.startedAt) : '0:00');
   const canEnhance = $derived(session.segs.length > 0 || m.notes.trim().length > 0);
-  const shownNotes = $derived(session.enhancing ? session.enhancedLive : m.enhanced);
+  // An automatic pass keeps showing the last notes until the new ones are complete, so they
+  // don't blank out and retype every minute. A manual pass (or the very first) streams in.
+  const streaming = $derived(session.enhancing && (!session.enhancingAuto || !m.enhanced));
+  const shownNotes = $derived(streaming ? session.enhancedLive : m.enhanced);
+  const auto = $derived(session.settings.autoNotes && live);
 
   const sub = $derived(
     [dayLabel(m.startedAt), timeOfDay(m.startedAt), session.segs.length ? `${session.segs.length} lines of transcript` : '']
@@ -110,6 +114,15 @@
     <div class="flex min-h-0 flex-col bg-paper/60">
       <div class="flex items-center px-6 pb-1 pt-3">
         <span class="text-[11px] font-semibold tracking-wider text-faint">AI NOTES</span>
+        {#if session.enhancing && session.enhancingAuto}
+          <span class="ml-3 flex items-center gap-1.5 text-xs text-muted" role="status">
+            <span class="rec-dot h-1.5 w-1.5 rounded-full bg-lime-deep"></span>Updating…
+          </span>
+        {:else if auto && session.autoError}
+          <span class="ml-3 min-w-0 truncate text-xs text-rec" title={session.autoError}>Couldn't update; trying again soon</span>
+        {:else if auto}
+          <span class="ml-3 text-xs text-muted" title="Updates when you pause typing and as the meeting goes on">Auto</span>
+        {/if}
         <button
           class="ml-auto flex items-center gap-1.5 rounded-full bg-lime px-3.5 py-1.5 text-[13px] font-semibold text-ink transition-colors hover:bg-lime-deep disabled:bg-soft disabled:text-faint"
           disabled={!canEnhance || session.enhancing}
@@ -117,11 +130,11 @@
           onclick={() => session.enhance()}
         >
           <Icon name="spark" size={15} />
-          {session.enhancing ? 'Writing…' : m.enhanced ? 'Enhance again' : 'Enhance notes'}
+          {streaming ? 'Writing…' : m.enhanced ? 'Enhance again' : 'Enhance notes'}
         </button>
       </div>
       <div class="min-h-0 flex-1 overflow-y-auto px-6 pb-4 pt-2">
-        {#if session.enhancing && !session.enhancedLive}
+        {#if streaming && !session.enhancedLive}
           <div class="space-y-3 pt-2" aria-label="Writing notes">
             <div class="shimmer h-4 w-2/3 rounded-full"></div>
             <div class="shimmer h-3 w-full rounded-full"></div>
@@ -129,13 +142,17 @@
             <div class="shimmer h-3 w-3/4 rounded-full"></div>
           </div>
         {:else if shownNotes}
-          <Markdown text={shownNotes} />
+          <Markdown text={shownNotes} mine={m.notes} />
         {:else}
           <div class="flex h-full flex-col items-center justify-center text-center">
             <span class="grid h-12 w-12 place-items-center rounded-2xl bg-lime text-ink"><Icon name="spark" size={24} /></span>
             <p class="mt-4 font-semibold">Your notes, expanded</p>
             <p class="mt-1 max-w-[16rem] text-sm leading-relaxed text-muted">
-              Take a few quick notes while you talk. When you're ready, press Enhance and fivesight writes it up from what was said.
+              {#if session.settings.autoNotes}
+                Take a few quick notes while you talk. While recording, fivesight fills them in from what was said as the meeting goes.
+              {:else}
+                Take a few quick notes while you talk. When you're ready, press Enhance and fivesight writes it up from what was said.
+              {/if}
             </p>
           </div>
         {/if}

@@ -148,6 +148,11 @@
 .prose-notes code { background: var(--soft); border-radius: 4px; padding: 1px 5px; font-size: 0.9em; }
 .prose-notes blockquote { border-left: 2px solid var(--line); margin: 0.6em 0; padding-left: 0.9em; color: var(--muted); }
 .prose-notes a { text-decoration: underline; text-underline-offset: 2px; }
+/* AI notes built on the user's notes: their own lines in ink, what the AI added in grey. */
+.prose-notes.has-mine { color: var(--muted); }
+.prose-notes.has-mine .mine { color: var(--ink); font-weight: 500; }
+.prose-notes.has-mine .mine ul,
+.prose-notes.has-mine .mine ol { color: var(--muted); font-weight: 400; }
 
 @media (prefers-reduced-motion: reduce) {
   .rec-dot, .rise, .slide-in, .shimmer { animation: none; }
