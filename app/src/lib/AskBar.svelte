@@ -39,7 +39,7 @@
       {/each}
       {#if session.lookups.length && (session.asking || session.chat.at(-1)?.role === 'assistant')}
         <div class="flex flex-wrap items-center gap-1.5 pl-1 text-[11px] text-muted" aria-live="polite">
-          <span class="font-semibold tracking-wide text-faint">JIRA</span>
+          <span class="font-semibold tracking-wide text-faint">LOOKED UP</span>
           {#each session.lookups as l (l.id)}
             <span
               class="flex items-center gap-1 rounded-full px-2 py-0.5 font-medium {l.state === 'failed' ? 'bg-rec-soft text-rec' : 'bg-soft text-ink'}"

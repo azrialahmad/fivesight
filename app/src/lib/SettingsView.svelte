@@ -227,21 +227,23 @@
         <span class="rounded-full bg-soft px-2.5 py-0.5 text-[11px] font-semibold tracking-wide">READ-ONLY</span>
       </div>
       <p class="mt-0.5 text-sm text-muted">
-        Ask can search and read tickets, and read Confluence pages you link, through Atlassian's own command-line tool (acli). It can never create, edit, comment on, assign or move anything.
+        Ask can search and read Jira tickets (through acli) and Confluence pages with their comments (through confluence-cli). It can never create, edit, comment on, assign or move anything.
       </p>
       <div class="mt-3 space-y-1.5 text-sm">
         {#if atlChecking && !atl}
-          <p class="text-muted">Checking acli…</p>
-        {:else if atl && !atl.installed}
-          <p class="flex items-center gap-2"><span class="h-2 w-2 rounded-full bg-faint"></span><span class="text-muted">acli isn't installed. See Atlassian's install guide, then come back here.</span></p>
+          <p class="text-muted">Checking…</p>
         {:else if atl}
           <p class="flex items-center gap-2">
-            <span class="h-2 w-2 rounded-full {atl.jiraSite ? 'bg-lime-deep' : 'bg-faint'}"></span>
-            {#if atl.jiraSite}<span>Jira: <span class="font-medium">{atl.jiraSite}</span></span>{:else}<span class="text-muted">Jira: not logged in. Run <code class="rounded bg-soft px-1.5 py-0.5 text-xs">acli jira auth login --web</code></span>{/if}
+            <span class="h-2 w-2 shrink-0 rounded-full {atl.jiraSite ? 'bg-lime-deep' : 'bg-faint'}"></span>
+            {#if atl.jiraSite}<span>Jira: <span class="font-medium">{atl.jiraSite}</span></span>
+            {:else if !atl.installed}<span class="text-muted">Jira: acli isn't installed. See Atlassian's install guide.</span>
+            {:else}<span class="text-muted">Jira: not logged in. Run <code class="rounded bg-soft px-1.5 py-0.5 text-xs">acli jira auth login --web</code></span>{/if}
           </p>
           <p class="flex items-center gap-2">
-            <span class="h-2 w-2 rounded-full {atl.confluence ? 'bg-lime-deep' : 'bg-faint'}"></span>
-            {#if atl.confluence}<span>Confluence: logged in</span>{:else}<span class="text-muted">Confluence: not logged in. Run <code class="rounded bg-soft px-1.5 py-0.5 text-xs">acli confluence auth login --web</code></span>{/if}
+            <span class="h-2 w-2 shrink-0 rounded-full {atl.confluence ? 'bg-lime-deep' : 'bg-faint'}"></span>
+            {#if atl.confluence}<span>Confluence: connected</span>
+            {:else if !atl.confluenceCli}<span class="text-muted">Confluence: install it with <code class="rounded bg-soft px-1.5 py-0.5 text-xs">npm install -g confluence-cli</code></span>
+            {:else}<span class="text-muted">Confluence: not set up. Run <code class="rounded bg-soft px-1.5 py-0.5 text-xs">confluence init</code></span>{/if}
           </p>
         {/if}
       </div>

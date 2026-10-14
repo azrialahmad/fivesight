@@ -567,13 +567,15 @@ async fn ask(
         }
     };
     let _ = app.emit("ask-sources", AskSources { meeting_id, files: sources });
-    let use_atlassian = lock(&state.settings).atlassian && fs_atlassian::find_acli().is_some();
-    let confluence = lock(&state.atlassian).confluence;
+    // Jira through acli, Confluence through confluence-cli; each only when it's there and set up.
+    let enabled = lock(&state.settings).atlassian;
+    let jira = enabled && fs_atlassian::find_acli().is_some();
+    let confluence = enabled && lock(&state.atlassian).confluence;
 
     tauri::async_runtime::spawn(async move {
         let mut msgs = msgs;
-        if use_atlassian {
-            let answered = lookups::run_lookups(&app, meeting_id, &cfg, &mut msgs, &question, confluence).await;
+        if jira || confluence {
+            let answered = lookups::run_lookups(&app, meeting_id, &cfg, &mut msgs, &question, jira, confluence).await;
             if let Some(text) = answered {
                 // The AI finished while using tools; show it as one piece.
                 emit_stream(&app, "ask-delta", meeting_id, &text, false, None);
