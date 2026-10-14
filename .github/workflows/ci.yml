@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust (crates without the GPU toolchain)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Test
+        # fs-pipeline, the app and the engine/silero features need CUDA and ONNX Runtime; they are built locally.
+        run: cargo test -p fs-store -p fs-kb -p fs-llm -p fs-atlassian -p fs-bridge -p fs-stt -p fs-vad -p fs-audio
+
+  web:
+    name: UI and extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - name: Build UI
+        working-directory: app
+        run: |
+          npm ci
+          npm run build
+      - name: Extension tests
+        working-directory: extension
+        run: node --test test/tracker.test.js

@@ -26,16 +26,17 @@ fn avg_logprob(seg: &whisper_rs::WhisperSegment) -> f32 {
     let (mut sum, mut n) = (0.0f32, 0u32);
     for i in 0..seg.n_tokens() {
         let Some(tok) = seg.get_token(i) else { continue };
-        let is_special = tok
-            .to_str_lossy()
-            .map(|t| t.starts_with("[_") || t.starts_with("<|"))
-            .unwrap_or(true);
+        let is_special = tok.to_str_lossy().map(|t| t.starts_with("[_") || t.starts_with("<|")).unwrap_or(true);
         if !is_special {
             sum += tok.token_data().plog;
             n += 1;
         }
     }
-    if n == 0 { 0.0 } else { sum / n as f32 }
+    if n == 0 {
+        0.0
+    } else {
+        sum / n as f32
+    }
 }
 
 pub struct Engine {
@@ -58,11 +59,7 @@ impl Engine {
         let (_, probs) = state.lang_detect(0, 4)?;
         Ok(langs
             .iter()
-            .map(|l| {
-                whisper_rs::get_lang_id(l)
-                    .and_then(|i| probs.get(i as usize).copied())
-                    .unwrap_or(0.0)
-            })
+            .map(|l| whisper_rs::get_lang_id(l).and_then(|i| probs.get(i as usize).copied()).unwrap_or(0.0))
             .collect())
     }
 

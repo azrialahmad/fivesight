@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use wasapi::{
-    initialize_mta, AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle,
-    SampleType, StreamMode, WaveFormat,
+    initialize_mta, AudioCaptureClient, AudioClient, DeviceEnumerator, Direction, Handle, SampleType, StreamMode,
+    WaveFormat,
 };
 
 pub const SAMPLE_RATE: u32 = 16_000;
@@ -23,8 +23,7 @@ pub const FRAME: usize = 512;
 const WAIT_MS: u32 = 100;
 const SILENCE_SAMPLES_PER_TIMEOUT: usize = (SAMPLE_RATE as usize * WAIT_MS as usize) / 1000;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[derive(serde::Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     /// Default microphone: the local user.
@@ -72,25 +71,16 @@ fn open(source: Source) -> Result<(Session, String), AudioError> {
     let mut client = device.get_iaudioclient().map_err(werr)?;
     let format = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE as usize, 1, None);
     let (_default, min_period) = client.get_device_period().map_err(werr)?;
-    let mode = StreamMode::EventsShared {
-        autoconvert: true,
-        buffer_duration_hns: min_period,
-    };
+    let mode = StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: min_period };
     // For loopback the stream direction is Capture on a Render device.
-    client
-        .initialize_client(&format, &Direction::Capture, &mode)
-        .map_err(werr)?;
+    client.initialize_client(&format, &Direction::Capture, &mode).map_err(werr)?;
     let event = client.set_get_eventhandle().map_err(werr)?;
     let reader = client.get_audiocaptureclient().map_err(werr)?;
     Ok((Session { client, reader, event }, name))
 }
 
 /// Emit as many whole frames as `samples` holds. Returns false if the receiver is gone.
-fn emit_frames(
-    samples: &mut Vec<f32>,
-    tx: &SyncSender<Vec<f32>>,
-    dropped: &AtomicU64,
-) -> bool {
+fn emit_frames(samples: &mut Vec<f32>, tx: &SyncSender<Vec<f32>>, dropped: &AtomicU64) -> bool {
     let whole = samples.len() / FRAME * FRAME;
     for chunk in samples[..whole].chunks_exact(FRAME) {
         match tx.try_send(chunk.to_vec()) {
@@ -160,9 +150,7 @@ impl Capture {
             })
             .map_err(|e| AudioError::Thread(e.to_string()))?;
 
-        let device_name = ready_rx
-            .recv()
-            .map_err(|e| AudioError::Thread(e.to_string()))??;
+        let device_name = ready_rx.recv().map_err(|e| AudioError::Thread(e.to_string()))??;
         Ok(Self { stop, dropped, join: Some(join), device_name })
     }
 

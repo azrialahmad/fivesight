@@ -42,10 +42,7 @@ pub enum Verdict {
 }
 
 fn normalize(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect::<String>()
-        .to_lowercase()
+    s.chars().filter(|c| c.is_alphanumeric() || c.is_whitespace()).collect::<String>().to_lowercase()
 }
 
 /// Total words divided by unique words. Loops like "a a a a a" score high.
@@ -122,57 +119,31 @@ pub fn judge(text: &str, st: SegmentStats, cfg: &FilterConfig) -> Verdict {
 mod tests {
     use super::*;
 
-    const OK: SegmentStats = SegmentStats {
-        no_speech_prob: 0.1,
-        avg_logprob: -0.3,
-        vad_speech: true,
-    };
+    const OK: SegmentStats = SegmentStats { no_speech_prob: 0.1, avg_logprob: -0.3, vad_speech: true };
 
     #[test]
     fn keeps_normal_speech() {
-        assert_eq!(
-            judge("kita review ticket itu besok pagi", OK, &FilterConfig::default()),
-            Verdict::Keep
-        );
+        assert_eq!(judge("kita review ticket itu besok pagi", OK, &FilterConfig::default()), Verdict::Keep);
     }
 
     #[test]
     fn drops_blocked_and_repeated_phrase() {
         let c = FilterConfig::default();
         assert!(matches!(judge("Terima kasih.", OK, &c), Verdict::Drop(_)));
-        assert!(matches!(
-            judge("terima kasih terima kasih", OK, &c),
-            Verdict::Drop(_)
-        ));
+        assert!(matches!(judge("terima kasih terima kasih", OK, &c), Verdict::Drop(_)));
     }
 
     #[test]
     fn keeps_phrase_inside_real_sentence() {
-        assert_eq!(
-            judge(
-                "terima kasih atas update kemarin pak",
-                OK,
-                &FilterConfig::default()
-            ),
-            Verdict::Keep
-        );
+        assert_eq!(judge("terima kasih atas update kemarin pak", OK, &FilterConfig::default()), Verdict::Keep);
     }
 
     #[test]
     fn drops_low_confidence() {
         let c = FilterConfig::default();
-        let hi = SegmentStats {
-            no_speech_prob: 0.9,
-            ..OK
-        };
-        let lo = SegmentStats {
-            avg_logprob: -1.5,
-            ..OK
-        };
-        let nv = SegmentStats {
-            vad_speech: false,
-            ..OK
-        };
+        let hi = SegmentStats { no_speech_prob: 0.9, ..OK };
+        let lo = SegmentStats { avg_logprob: -1.5, ..OK };
+        let nv = SegmentStats { vad_speech: false, ..OK };
         assert_eq!(judge("hello there", hi, &c), Verdict::Drop("no_speech_prob"));
         assert_eq!(judge("hello there", lo, &c), Verdict::Drop("avg_logprob"));
         assert_eq!(judge("hello there", nv, &c), Verdict::Drop("no vad speech"));
@@ -181,13 +152,7 @@ mod tests {
     #[test]
     fn drops_loops() {
         let c = FilterConfig::default();
-        assert!(matches!(
-            judge("yeah yeah yeah yeah yeah yeah yeah yeah yeah", OK, &c),
-            Verdict::Drop(_)
-        ));
-        assert!(matches!(
-            judge("we go to the we go to the we go to the we go to the", OK, &c),
-            Verdict::Drop(_)
-        ));
+        assert!(matches!(judge("yeah yeah yeah yeah yeah yeah yeah yeah yeah", OK, &c), Verdict::Drop(_)));
+        assert!(matches!(judge("we go to the we go to the we go to the we go to the", OK, &c), Verdict::Drop(_)));
     }
 }

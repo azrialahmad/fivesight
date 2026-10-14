@@ -42,7 +42,17 @@ pub fn adf_to_text(v: &Value) -> String {
                         if let Some(c) = o.get("content") {
                             walk(c, out);
                         }
-                        if matches!(kind, "paragraph" | "heading" | "listItem" | "codeBlock" | "blockquote" | "tableRow" | "rule" | "panel") {
+                        if matches!(
+                            kind,
+                            "paragraph"
+                                | "heading"
+                                | "listItem"
+                                | "codeBlock"
+                                | "blockquote"
+                                | "tableRow"
+                                | "rule"
+                                | "panel"
+                        ) {
                             out.push('\n');
                         }
                     }
@@ -89,12 +99,20 @@ pub fn html_to_text(html: &str) -> String {
             }
             (true, '>') => {
                 in_tag = false;
-                let name: String = tag.trim_start_matches('/').chars().take_while(|c| c.is_ascii_alphanumeric()).collect::<String>().to_ascii_lowercase();
+                let name: String = tag
+                    .trim_start_matches('/')
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect::<String>()
+                    .to_ascii_lowercase();
                 if name == "script" || name == "style" {
                     skip = !tag.starts_with('/');
                 }
                 let closing = tag.starts_with('/');
-                let block = matches!(name.as_str(), "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "table");
+                let block = matches!(
+                    name.as_str(),
+                    "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "pre" | "table"
+                );
                 // Break after a block ends (and at <br>), not at both ends, to avoid blank lines.
                 if (block && closing) || name == "br" {
                     out.push('\n');
@@ -260,7 +278,10 @@ mod tests {
             "comment": {"comments": comments}
         }});
         let t = format_issue(&v);
-        assert!(t.contains("Reporter: Sari") && t.contains("Labels: checkout") && t.contains("Fails after 30 s"), "{t}");
+        assert!(
+            t.contains("Reporter: Sari") && t.contains("Labels: checkout") && t.contains("Fails after 30 s"),
+            "{t}"
+        );
         assert!(t.contains("Latest comments (5 of 7)"), "{t}");
         assert!(!t.contains("note 2") && t.contains("note 3") && t.contains("note 7"), "{t}");
         let empty = format_issue(&json!({"key": "X-1", "fields": {"summary": "s", "description": null}}));

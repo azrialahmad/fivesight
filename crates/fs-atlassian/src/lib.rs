@@ -179,9 +179,19 @@ struct Allowed {
 
 /// The complete list of what may run. Nothing that changes data is here.
 const ALLOWED: &[Allowed] = &[
-    Allowed { verbs: ["jira", "workitem", "search"], positional: 0, value_flags: &["--jql", "--limit", "--fields"], bool_flags: &["--json"] },
+    Allowed {
+        verbs: ["jira", "workitem", "search"],
+        positional: 0,
+        value_flags: &["--jql", "--limit", "--fields"],
+        bool_flags: &["--json"],
+    },
     Allowed { verbs: ["jira", "workitem", "view"], positional: 1, value_flags: &["--fields"], bool_flags: &["--json"] },
-    Allowed { verbs: ["confluence", "page", "view"], positional: 0, value_flags: &["--id", "--body-format"], bool_flags: &["--json"] },
+    Allowed {
+        verbs: ["confluence", "page", "view"],
+        positional: 0,
+        value_flags: &["--id", "--body-format"],
+        bool_flags: &["--json"],
+    },
     Allowed { verbs: ["jira", "auth", "status"], positional: 0, value_flags: &[], bool_flags: &[] },
     Allowed { verbs: ["confluence", "auth", "status"], positional: 0, value_flags: &[], bool_flags: &[] },
 ];
@@ -192,10 +202,7 @@ pub fn validate_argv(argv: &[String]) -> Result<(), AtlassianError> {
     if argv.len() < 3 || argv.iter().any(|a| a.contains('\0')) {
         return Err(reject());
     }
-    let spec = ALLOWED
-        .iter()
-        .find(|a| a.verbs.iter().zip(argv).all(|(v, a)| v == a))
-        .ok_or_else(reject)?;
+    let spec = ALLOWED.iter().find(|a| a.verbs.iter().zip(argv).all(|(v, a)| v == a)).ok_or_else(reject)?;
     let mut positional = 0;
     let mut rest = argv[3..].iter();
     while let Some(tok) = rest.next() {
@@ -314,9 +321,7 @@ pub fn status() -> Status {
     let jira = exec(&[s("jira"), s("auth"), s("status")], "jira").ok();
     let confluence = exec(&[s("confluence"), s("auth"), s("status")], "confluence").is_ok();
     let jira_site = jira.and_then(|out| {
-        out.lines()
-            .find_map(|l| l.trim().strip_prefix("Site:").map(|v| v.trim().to_string()))
-            .filter(|v| !v.is_empty())
+        out.lines().find_map(|l| l.trim().strip_prefix("Site:").map(|v| v.trim().to_string())).filter(|v| !v.is_empty())
     });
     Status { installed: true, jira_site, confluence }
 }
@@ -482,12 +487,24 @@ mod tests {
             from_tool_call("jira_search", r#"{"jql":"project = PAY","limit":99}"#).unwrap(),
             ReadCommand::JiraSearch { jql: "project = PAY".into(), limit: 20 }
         );
-        assert_eq!(from_tool_call("jira_view", r#"{"key":"pay-142"}"#).unwrap(), ReadCommand::JiraView { key: "PAY-142".into() });
         assert_eq!(
-            from_tool_call("confluence_page", r#"{"page":"https://x.atlassian.net/wiki/spaces/ENG/pages/98765/Runbook"}"#).unwrap(),
+            from_tool_call("jira_view", r#"{"key":"pay-142"}"#).unwrap(),
+            ReadCommand::JiraView { key: "PAY-142".into() }
+        );
+        assert_eq!(
+            from_tool_call(
+                "confluence_page",
+                r#"{"page":"https://x.atlassian.net/wiki/spaces/ENG/pages/98765/Runbook"}"#
+            )
+            .unwrap(),
             ReadCommand::ConfluencePage { page_id: "98765".into() }
         );
-        let names: Vec<String> = tool_specs(true).as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap().to_string()).collect();
+        let names: Vec<String> = tool_specs(true)
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
         assert_eq!(names, ["jira_search", "jira_view", "confluence_page"]);
         assert_eq!(tool_specs(false).as_array().unwrap().len(), 2);
     }

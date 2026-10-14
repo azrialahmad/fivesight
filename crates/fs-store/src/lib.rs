@@ -167,13 +167,105 @@ pub struct KbHit {
 
 /// Words that say nothing about the topic, in English and Indonesian.
 const STOPWORDS: &[&str] = &[
-    "a", "an", "the", "and", "or", "of", "to", "in", "on", "for", "at", "by", "with", "from", "is", "are", "was",
-    "were", "be", "been", "it", "this", "that", "these", "those", "what", "which", "who", "whom", "when", "where",
-    "why", "how", "do", "does", "did", "can", "could", "should", "would", "will", "about", "we", "you", "i", "our",
-    "my", "me", "us", "they", "them", "there", "here", "any", "some", "tell", "please", "yang", "dan", "di", "ke",
-    "dari", "ini", "itu", "apa", "siapa", "kapan", "dimana", "mana", "bagaimana", "gimana", "kenapa", "mengapa",
-    "untuk", "dengan", "pada", "adalah", "akan", "sudah", "udah", "belum", "kita", "kami", "saya", "aku", "kamu",
-    "anda", "mereka", "tolong", "ada", "atau", "juga", "tidak", "nggak", "gak", "ya", "dong", "sih", "kah",
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "of",
+    "to",
+    "in",
+    "on",
+    "for",
+    "at",
+    "by",
+    "with",
+    "from",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "it",
+    "this",
+    "that",
+    "these",
+    "those",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "when",
+    "where",
+    "why",
+    "how",
+    "do",
+    "does",
+    "did",
+    "can",
+    "could",
+    "should",
+    "would",
+    "will",
+    "about",
+    "we",
+    "you",
+    "i",
+    "our",
+    "my",
+    "me",
+    "us",
+    "they",
+    "them",
+    "there",
+    "here",
+    "any",
+    "some",
+    "tell",
+    "please",
+    "yang",
+    "dan",
+    "di",
+    "ke",
+    "dari",
+    "ini",
+    "itu",
+    "apa",
+    "siapa",
+    "kapan",
+    "dimana",
+    "mana",
+    "bagaimana",
+    "gimana",
+    "kenapa",
+    "mengapa",
+    "untuk",
+    "dengan",
+    "pada",
+    "adalah",
+    "akan",
+    "sudah",
+    "udah",
+    "belum",
+    "kita",
+    "kami",
+    "saya",
+    "aku",
+    "kamu",
+    "anda",
+    "mereka",
+    "tolong",
+    "ada",
+    "atau",
+    "juga",
+    "tidak",
+    "nggak",
+    "gak",
+    "ya",
+    "dong",
+    "sih",
+    "kah",
 ];
 
 /// Any of the question's meaningful words, best matches first (for finding context, not for the search box).
@@ -214,19 +306,17 @@ impl Store {
         // Order matters: columns added later must not be referenced by the base schema's
         // indexes, and `CREATE TABLE IF NOT EXISTS` leaves an old `meetings` table untouched.
         conn.execute_batch(SCHEMA)?;
-        let has_language: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'language'",
-            [],
-            |r| r.get(0),
-        )?;
+        let has_language: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('meetings') WHERE name = 'language'", [], |r| {
+                r.get(0)
+            })?;
         if has_language == 0 {
             conn.execute_batch("ALTER TABLE meetings ADD COLUMN language TEXT NOT NULL DEFAULT 'auto'")?;
         }
-        let has_speaker: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name = 'speaker'",
-            [],
-            |r| r.get(0),
-        )?;
+        let has_speaker: i64 =
+            conn.query_row("SELECT COUNT(*) FROM pragma_table_info('segments') WHERE name = 'speaker'", [], |r| {
+                r.get(0)
+            })?;
         if has_speaker == 0 {
             conn.execute_batch("ALTER TABLE segments ADD COLUMN speaker TEXT")?;
         }
@@ -246,39 +336,33 @@ impl Store {
     }
 
     pub fn set_language(&self, id: i64, language: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE meetings SET language = ?2 WHERE id = ?1", params![id, language])?;
+        self.conn.execute("UPDATE meetings SET language = ?2 WHERE id = ?1", params![id, language])?;
         Ok(())
     }
 
     pub fn end_meeting(&self, id: i64, ended_at: i64) -> Result<()> {
-        self.conn
-            .execute("UPDATE meetings SET ended_at = ?2 WHERE id = ?1", params![id, ended_at])?;
+        self.conn.execute("UPDATE meetings SET ended_at = ?2 WHERE id = ?1", params![id, ended_at])?;
         Ok(())
     }
 
     /// Mark a finished meeting as in progress again (recording into it a second time).
     pub fn reopen_meeting(&self, id: i64) -> Result<()> {
-        self.conn
-            .execute("UPDATE meetings SET ended_at = NULL WHERE id = ?1", params![id])?;
+        self.conn.execute("UPDATE meetings SET ended_at = NULL WHERE id = ?1", params![id])?;
         Ok(())
     }
 
     pub fn rename_meeting(&self, id: i64, title: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE meetings SET title = ?2 WHERE id = ?1", params![id, title])?;
+        self.conn.execute("UPDATE meetings SET title = ?2 WHERE id = ?1", params![id, title])?;
         Ok(())
     }
 
     pub fn set_notes(&self, id: i64, notes: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE meetings SET notes = ?2 WHERE id = ?1", params![id, notes])?;
+        self.conn.execute("UPDATE meetings SET notes = ?2 WHERE id = ?1", params![id, notes])?;
         Ok(())
     }
 
     pub fn set_enhanced(&self, id: i64, enhanced: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE meetings SET enhanced = ?2 WHERE id = ?1", params![id, enhanced])?;
+        self.conn.execute("UPDATE meetings SET enhanced = ?2 WHERE id = ?1", params![id, enhanced])?;
         Ok(())
     }
 
@@ -353,7 +437,13 @@ impl Store {
             "SELECT source, seg_id, start_ms, text, speaker FROM segments WHERE meeting_id = ?1 ORDER BY start_ms, id",
         )?;
         let rows = st.query_map(params![meeting_id], |r| {
-            Ok(Segment { source: r.get(0)?, seg_id: r.get(1)?, start_ms: r.get(2)?, text: r.get(3)?, speaker: r.get(4)? })
+            Ok(Segment {
+                source: r.get(0)?,
+                seg_id: r.get(1)?,
+                start_ms: r.get(2)?,
+                text: r.get(3)?,
+                speaker: r.get(4)?,
+            })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -477,9 +567,7 @@ impl Store {
 
     /// Chat for one meeting, or the global chat when `meeting_id` is `None`. Oldest first.
     pub fn chat_history(&self, meeting_id: Option<i64>) -> Result<Vec<ChatMessage>> {
-        let mut st = self
-            .conn
-            .prepare("SELECT role, content FROM chat WHERE meeting_id IS ?1 ORDER BY id")?;
+        let mut st = self.conn.prepare("SELECT role, content FROM chat WHERE meeting_id IS ?1 ORDER BY id")?;
         let rows = st.query_map(params![meeting_id], |r| Ok(ChatMessage { role: r.get(0)?, content: r.get(1)? }))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -553,7 +641,15 @@ mod tests {
         let s = store();
         let chunks = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let a = s
-            .kb_put("C:/docs/runbook.md", "Payments runbook", "md", 100, 1, 10, &chunks(&["# Retry\nThe checkout retry waits 30 seconds before failing.", "# On-call\nPage Budi."]))
+            .kb_put(
+                "C:/docs/runbook.md",
+                "Payments runbook",
+                "md",
+                100,
+                1,
+                10,
+                &chunks(&["# Retry\nThe checkout retry waits 30 seconds before failing.", "# On-call\nPage Budi."]),
+            )
             .unwrap();
         s.kb_put("C:/docs/menu.txt", "Lunch", "txt", 10, 1, 11, &chunks(&["Nasi goreng on Fridays."])).unwrap();
 

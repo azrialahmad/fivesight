@@ -100,7 +100,9 @@ pub async fn run_lookups(
                 // Usually "this model can't use tools". Fall back to a plain answer either way;
                 // a real problem (bad key, server down) will surface from that request instead.
                 match &e {
-                    LlmError::Api { status, .. } => tracing::info!("tool call round {round} failed ({status}); answering without tools"),
+                    LlmError::Api { status, .. } => {
+                        tracing::info!("tool call round {round} failed ({status}); answering without tools")
+                    }
                     other => tracing::info!("tool call round {round} failed ({other}); answering without tools"),
                 }
                 break;

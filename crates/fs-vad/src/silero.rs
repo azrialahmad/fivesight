@@ -108,10 +108,7 @@ mod tests {
 
         let mut r = hound::WavReader::open(wav).unwrap();
         let samples: Vec<f32> = r.samples::<i16>().map(|s| s.unwrap() as f32 / 32768.0).collect();
-        let probs: Vec<f32> = samples
-            .chunks_exact(FRAME)
-            .map(|f| vad.prob(f).unwrap())
-            .collect();
+        let probs: Vec<f32> = samples.chunks_exact(FRAME).map(|f| vad.prob(f).unwrap()).collect();
 
         // The clip is speech for ~6 s then a 0.6 s gap, repeated. Check the extremes.
         let speech_frames = probs.iter().filter(|&&p| p > 0.5).count();
