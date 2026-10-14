@@ -340,7 +340,7 @@ function createMockApi(): Api {
       m.enhanced = md;
     },
     ask: async (meetingId, question) => {
-      const a = `Based on the transcript, the checkout timeout comes from the retry logic waiting thirty seconds before failing [0:07]. Budi was asked to ship a fix by Friday [0:15].\n\n(Mock answer to: "${question}")`;
+      const a = `Based on the transcript, the checkout timeout comes from the retry logic waiting thirty seconds before failing [0:07]. Budi was asked to ship a fix by Friday [0:15].`;
       if (meetingId !== null) (chats[meetingId] ??= []).push({ role: 'user', content: question });
       emit<AskSources>('ask-sources', { meetingId, files: kb.length ? [kb[0].title] : [] });
       if (settings.atlassian && /PAY-\d+|ticket|jira/i.test(question)) {
