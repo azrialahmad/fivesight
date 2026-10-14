@@ -161,7 +161,7 @@
 
 <div class="flex h-full flex-col">
   <header class="flex items-center gap-2.5 px-8 pt-6">
-    <span class="grid h-8 w-8 place-items-center rounded-[10px] bg-ink text-lime"><Icon name="spark" size={18} /></span>
+    <span class="grid h-8 w-8 place-items-center rounded-[10px] bg-ink text-lime"><Icon name="logo" size={18} /></span>
     <span class="text-[19px] font-semibold tracking-tight">fivesight</span>
     <button class="ml-auto rounded-full px-3 py-1.5 text-[13px] text-muted hover:bg-soft disabled:opacity-50" disabled={finishing} onclick={() => finish(true)}>
       {session.settings.setupDone ? 'Close' : 'Skip setup'}

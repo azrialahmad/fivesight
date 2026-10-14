@@ -16,7 +16,7 @@
 <div class="flex h-full flex-col overflow-hidden rounded-2xl border border-line bg-card">
   <header data-tauri-drag-region class="flex select-none items-center gap-2 px-4 py-2.5">
     <span data-tauri-drag-region class="flex items-center gap-2 text-sm font-semibold">
-      <span class="grid h-6 w-6 place-items-center rounded-lg bg-ink text-lime"><Icon name="spark" size={14} /></span>
+      <span class="grid h-6 w-6 place-items-center rounded-lg bg-ink text-lime"><Icon name="logo" size={14} /></span>
       fivesight
       {#if session.recording}<span class="rec-dot ml-1 h-2 w-2 rounded-full bg-rec" title="Recording"></span>{/if}
     </span>

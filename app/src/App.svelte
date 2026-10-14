@@ -21,7 +21,7 @@
 <div class="flex h-full">
   <aside class="flex w-56 shrink-0 flex-col px-3 py-4">
     <button class="flex items-center gap-2.5 px-3 pb-5 pt-1" onclick={() => session.go('home')} aria-label="fivesight home">
-      <span class="grid h-8 w-8 place-items-center rounded-[10px] bg-ink text-lime"><Icon name="spark" size={18} /></span>
+      <span class="grid h-8 w-8 place-items-center rounded-[10px] bg-ink text-lime"><Icon name="logo" size={18} /></span>
       <span class="text-[19px] font-semibold tracking-tight">fivesight</span>
     </button>
 
