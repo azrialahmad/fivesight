@@ -1,7 +1,7 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import { session, inTauri } from './session.svelte';
-  import { api } from './api';
+  import { api, looksLikeAddress } from './api';
   import type { AtlassianStatus, BridgeStatus, Settings } from './api';
   import { onMount } from 'svelte';
 
@@ -96,9 +96,35 @@
     }
   }
 
+  let notice = $state<string | null>(null);
+  onMount(() => void api.settingsNotice().then((n) => (notice = n)).catch(() => {}));
+
+  // Nothing is kept until Save, so say when the form differs from what's saved.
+  const dirty = $derived.by(() => {
+    const s = session.settings;
+    return (
+      form.baseUrl.trim() !== s.baseUrl.trim() ||
+      form.model.trim() !== s.model.trim() ||
+      form.fallbackModel.trim() !== s.fallbackModel.trim() ||
+      form.language !== s.language ||
+      form.atlassian !== s.atlassian ||
+      apiKey.trim() !== ''
+    );
+  });
+  const modelIsAddress = $derived(looksLikeAddress(form.model));
+  const fallbackIsAddress = $derived(looksLikeAddress(form.fallbackModel));
+  let saveError = $state<string | null>(null);
+
   async function save() {
-    await session.saveSettings(form, apiKey.trim() || null);
+    saveError = null;
+    try {
+      await session.saveSettings(form, apiKey.trim() || null);
+    } catch (e) {
+      saveError = String(e);
+      return;
+    }
     apiKey = '';
+    notice = null;
     keySaved = await api.keySaved(form.baseUrl);
     saved = true;
     setTimeout(() => (saved = false), 2000);
@@ -129,6 +155,9 @@
 <div class="h-full overflow-y-auto">
   <div class="mx-auto max-w-xl space-y-8 px-8 pb-12 pt-8">
     <h1 class="text-2xl font-semibold tracking-tight">Settings</h1>
+    {#if notice}
+      <p class="break-words rounded-xl bg-rec-soft px-4 py-3 text-sm text-rec" role="alert">{notice}</p>
+    {/if}
 
     <section>
       <label class="font-semibold" for="lang">Language for new meetings</label>
@@ -178,6 +207,9 @@
 
       <label class="mt-4 block text-sm font-medium" for="model">Model</label>
       <input id="model" class={field} placeholder="model name as the provider spells it" spellcheck="false" bind:value={form.model} />
+      {#if modelIsAddress}
+        <p class="mt-1.5 text-xs font-medium text-rec">This is a server address. Put it in Server address above; this field takes a model name.</p>
+      {/if}
 
       <label class="mt-4 block text-sm font-medium" for="key">
         API key {#if isLocal}<span class="font-normal text-faint">(not needed for a local server)</span>{/if}
@@ -198,7 +230,12 @@
       </p>
 
       <label class="mt-4 block text-sm font-medium" for="fb">Fallback model <span class="font-normal text-faint">(optional)</span></label>
-      <input id="fb" class={field} placeholder="Tried if the main model fails" spellcheck="false" bind:value={form.fallbackModel} />
+      <input id="fb" class={field} placeholder="Another model on the same server, tried if the main one fails" spellcheck="false" bind:value={form.fallbackModel} />
+      {#if fallbackIsAddress}
+        <p class="mt-1.5 text-xs font-medium text-rec">
+          This is a server address. The fallback is another model name on the same server; put the address in Server address above.
+        </p>
+      {/if}
 
       <div class="mt-4 flex flex-wrap items-center gap-3">
         <button
@@ -301,9 +338,24 @@
       </p>
     </section>
 
-    <div class="flex items-center gap-3">
-      <button class="rounded-full bg-ink px-6 py-2.5 text-sm font-semibold text-white" onclick={save}>Save settings</button>
-      {#if saved}<span class="flex items-center gap-1.5 text-sm font-medium"><Icon name="check" size={18} /> Saved</span>{/if}
+  </div>
+  <!-- Stays in view while scrolling, so changes at the top aren't left unsaved by accident. -->
+  <div class="sticky bottom-0 border-t border-line bg-card/95 backdrop-blur">
+    <div class="mx-auto flex max-w-xl items-center gap-3 px-8 py-3">
+      <button
+        class="shrink-0 rounded-full bg-ink px-6 py-2.5 text-sm font-semibold text-white disabled:opacity-40"
+        disabled={modelIsAddress || fallbackIsAddress}
+        onclick={save}
+      >
+        Save settings
+      </button>
+      {#if saveError}
+        <span class="min-w-0 break-words text-sm font-medium text-rec" role="alert">{saveError}</span>
+      {:else if saved}
+        <span class="flex items-center gap-1.5 text-sm font-medium"><Icon name="check" size={18} /> Saved</span>
+      {:else if dirty}
+        <span class="flex items-center gap-2 text-sm font-medium"><span class="h-2 w-2 rounded-full bg-lime-deep"></span>Unsaved changes</span>
+      {/if}
     </div>
   </div>
 </div>

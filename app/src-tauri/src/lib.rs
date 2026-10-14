@@ -14,6 +14,7 @@ use fs_stt::lang::LangMode;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
+mod logging;
 mod lookups;
 
 const KEYRING_SERVICE: &str = "fivesight";
@@ -35,6 +36,9 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// Every field has a serde default, so a field missing from `settings.json` (older or
+/// hand-edited file) doesn't fail the whole file. `base_url` defaults to empty on purpose:
+/// that is how [`Settings::migrated`] spots a file from before the provider was generalised.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
@@ -43,8 +47,10 @@ struct Settings {
     base_url: String,
     #[serde(default)]
     model: String,
+    #[serde(default)]
     fallback_model: String,
     /// Language given to new meetings: "auto", "id" or "en". Each meeting can override it.
+    #[serde(default = "auto_language")]
     language: String,
     /// Let Ask read Jira and Confluence through acli (read-only).
     #[serde(default = "enabled")]
@@ -111,6 +117,10 @@ fn enabled() -> bool {
     true
 }
 
+fn auto_language() -> String {
+    "auto".into()
+}
+
 /// The Credential Manager entry for a server: one key per host, so each provider keeps its own
 /// and a key is never sent to a server it wasn't saved for.
 fn key_slot(base_url: &str) -> String {
@@ -132,6 +142,8 @@ struct AppState {
     recording: Mutex<Option<Recording>>,
     settings: Mutex<Settings>,
     settings_path: PathBuf,
+    /// Set when `settings.json` couldn't be read at startup; Settings shows it until the next save.
+    settings_notice: Mutex<Option<String>>,
     /// What the Meet extension reports: who is speaking, and whether a call is on.
     meet: Mutex<MeetState>,
     /// Last known acli login state; refreshed when Settings opens.
@@ -738,15 +750,67 @@ fn forget_key(base_url: String) -> Result<(), String> {
 fn save_settings(state: State<'_, AppState>, settings: Settings, api_key: Option<String>) -> Result<(), String> {
     let (mut to_store, _) = settings.migrated();
     to_store.base_url = to_store.base_url.trim().to_string();
+    to_store.model = to_store.model.trim().to_string();
+    to_store.fallback_model = to_store.fallback_model.trim().to_string();
+    for (field, value) in [("Model", &to_store.model), ("Fallback model", &to_store.fallback_model)] {
+        if looks_like_address(value) {
+            return Err(format!(
+                "{field} should be a model name, not a server address. Put the address in Server address."
+            ));
+        }
+    }
     if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
         keyring::Entry::new(KEYRING_SERVICE, &key_slot(&to_store.base_url))
             .and_then(|e| e.set_password(key.trim()))
             .map_err(|e| format!("Couldn't save the key to Windows Credential Manager: {e}"))?;
     }
     to_store.has_key = false;
-    std::fs::write(&state.settings_path, serde_json::to_string_pretty(&to_store).map_err(err)?).map_err(err)?;
+    std::fs::write(&state.settings_path, serde_json::to_string_pretty(&to_store).map_err(err)?)
+        .map_err(|e| format!("Couldn't save settings to {}: {e}", state.settings_path.display()))?;
     *lock(&state.settings) = to_store;
+    *lock(&state.settings_notice) = None;
+    tracing::info!("settings saved");
     Ok(())
+}
+
+/// Why settings were reset to defaults at startup, if they were.
+#[tauri::command]
+fn settings_notice(state: State<'_, AppState>) -> Option<String> {
+    lock(&state.settings_notice).clone()
+}
+
+/// Model names never contain "://" or start with "www."; server addresses do.
+fn looks_like_address(s: &str) -> bool {
+    let s = s.trim().to_ascii_lowercase();
+    s.contains("://") || s.starts_with("www.")
+}
+
+/// Read `settings.json`. A file that can't be parsed is copied to `settings.broken.json`
+/// (so a later save doesn't destroy it) and defaults are used, with a notice for Settings.
+fn load_settings(path: &std::path::Path) -> (Option<Settings>, Option<String>) {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, None),
+        Err(e) => {
+            tracing::warn!("reading {}: {e}", path.display());
+            return (None, Some(format!("Couldn't read your settings file, so defaults are in use. ({e})")));
+        }
+    };
+    match serde_json::from_str::<Settings>(&text) {
+        Ok(s) => (Some(s), None),
+        Err(e) => {
+            let backup = path.with_file_name("settings.broken.json");
+            let _ = std::fs::copy(path, &backup);
+            tracing::warn!("parsing {}: {e}; copied to {}", path.display(), backup.display());
+            (
+                None,
+                Some(format!(
+                    "Your settings file couldn't be read, so defaults are in use. The old file was kept as {}. ({e})",
+                    backup.display()
+                )),
+            )
+        }
+    }
 }
 
 /// Try the model with a one-word request, using the form's values (a typed key wins over a saved one).
@@ -794,10 +858,10 @@ pub fn run() {
         .setup(|app| {
             let dir = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&dir)?;
+            logging::init(&dir);
             let store = Store::open(&dir.join("fivesight.db"))?;
             let settings_path = dir.join("settings.json");
-            let loaded =
-                std::fs::read_to_string(&settings_path).ok().and_then(|t| serde_json::from_str::<Settings>(&t).ok());
+            let (loaded, settings_notice) = load_settings(&settings_path);
             let settings = match loaded {
                 Some(old) => {
                     let (settings, legacy_slot) = old.migrated();
@@ -823,6 +887,7 @@ pub fn run() {
                 recording: Mutex::new(None),
                 settings: Mutex::new(settings),
                 settings_path,
+                settings_notice: Mutex::new(settings_notice),
                 meet: Mutex::new(MeetState::default()),
                 atlassian: Mutex::new(fs_atlassian::Status::default()),
             });
@@ -874,6 +939,7 @@ pub fn run() {
             ask,
             get_settings,
             save_settings,
+            settings_notice,
             get_bridge,
             atlassian_status,
             kb_list,
@@ -895,6 +961,51 @@ mod tests {
 
     fn parse(json: &str) -> Settings {
         serde_json::from_str(json).expect("settings json")
+    }
+
+    fn temp_settings(name: &str, contents: Option<&str>) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("fivesight-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        if let Some(c) = contents {
+            std::fs::write(&path, c).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn missing_fields_take_defaults() {
+        let s = parse(r#"{"baseUrl":"http://gw:8080/v1","model":"m"}"#);
+        assert_eq!(s.fallback_model, "");
+        assert_eq!(s.language, "auto");
+        assert!(s.atlassian);
+    }
+
+    #[test]
+    fn missing_settings_file_is_not_a_problem() {
+        let (s, notice) = load_settings(&temp_settings("missing", None));
+        assert!(s.is_none() && notice.is_none());
+    }
+
+    #[test]
+    fn broken_settings_file_is_kept_and_reported() {
+        let path = temp_settings("broken", Some("{ not json"));
+        let (s, notice) = load_settings(&path);
+        assert!(s.is_none());
+        assert!(notice.unwrap().contains("settings.broken.json"));
+        assert_eq!(std::fs::read_to_string(path.with_file_name("settings.broken.json")).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn spots_addresses_in_model_fields() {
+        assert!(looks_like_address("http://asus-homelab:20128/v1"));
+        assert!(looks_like_address(" HTTPS://openrouter.ai/api/v1"));
+        assert!(looks_like_address("www.example.com"));
+        assert!(!looks_like_address("google/gemini-2.5-flash"));
+        assert!(!looks_like_address("ag/gemini-3.8-flash-medium"));
+        assert!(!looks_like_address("llama3.1:8b"));
+        assert!(!looks_like_address(""));
     }
 
     #[test]

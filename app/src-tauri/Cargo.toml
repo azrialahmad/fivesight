@@ -19,6 +19,7 @@ tauri = { version = "2", features = [] }
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "registry"] }
 fs-audio = { path = "../../crates/fs-audio" }
 fs-stt = { path = "../../crates/fs-stt", features = ["engine"] }
 fs-pipeline = { path = "../../crates/fs-pipeline" }
