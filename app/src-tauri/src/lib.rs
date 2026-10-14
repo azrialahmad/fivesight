@@ -1,7 +1,7 @@
 //! fivesight desktop shell: owns the pipeline, the database and the LLM calls, and
 //! forwards everything to the UI as commands and events.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -233,13 +233,45 @@ struct MeetState {
     port: u16,
     /// Why the local endpoint couldn't start, if it couldn't.
     error: Option<String>,
+    /// Anything from the extension; it says hello every 30 s while Chrome runs.
     last_seen: i64,
+    /// Anything from an open Meet tab; it says hello every 15 s.
+    last_tab_seen: i64,
     in_call: bool,
     call_title: Option<String>,
+    /// The extension's version, from its hello. `None` for versions before 0.2.
+    ext_version: Option<String>,
 }
 
-/// Extension events older than this mean the browser isn't sending any (tab closed, extension off).
-const MEET_STALE_MS: i64 = 45_000;
+/// Nothing from the extension for this long means Chrome is closed or the extension is off.
+const MEET_STALE_MS: i64 = 75_000;
+/// Nothing from a Meet tab for this long means the call tab is gone.
+const MEET_TAB_STALE_MS: i64 = 45_000;
+
+/// The extension version this build of the app ships with.
+fn bundled_extension_version() -> String {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../../extension/manifest.json")).unwrap_or_default();
+    manifest["version"].as_str().unwrap_or("").to_string()
+}
+
+/// True when `have` is an older dotted version than `want` (0.2.0 < 0.10.0).
+fn older_version(have: &str, want: &str) -> bool {
+    let parse = |v: &str| v.split('.').map(|p| p.parse::<u64>().unwrap_or(0)).collect::<Vec<_>>();
+    parse(have) < parse(want)
+}
+
+/// The extension folder to load in Chrome: shipped next to the app, or the repo's in development.
+fn extension_dir(app: &AppHandle) -> Option<PathBuf> {
+    if cfg!(debug_assertions) {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extension");
+        if repo.join("manifest.json").exists() {
+            return repo.canonicalize().ok().map(|p| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\")));
+        }
+    }
+    let dir = app.path().resource_dir().ok()?.join("extension");
+    dir.join("manifest.json").exists().then_some(dir)
+}
 
 fn pairing_token() -> String {
     if let Some(t) = stored_key("bridge-token") {
@@ -270,8 +302,15 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     {
         let mut meet = lock(&st.meet);
         meet.last_seen = now;
+        if !matches!(ev, Incoming::Hello { tab: false, .. }) {
+            meet.last_tab_seen = now;
+        }
         match ev {
-            Incoming::Hello => {}
+            Incoming::Hello { version, .. } => {
+                if version.is_some() {
+                    meet.ext_version = version;
+                }
+            }
             Incoming::Speaking { name, speaking, at } => {
                 // Trust the browser's clock only if it agrees with ours; otherwise use ours.
                 let at = if (at - now).abs() < 5_000 { at } else { now };
@@ -324,19 +363,40 @@ struct BridgeStatus {
     in_call: bool,
     call_title: Option<String>,
     error: Option<String>,
+    /// The connected extension's version (`None` before 0.2) and the one shipped with this app.
+    version: Option<String>,
+    latest: String,
+    /// The connected extension is older than the shipped one: reload it in Chrome.
+    outdated: bool,
+    /// The folder to load in Chrome with Load unpacked.
+    folder: Option<String>,
 }
 
 #[tauri::command]
-fn get_bridge(state: State<'_, AppState>) -> BridgeStatus {
+fn get_bridge(app: AppHandle, state: State<'_, AppState>) -> BridgeStatus {
     let m = lock(&state.meet);
+    let connected = m.error.is_none() && now_ms() - m.last_seen < MEET_STALE_MS;
+    let latest = bundled_extension_version();
     BridgeStatus {
         port: m.port,
         token: m.token.clone(),
-        connected: m.error.is_none() && now_ms() - m.last_seen < MEET_STALE_MS,
-        in_call: m.in_call && now_ms() - m.last_seen < MEET_STALE_MS,
+        connected,
+        in_call: connected && m.in_call && now_ms() - m.last_tab_seen < MEET_TAB_STALE_MS,
         call_title: m.call_title.clone(),
         error: m.error.clone(),
+        version: m.ext_version.clone(),
+        outdated: connected && m.ext_version.as_deref().is_none_or(|v| older_version(v, &latest)),
+        latest,
+        folder: extension_dir(&app).map(|p| p.display().to_string()),
     }
+}
+
+/// Show the extension folder in Explorer, ready for Chrome's Load unpacked.
+#[tauri::command]
+fn open_extension_folder(app: AppHandle) -> Result<(), String> {
+    let dir = extension_dir(&app).ok_or("The extension folder isn't included in this build.")?;
+    std::process::Command::new("explorer").arg(&dir).spawn().map_err(err)?;
+    Ok(())
 }
 
 /// Where the speech models live. Order: `FIVESIGHT_MODELS`, `%LOCALAPPDATA%\fivesight\models`,
@@ -1244,6 +1304,7 @@ pub fn run() {
             download_models,
             cancel_download,
             get_bridge,
+            open_extension_folder,
             atlassian_status,
             kb_list,
             kb_add,
@@ -1261,6 +1322,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_versions() {
+        assert!(!bundled_extension_version().is_empty());
+        assert!(older_version("0.1.0", "0.2.0"));
+        assert!(older_version("0.9.0", "0.10.0"));
+        assert!(!older_version("0.2.0", "0.2.0"));
+        assert!(!older_version("0.3.0", "0.2.0"));
+    }
 
     fn parse(json: &str) -> Settings {
         serde_json::from_str(json).expect("settings json")

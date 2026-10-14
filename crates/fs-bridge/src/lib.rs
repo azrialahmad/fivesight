@@ -35,8 +35,15 @@ pub enum CallState {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Incoming {
-    /// Heartbeat while a Meet tab is open, so the app can show "connected".
-    Hello,
+    /// Heartbeat from the extension (every 30 s or so, Meet tab or not), so the app can show
+    /// "connected". `version` is the extension's, so the app can tell when it's out of date.
+    Hello {
+        #[serde(default)]
+        version: Option<String>,
+        /// Sent by an open Meet tab (not just the background worker).
+        #[serde(default)]
+        tab: bool,
+    },
     /// A participant started or stopped speaking. `at` is the browser's `Date.now()`.
     Speaking { name: String, speaking: bool, at: i64 },
     /// The user joined or left a call in this tab.
@@ -283,6 +290,17 @@ mod tests {
         let r = route(&post("/events", Some("chrome-extension://abc"), Some("Bearer s3cret-token"), body), TOKEN);
         assert_eq!(r.status, 200);
         assert_eq!(r.events.len(), 4);
+        assert_eq!(r.events[0], Incoming::Hello { version: None, tab: false }); // extensions before 0.2 send neither
+        let v = route(
+            &post(
+                "/events",
+                Some("chrome-extension://abc"),
+                Some("Bearer s3cret-token"),
+                br#"{"events":[{"type":"hello","version":"0.2.0","tab":true}]}"#,
+            ),
+            TOKEN,
+        );
+        assert_eq!(v.events, vec![Incoming::Hello { version: Some("0.2.0".into()), tab: true }]);
         assert_eq!(r.events[1], Incoming::Speaking { name: "Budi".into(), speaking: true, at: 1000 });
         assert_eq!(
             r.events[2],

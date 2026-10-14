@@ -39,10 +39,16 @@
       .catch((e) => (infoError = String(e)));
     api.detectLocalLlms().then((l) => (locals = l)).catch(() => {});
     api.atlassianStatus().then((a) => (atl = a)).catch(() => {});
-    api.getBridge().then((b) => (bridge = b)).catch(() => {});
+    // Poll, so "connected" shows up while the extension is being added.
+    const pollBridge = () => api.getBridge().then((b) => (bridge = b)).catch(() => {});
+    pollBridge();
+    const bridgeTimer = setInterval(pollBridge, 3000);
     let off: (() => void) | undefined;
     api.onModelDownload(onProgress).then((o) => (off = o));
-    return () => off?.();
+    return () => {
+      clearInterval(bridgeTimer);
+      off?.();
+    };
   });
 
   const gb = (mb: number) => (mb >= 10_240 ? Math.round(mb / 1024) : Math.round(mb / 102.4) / 10) + ' GB';
@@ -375,8 +381,9 @@
         <section class="mt-4 rounded-2xl border border-line p-5">
           <h2 class="font-semibold">Google Meet extension</h2>
           <p class="mt-0.5 text-sm text-muted">
-            Shows who's talking instead of "Others" and offers to record when you join a call. Load the extension folder in chrome://extensions (Developer mode → Load unpacked), then paste this code into it.
+            Shows who's talking instead of "Others" and offers to record when you join a call. In Chrome, open chrome://extensions, turn on Developer mode, choose Load unpacked and pick the extension folder. Then paste this code into the extension.
           </p>
+          <button class="{secondary} mt-3" disabled={!bridge?.folder} onclick={() => api.openExtensionFolder()}>Open extension folder</button>
           <div class="mt-3 flex items-center gap-2">
             <span class="h-2 w-2 rounded-full {bridge?.connected ? 'bg-lime-deep' : 'bg-faint'}"></span>
             <span class="text-sm {bridge?.connected ? 'font-medium' : 'text-muted'}">{bridge?.connected ? 'Extension connected' : 'Not connected yet'}</span>

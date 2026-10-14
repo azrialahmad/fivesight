@@ -158,6 +158,13 @@ export interface BridgeStatus {
   inCall: boolean;
   callTitle: string | null;
   error: string | null;
+  /** The connected extension's version (null before 0.2), and the one shipped with the app. */
+  version: string | null;
+  latest: string;
+  /** The connected extension is older than the shipped one: reload it in Chrome. */
+  outdated: boolean;
+  /** Folder to pick in Chrome's Load unpacked. */
+  folder: string | null;
 }
 
 export interface CallEvent {
@@ -240,6 +247,7 @@ export interface Api {
   testLlm(s: Settings, apiKey: string | null): Promise<string>;
   openLivePanel(): Promise<void>;
   getBridge(): Promise<BridgeStatus>;
+  openExtensionFolder(): Promise<void>;
   setupInfo(): Promise<SetupInfo>;
   detectLocalLlms(): Promise<LocalServer[]>;
   /** Queue the voice detection model (if missing) and these speech models; returns the files queued. */
@@ -293,6 +301,7 @@ const tauriApi: Api = {
   testLlm: (settings, apiKey) => invoke('test_llm', { settings, apiKey }),
   openLivePanel: () => invoke('open_live_panel'),
   getBridge: () => invoke('get_bridge'),
+  openExtensionFolder: () => invoke('open_extension_folder'),
   setupInfo: () => invoke('setup_info'),
   detectLocalLlms: () => invoke('detect_local_llms'),
   downloadModels: (speechModels) => invoke('download_models', { speechModels }),
@@ -499,7 +508,8 @@ function createMockApi(): Api {
       return { installed: true, jiraSite: 'yourcompany.atlassian.net', confluenceCli: true, confluence: false };
     },
     onAskLookup: (cb) => sub('ask-lookup', cb),
-    getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: false, inCall: false, callTitle: null, error: null }),
+    getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: true, inCall: false, callTitle: null, error: null, version: '0.1.0', latest: '0.2.0', outdated: true, folder: 'C:\\Users\\you\\AppData\\Local\\fivesight\\extension' }),
+    openExtensionFolder: async () => {},
     setupInfo: async () => {
       await new Promise((r) => setTimeout(r, 500));
       return {
