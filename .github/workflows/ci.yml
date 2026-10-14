@@ -40,6 +40,9 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: UI tests
+        working-directory: app
+        run: node --test test/mine.test.ts
       - name: Extension tests
         working-directory: extension
         run: node --test test/tracker.test.js

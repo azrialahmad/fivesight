@@ -55,6 +55,9 @@ struct Settings {
     /// Let Ask read Jira and Confluence through acli (read-only).
     #[serde(default = "enabled")]
     atlassian: bool,
+    /// Keep the AI notes up to date on their own while recording (one AI request every minute or so).
+    #[serde(default = "enabled")]
+    auto_notes: bool,
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
@@ -77,6 +80,7 @@ impl Default for Settings {
             fallback_model: String::new(),
             language: "auto".into(),
             atlassian: true,
+            auto_notes: true,
             has_key: false,
             provider: None,
             openrouter_model: None,
@@ -505,17 +509,23 @@ fn emit_stream(app: &AppHandle, event: &str, meeting_id: Option<i64>, delta: &st
 }
 
 #[tauri::command]
-async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64) -> Result<(), String> {
+/// Write the AI notes. `update` builds on the last AI notes instead of starting over; the
+/// automatic passes during a meeting use it so the notes don't churn.
+async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, update: bool) -> Result<(), String> {
     let cfg = llm_config(&state)?;
     let (meeting, transcript) = {
         let st = lock(&state.store);
         (st.get_meeting(id).map_err(err)?, st.transcript(id).map_err(err)?)
     };
+    let live = lock(&state.recording).as_ref().is_some_and(|r| r.meeting_id == id);
+    let previous = (update && !meeting.enhanced.trim().is_empty()).then_some(meeting.enhanced.as_str());
     let msgs = prompts::enhance_notes(
         &meeting.title,
         &meeting.notes,
         &prompts::format_transcript(&lines(&transcript), 60_000),
+        prompts::EnhanceMode { live, previous },
     );
+    tracing::debug!("enhancing meeting {id} (live: {live}, update: {})", previous.is_some());
     let key_sent = cfg.api_key.is_some();
 
     tauri::async_runtime::spawn(async move {
@@ -980,6 +990,7 @@ mod tests {
         assert_eq!(s.fallback_model, "");
         assert_eq!(s.language, "auto");
         assert!(s.atlassian);
+        assert!(s.auto_notes);
     }
 
     #[test]
