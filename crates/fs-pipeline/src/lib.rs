@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,6 +24,7 @@ use echo::{EchoConfig, EchoGuard};
 use fs_audio::{rms, Capture, Source};
 use fs_stt::engine::Engine;
 use fs_stt::filter::{judge, FilterConfig, SegmentStats, Verdict};
+use fs_stt::hints::echoes_prompt;
 use fs_stt::lang::{LangMode, LangTracker, BILINGUAL_PROMPT, MIN_DETECT_SECS};
 use fs_vad::silero::SileroVad;
 use fs_vad::{EndpointConfig, Endpointer, Event, FRAME, SAMPLE_RATE};
@@ -34,7 +35,8 @@ pub struct PipelineConfig {
     pub vad_model: PathBuf,
     /// Auto picks between Indonesian and English per utterance; Id/En pin one language.
     pub language: LangMode,
-    /// Biases Whisper toward the right vocabulary. Ignored in English-only mode.
+    /// Biases Whisper toward the right vocabulary and language style. `Pipeline::set_prompt`
+    /// replaces it while running. The bilingual default suits Auto and Indonesian, not English.
     pub initial_prompt: Option<String>,
     pub partial_interval: Duration,
     pub partial_window_s: f32,
@@ -115,6 +117,7 @@ struct Job {
 pub struct Pipeline {
     captures: Vec<Capture>,
     threads: Vec<JoinHandle<()>>,
+    prompt: Arc<Mutex<Option<String>>>,
 }
 
 impl Pipeline {
@@ -126,6 +129,7 @@ impl Pipeline {
         let inflight_out = Arc::new(AtomicBool::new(false));
         let barge = Arc::new(AtomicBool::new(false));
         let other = Arc::new(OtherSide::default());
+        let prompt = Arc::new(Mutex::new(cfg.initial_prompt.clone()));
 
         // Whisper worker owns the engine; load it here and report errors synchronously.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -137,6 +141,7 @@ impl Pipeline {
                 inflight_out: inflight_out.clone(),
                 barge: barge.clone(),
                 other: other.clone(),
+                prompt: prompt.clone(),
             };
             thread::Builder::new()
                 .name("whisper-worker".into())
@@ -184,7 +189,14 @@ impl Pipeline {
             );
             captures.push(Capture::start(source, frame_tx)?);
         }
-        Ok(Self { captures, threads })
+        Ok(Self { captures, threads, prompt })
+    }
+
+    /// Replace Whisper's initial prompt; the next utterance uses it.
+    pub fn set_prompt(&self, prompt: Option<String>) {
+        if let Ok(mut p) = self.prompt.lock() {
+            *p = prompt;
+        }
     }
 
     pub fn dropped_frames(&self) -> u64 {
@@ -311,6 +323,7 @@ struct WorkerShared {
     inflight_out: Arc<AtomicBool>,
     barge: Arc<AtomicBool>,
     other: Arc<OtherSide>,
+    prompt: Arc<Mutex<Option<String>>>,
 }
 
 fn worker_loop(
@@ -320,10 +333,6 @@ fn worker_loop(
     events: Sender<TranscriptEvent>,
     shared: WorkerShared,
 ) {
-    let prompt = match cfg.language {
-        LangMode::En => None,
-        _ => cfg.initial_prompt.as_deref(),
-    };
     // One tracker per audio stream (mic, loopback), and the language picked for each
     // utterance in progress so its partials don't re-detect on every pass.
     let mut trackers = [LangTracker::default(), LangTracker::default()];
@@ -392,9 +401,10 @@ fn worker_loop(
             dropped,
         };
 
+        let prompt = shared.prompt.lock().ok().and_then(|p| p.clone());
         let result = match job.kind {
-            Kind::Partial => engine.transcribe(&job.audio, lang, 1, prompt),
-            Kind::Final => engine.transcribe(&job.audio, lang, cfg.final_beam, prompt),
+            Kind::Partial => engine.transcribe(&job.audio, lang, 1, prompt.as_deref()),
+            Kind::Final => engine.transcribe(&job.audio, lang, cfg.final_beam, prompt.as_deref()),
         };
         if job.kind == Kind::Partial {
             match job.source {
@@ -430,7 +440,8 @@ fn worker_loop(
             let all = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
             (!all.is_empty()).then(|| mk(all, Some(format!("below energy gate (rms {level:.4})"))))
         } else if !text.is_empty() {
-            Some(mk(text, None))
+            let parroted = prompt.as_deref().is_some_and(|p| echoes_prompt(&text, p));
+            Some(mk(text, parroted.then(|| "repeats the prompt".to_string())))
         } else if job.kind == Kind::Final && !rejected.is_empty() {
             Some(mk(String::new(), Some(rejected.join(" | "))))
         } else {

@@ -69,6 +69,8 @@ export interface Settings {
   speechModel: string;
   /** First-run setup finished or skipped. */
   setupDone: boolean;
+  /** Names and jargon the speech model should listen for, separated by commas or new lines. */
+  vocabulary: string;
   /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
   hasKey: boolean;
 }
@@ -341,6 +343,7 @@ function createMockApi(): Api {
     speechModel: 'large-v3-turbo',
     // The preview opens on the home screen; Settings → Run setup shows the wizard.
     setupDone: true,
+    vocabulary: 'Playwright, Claude',
     hasKey: false
   };
   const speechModels: SpeechModelInfo[] = [

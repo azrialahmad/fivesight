@@ -26,6 +26,14 @@ impl LangMode {
             _ => Self::Auto,
         }
     }
+
+    /// The prompt sentence that sets the language style: none when only English is spoken.
+    pub fn base_prompt(self) -> Option<&'static str> {
+        match self {
+            Self::En => None,
+            _ => Some(BILINGUAL_PROMPT),
+        }
+    }
 }
 
 /// Shortest audio, in seconds, whose detection result is trusted.
