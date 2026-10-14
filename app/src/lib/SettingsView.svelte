@@ -331,14 +331,27 @@
         {#if bridge?.error}
           <span class="h-2 w-2 rounded-full bg-rec"></span><span class="text-rec">{bridge.error}</span>
         {:else if bridge?.connected}
-          <span class="h-2 w-2 rounded-full bg-lime-deep"></span><span class="font-medium">Extension connected{bridge.inCall ? ' · in a call' : ''}</span>
+          <span class="h-2 w-2 rounded-full bg-lime-deep"></span>
+          <span class="font-medium">Extension connected</span>
+          <span class="text-muted">{bridge.version ? `· version ${bridge.version}` : ''}{bridge.inCall ? ' · in a call' : ''}</span>
         {:else}
-          <span class="h-2 w-2 rounded-full bg-faint"></span><span class="text-muted">Extension not connected</span>
+          <span class="h-2 w-2 rounded-full bg-faint"></span><span class="text-muted">Not connected. Is Chrome open, with the extension added and paired?</span>
         {/if}
       </div>
+      {#if bridge?.outdated}
+        <p class="mt-3 rounded-xl bg-soft px-4 py-3 text-sm" role="status">
+          <span class="font-medium">An update for the extension is ready (version {bridge.latest}).</span>
+          In Chrome, open <span class="font-medium">chrome://extensions</span> and press the reload arrow on fivesight for Meet.
+          <span class="mt-1 block text-xs text-muted">Still says this afterwards? Remove the extension and load the folder below instead; it updates along with the app.</span>
+        </p>
+      {/if}
       <ol class="mt-3 list-decimal space-y-1 pl-5 text-sm text-muted">
         <li>In Chrome, open <span class="font-medium text-ink">chrome://extensions</span>, turn on Developer mode, and choose Load unpacked.</li>
-        <li>Pick the <span class="font-medium text-ink">extension</span> folder from the fivesight project.</li>
+        <li>
+          Pick the extension folder that comes with fivesight.
+          <button class="ml-1 font-medium text-ink underline disabled:no-underline disabled:opacity-50" disabled={!bridge?.folder} onclick={() => api.openExtensionFolder()}>Open extension folder</button>
+          {#if bridge?.folder}<span class="mt-0.5 block break-all text-xs text-faint">{bridge.folder}</span>{/if}
+        </li>
         <li>Open the extension's icon, paste the pairing code below, and press Connect.</li>
       </ol>
       <div class="mt-3 flex items-center gap-2">

@@ -11,11 +11,11 @@ It does not touch audio or video, shows nothing on the Meet page, and only talks
 ## Install (developer mode)
 
 1. Open `chrome://extensions` and turn on **Developer mode**.
-2. Choose **Load unpacked** and pick this `extension` folder.
+2. Choose **Load unpacked** and pick the extension folder. The app ships a copy: **Settings → Google Meet → Open extension folder**. (Working on fivesight itself? Pick this `extension` folder instead.)
 3. In fivesight, open **Settings → Google Meet** and copy the pairing code.
 4. Click the extension's icon, paste the code, press **Connect**.
 
-Settings shows "Extension connected" once a Meet tab is open.
+Settings shows "Extension connected" within half a minute, whether or not a Meet tab is open.
 
 ## How it works
 

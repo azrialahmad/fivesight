@@ -85,9 +85,13 @@ The first build takes several minutes (whisper.cpp with CUDA).
 ### Meet extension
 
 1. Open `chrome://extensions`, turn on Developer mode, and choose **Load unpacked**.
-2. Pick the `extension` folder.
+2. Pick the extension folder. The installed app ships one: **Settings → Google Meet → Open
+   extension folder**. When running from source, pick this repo's `extension` folder.
 3. In fivesight, open **Settings → Google Meet**, copy the pairing code, and paste it into the
    extension's popup.
+
+**Updating:** when a new fivesight comes with a newer extension, Settings says so. Open
+`chrome://extensions` and press the reload arrow on fivesight for Meet.
 
 See [extension/README.md](extension/README.md) for how it works.
 
