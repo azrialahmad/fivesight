@@ -185,11 +185,7 @@ pub struct Bridge {
 
 impl Bridge {
     /// Listen on `127.0.0.1:port` (0 picks a free port). `on_event` runs on the server thread.
-    pub fn start(
-        port: u16,
-        token: String,
-        on_event: impl Fn(Incoming) + Send + 'static,
-    ) -> Result<Self, BridgeError> {
+    pub fn start(port: u16, token: String, on_event: impl Fn(Incoming) + Send + 'static) -> Result<Self, BridgeError> {
         let addr = format!("127.0.0.1:{port}");
         let server = tiny_http::Server::http(&addr).map_err(|e| BridgeError::Bind(addr, e.to_string()))?;
         let server = Arc::new(server);
@@ -268,7 +264,10 @@ mod tests {
         for auth in [None, Some("Bearer nope"), Some("s3cret-token"), Some("Bearer ")] {
             assert_eq!(route(&post("/ping", Some("chrome-extension://abc"), auth, b""), TOKEN).status, 401);
         }
-        assert_eq!(route(&post("/ping", Some("chrome-extension://abc"), Some("Bearer s3cret-token"), b""), TOKEN).status, 200);
+        assert_eq!(
+            route(&post("/ping", Some("chrome-extension://abc"), Some("Bearer s3cret-token"), b""), TOKEN).status,
+            200
+        );
         // An unset token must never match an empty header.
         assert_eq!(route(&post("/ping", None, None, b""), "").status, 401);
     }
@@ -287,7 +286,11 @@ mod tests {
         assert_eq!(r.events[1], Incoming::Speaking { name: "Budi".into(), speaking: true, at: 1000 });
         assert_eq!(
             r.events[2],
-            Incoming::Call { state: CallState::Joined, title: Some("Payments sync".into()), code: Some("abc-defg-hij".into()) }
+            Incoming::Call {
+                state: CallState::Joined,
+                title: Some("Payments sync".into()),
+                code: Some("abc-defg-hij".into())
+            }
         );
     }
 

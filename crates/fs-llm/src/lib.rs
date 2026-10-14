@@ -32,7 +32,8 @@ impl LlmError {
             }
             LlmError::Api { status: 429, .. } => "The AI server is rate limiting you. Try again in a moment.".into(),
             LlmError::Http(e) if e.is_connect() || e.is_timeout() => {
-                "Couldn't reach the AI server. Check the address in Settings, or that your local server is running.".into()
+                "Couldn't reach the AI server. Check the address in Settings, or that your local server is running."
+                    .into()
             }
             other => other.to_string(),
         }
@@ -142,7 +143,11 @@ pub struct Reply {
 /// One non-streamed request offering `tools` (OpenAI function-calling format).
 /// Servers or models without tool support usually answer 400/404/422; callers can then
 /// fall back to a plain [`chat_stream`].
-pub async fn chat_with_tools(cfg: &LlmConfig, messages: &[Message], tools: &serde_json::Value) -> Result<Reply, LlmError> {
+pub async fn chat_with_tools(
+    cfg: &LlmConfig,
+    messages: &[Message],
+    tools: &serde_json::Value,
+) -> Result<Reply, LlmError> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
     let mut req = reqwest::Client::new().post(url).json(&serde_json::json!({
         "model": cfg.model,
@@ -163,14 +168,14 @@ pub async fn chat_with_tools(cfg: &LlmConfig, messages: &[Message], tools: &serd
     let v: serde_json::Value =
         serde_json::from_str(&body).map_err(|e| LlmError::Stream(format!("unreadable reply: {e}")))?;
     if let Some(err) = v.get("error") {
-        return Err(LlmError::Stream(err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error").to_string()));
+        return Err(LlmError::Stream(
+            err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error").to_string(),
+        ));
     }
     let msg = &v["choices"][0]["message"];
     let content = msg["content"].as_str().unwrap_or("").to_string();
-    let tool_calls: Vec<ToolCall> = msg
-        .get("tool_calls")
-        .and_then(|t| serde_json::from_value(t.clone()).ok())
-        .unwrap_or_default();
+    let tool_calls: Vec<ToolCall> =
+        msg.get("tool_calls").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default();
     Ok(Reply { content, tool_calls })
 }
 
@@ -184,9 +189,7 @@ async fn stream_once(
     use futures_util::StreamExt;
 
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let mut req = client
-        .post(url)
-        .json(&serde_json::json!({ "model": model, "messages": messages, "stream": true }));
+    let mut req = client.post(url).json(&serde_json::json!({ "model": model, "messages": messages, "stream": true }));
     if let Some(k) = &cfg.api_key {
         req = req.bearer_auth(k);
     }
@@ -267,7 +270,11 @@ mod tests {
                     if let Some(h) = text.find("\r\n\r\n") {
                         let len = text[..h]
                             .lines()
-                            .find_map(|l| l.to_ascii_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0)))
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
                             .unwrap_or(0);
                         if req.len() >= h + 4 + len || n == 0 {
                             let body_json = &text[h + 4..];
@@ -308,7 +315,10 @@ mod tests {
 
     #[test]
     fn user_messages_explain_the_fix() {
-        let api = |status| LlmError::Api { status, body: "{\"error\":{\"message\":\"Missing Authentication header\"}}".into() };
+        let api = |status| LlmError::Api {
+            status,
+            body: "{\"error\":{\"message\":\"Missing Authentication header\"}}".into(),
+        };
         assert!(api(401).user_message(false).contains("none was sent"));
         assert!(api(401).user_message(true).contains("rejected your API key"));
         assert!(api(404).user_message(true).contains("model name"));
@@ -387,20 +397,28 @@ mod tests {
     async fn a_plain_answer_comes_back_as_content() {
         let reply = r#"{"choices":[{"message":{"role":"assistant","content":"No lookup needed."}}]}"#;
         let url = fake("200 OK", reply.into()).await;
-        let r = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([])).await.unwrap();
+        let r = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([]))
+            .await
+            .unwrap();
         assert_eq!(r, Reply { content: "No lookup needed.".into(), tool_calls: vec![] });
     }
 
     #[tokio::test]
     async fn tool_support_errors_surface_for_fallback() {
         let url = fake("400 Bad Request", r#"{"error":{"message":"tools not supported"}}"#.into()).await;
-        let err = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([])).await.unwrap_err();
+        let err = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([]))
+            .await
+            .unwrap_err();
         assert!(matches!(err, LlmError::Api { status: 400, .. }), "{err}");
     }
 
     #[test]
     fn tool_turns_serialize_in_openai_shape() {
-        let call = ToolCall { id: "c1".into(), kind: "function".into(), function: FunctionCall { name: "jira_view".into(), arguments: "{}".into() } };
+        let call = ToolCall {
+            id: "c1".into(),
+            kind: "function".into(),
+            function: FunctionCall { name: "jira_view".into(), arguments: "{}".into() },
+        };
         let a = serde_json::to_value(Message::assistant_calls("", vec![call])).unwrap();
         assert_eq!(a["tool_calls"][0]["type"], "function");
         assert_eq!(a["tool_calls"][0]["function"]["name"], "jira_view");
@@ -408,7 +426,10 @@ mod tests {
         assert_eq!(t["role"], "tool");
         assert_eq!(t["tool_call_id"], "c1");
         // Plain turns stay exactly {role, content}.
-        assert_eq!(serde_json::to_value(Message::user("hi")).unwrap(), serde_json::json!({"role": "user", "content": "hi"}));
+        assert_eq!(
+            serde_json::to_value(Message::user("hi")).unwrap(),
+            serde_json::json!({"role": "user", "content": "hi"})
+        );
     }
 
     #[tokio::test]
@@ -433,7 +454,10 @@ mod tests {
     #[tokio::test]
     async fn no_fallback_once_output_has_started() {
         // Stream emits text, then a mid-stream error: must not retry on the fallback model.
-        let body = format!("{}data: {{\"error\":{{\"message\":\"cut\"}}}}\n\n", sse(&["partial"]).replace("data: [DONE]\n\n", ""));
+        let body = format!(
+            "{}data: {{\"error\":{{\"message\":\"cut\"}}}}\n\n",
+            sse(&["partial"]).replace("data: [DONE]\n\n", "")
+        );
         let (url, models) = fake_seq(vec![("200 OK", body), ("200 OK", sse(&["should not appear"]))]).await;
         let mut cfg = LlmConfig::local(&url, "primary");
         cfg.fallback_model = Some("fallback".into());

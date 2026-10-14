@@ -118,10 +118,7 @@ fn normalize(t: &str) -> String {
 }
 
 fn first_heading(md: &str) -> Option<String> {
-    md.lines()
-        .map(str::trim)
-        .find_map(|l| l.strip_prefix("# ").map(|h| h.trim().to_string()))
-        .filter(|h| !h.is_empty())
+    md.lines().map(str::trim).find_map(|l| l.strip_prefix("# ").map(|h| h.trim().to_string())).filter(|h| !h.is_empty())
 }
 
 fn heading(line: &str) -> Option<&str> {

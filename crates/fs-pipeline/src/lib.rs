@@ -138,10 +138,7 @@ impl Pipeline {
                 })
                 .map_err(|e| PipelineError::Thread(e.to_string()))?
         };
-        ready_rx
-            .recv()
-            .map_err(|e| PipelineError::Thread(e.to_string()))?
-            .map_err(PipelineError::Whisper)?;
+        ready_rx.recv().map_err(|e| PipelineError::Thread(e.to_string()))?.map_err(PipelineError::Whisper)?;
 
         let mut threads = vec![worker];
         let mut captures = Vec::new();
@@ -248,10 +245,7 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
         }
 
         // Streaming partial over the tail of the current segment.
-        if ep.is_speaking()
-            && last_partial.elapsed() >= ctx.partial_interval
-            && !ctx.inflight.load(Ordering::Relaxed)
-        {
+        if ep.is_speaking() && last_partial.elapsed() >= ctx.partial_interval && !ctx.inflight.load(Ordering::Relaxed) {
             let cur = ep.current_audio();
             let tail = &cur[cur.len().saturating_sub(SAMPLE_RATE)..];
             if cur.len() >= SAMPLE_RATE / 2 && rms(tail) >= ctx.min_rms {

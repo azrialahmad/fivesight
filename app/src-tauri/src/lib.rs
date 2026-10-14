@@ -9,8 +9,8 @@ use fs_audio::Source;
 use fs_bridge::{Bridge, CallState, Incoming, SpeakerLog};
 use fs_llm::{chat_stream, prompts, LlmConfig, Message};
 use fs_pipeline::{Kind, Pipeline, PipelineConfig, TranscriptEvent};
-use fs_stt::lang::LangMode;
 use fs_store::{ChatMessage, KbDoc, Meeting, MeetingSummary, SearchHit, Segment, Store};
+use fs_stt::lang::LangMode;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
@@ -248,9 +248,7 @@ fn models_dir() -> Option<PathBuf> {
         candidates.push(PathBuf::from(p).join("fivesight").join("models"));
     }
     candidates.push(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models")));
-    candidates
-        .into_iter()
-        .find(|d| d.join("ggml-large-v3-turbo.bin").exists() && d.join("silero_vad.onnx").exists())
+    candidates.into_iter().find(|d| d.join("ggml-large-v3-turbo.bin").exists() && d.join("silero_vad.onnx").exists())
 }
 
 fn stored_key(user: &str) -> Option<String> {
@@ -388,11 +386,7 @@ struct TranscriptPayload<'a> {
 }
 
 #[tauri::command]
-async fn start_recording(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    meeting_id: Option<i64>,
-) -> Result<i64, String> {
+async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>) -> Result<i64, String> {
     if lock(&state.recording).is_some() {
         return Err("Already recording.".into());
     }
@@ -421,10 +415,8 @@ async fn start_recording(
 
     let (tx, rx) = std::sync::mpsc::channel::<TranscriptEvent>();
     // Loading the model takes a few seconds; keep it off the async runtime.
-    let pipeline = tauri::async_runtime::spawn_blocking(move || Pipeline::start(cfg, tx))
-        .await
-        .map_err(err)?
-        .map_err(err)?;
+    let pipeline =
+        tauri::async_runtime::spawn_blocking(move || Pipeline::start(cfg, tx)).await.map_err(err)?.map_err(err)?;
     *lock(&state.recording) = Some(Recording { _pipeline: pipeline, meeting_id: mid });
 
     let forward = app.clone();
@@ -506,7 +498,11 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64) -> R
         let st = lock(&state.store);
         (st.get_meeting(id).map_err(err)?, st.transcript(id).map_err(err)?)
     };
-    let msgs = prompts::enhance_notes(&meeting.title, &meeting.notes, &prompts::format_transcript(&lines(&transcript), 60_000));
+    let msgs = prompts::enhance_notes(
+        &meeting.title,
+        &meeting.notes,
+        &prompts::format_transcript(&lines(&transcript), 60_000),
+    );
     let key_sent = cfg.api_key.is_some();
 
     tauri::async_runtime::spawn(async move {
@@ -527,7 +523,12 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64) -> R
 }
 
 #[tauri::command]
-async fn ask(app: AppHandle, state: State<'_, AppState>, meeting_id: Option<i64>, question: String) -> Result<(), String> {
+async fn ask(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    meeting_id: Option<i64>,
+    question: String,
+) -> Result<(), String> {
     let cfg = llm_config(&state)?;
     let now = now_ms();
     let key_sent = cfg.api_key.is_some();
@@ -658,12 +659,8 @@ fn index_file(st: &AppState, path: &std::path::Path) -> Result<String, String> {
     let extracted = fs_kb::extract(path).map_err(err)?;
     let chunks = fs_kb::chunk(&extracted.text);
     let meta = std::fs::metadata(path).map_err(err)?;
-    let modified = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let modified =
+        meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0);
     let shown = path.to_string_lossy().to_string();
     lock(&st.store)
         .kb_put(&shown, &extracted.title, extracted.kind.as_str(), meta.len() as i64, modified, now_ms(), &chunks)
@@ -761,7 +758,9 @@ async fn test_llm(settings: Settings, api_key: Option<String>) -> Result<String,
     cfg.fallback_model = None;
     let msgs = [Message::user("Reply with the single word: ok")];
     match chat_stream(&cfg, &msgs, |_| {}).await {
-        Ok(reply) => Ok(format!("Connected. {} replied: {}", cfg.model, reply.trim().chars().take(60).collect::<String>())),
+        Ok(reply) => {
+            Ok(format!("Connected. {} replied: {}", cfg.model, reply.trim().chars().take(60).collect::<String>()))
+        }
         Err(e) => Err(e.user_message(key_sent)),
     }
 }
@@ -794,7 +793,8 @@ pub fn run() {
             std::fs::create_dir_all(&dir)?;
             let store = Store::open(&dir.join("fivesight.db"))?;
             let settings_path = dir.join("settings.json");
-            let loaded = std::fs::read_to_string(&settings_path).ok().and_then(|t| serde_json::from_str::<Settings>(&t).ok());
+            let loaded =
+                std::fs::read_to_string(&settings_path).ok().and_then(|t| serde_json::from_str::<Settings>(&t).ok());
             let settings = match loaded {
                 Some(old) => {
                     let (settings, legacy_slot) = old.migrated();
@@ -803,7 +803,8 @@ pub fn run() {
                         let new_slot = key_slot(&settings.base_url);
                         if stored_key(&new_slot).is_none() {
                             if let Some(k) = stored_key(slot) {
-                                let _ = keyring::Entry::new(KEYRING_SERVICE, &new_slot).and_then(|e| e.set_password(&k));
+                                let _ =
+                                    keyring::Entry::new(KEYRING_SERVICE, &new_slot).and_then(|e| e.set_password(&k));
                             }
                         }
                         if let Ok(json) = serde_json::to_string_pretty(&settings) {
@@ -832,7 +833,8 @@ pub fn run() {
             // The Meet extension reports speaker names here. Failing to listen is not fatal.
             let token = pairing_token();
             let handle = app.handle().clone();
-            let started = Bridge::start(fs_bridge::DEFAULT_PORT, token.clone(), move |ev| handle_meet_event(&handle, ev));
+            let started =
+                Bridge::start(fs_bridge::DEFAULT_PORT, token.clone(), move |ev| handle_meet_event(&handle, ev));
             {
                 let st = app.state::<AppState>();
                 let mut meet = lock(&st.meet);
@@ -929,7 +931,9 @@ mod tests {
 
     #[test]
     fn new_shape_is_left_alone_and_legacy_fields_are_not_written() {
-        let (s, slot) = parse(r#"{"baseUrl":"https://api.groq.com/openai/v1","model":"llama","fallbackModel":"","language":"en"}"#).migrated();
+        let (s, slot) =
+            parse(r#"{"baseUrl":"https://api.groq.com/openai/v1","model":"llama","fallbackModel":"","language":"en"}"#)
+                .migrated();
         assert_eq!(slot, None);
         assert_eq!(s.base_url, "https://api.groq.com/openai/v1");
         let out = serde_json::to_string(&s).unwrap();
@@ -938,7 +942,11 @@ mod tests {
 
     #[test]
     fn build_config_validates_and_keeps_the_key_for_that_server() {
-        let mut s = Settings { base_url: "https://api.openai.com/v1/chat/completions".into(), model: "gpt-4o-mini".into(), ..Settings::default() };
+        let mut s = Settings {
+            base_url: "https://api.openai.com/v1/chat/completions".into(),
+            model: "gpt-4o-mini".into(),
+            ..Settings::default()
+        };
         let cfg = build_config(&s, Some("sk-test".into())).unwrap();
         assert_eq!(cfg.base_url, "https://api.openai.com/v1");
         assert_eq!(cfg.api_key.as_deref(), Some("sk-test"));

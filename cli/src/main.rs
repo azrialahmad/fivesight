@@ -4,17 +4,12 @@ fn read_wav_16k_mono(path: &str) -> Result<Vec<f32>> {
     let mut r = hound::WavReader::open(path).with_context(|| format!("open {path}"))?;
     let spec = r.spec();
     if spec.sample_rate != 16_000 || spec.channels != 1 {
-        bail!(
-            "need 16 kHz mono wav, got {} Hz x {} ch",
-            spec.sample_rate,
-            spec.channels
-        );
+        bail!("need 16 kHz mono wav, got {} Hz x {} ch", spec.sample_rate, spec.channels);
     }
     Ok(match spec.sample_format {
-        hound::SampleFormat::Int => r
-            .samples::<i16>()
-            .map(|s| s.map(|v| v as f32 / 32768.0))
-            .collect::<Result<_, _>>()?,
+        hound::SampleFormat::Int => {
+            r.samples::<i16>().map(|s| s.map(|v| v as f32 / 32768.0)).collect::<Result<_, _>>()?
+        }
         hound::SampleFormat::Float => r.samples::<f32>().collect::<Result<_, _>>()?,
     })
 }
@@ -37,15 +32,9 @@ fn bench(model: &str, wav: &str, lang: Option<&str>) -> Result<()> {
         let t = Instant::now();
         let segs = eng.transcribe(&samples, lang, beam, None)?;
         let dt = t.elapsed().as_secs_f32();
-        println!(
-            "\nbeam {beam}: {dt:.2}s for {audio_s:.1}s audio (RTF {:.3})",
-            dt / audio_s
-        );
+        println!("\nbeam {beam}: {dt:.2}s for {audio_s:.1}s audio (RTF {:.3})", dt / audio_s);
         for s in segs {
-            println!(
-                "[{:>6}-{:>6} ms] (nsp {:.2}) {}",
-                s.start_ms, s.end_ms, s.no_speech_prob, s.text
-            );
+            println!("[{:>6}-{:>6} ms] (nsp {:.2}) {}", s.start_ms, s.end_ms, s.no_speech_prob, s.text);
         }
     }
     Ok(())

@@ -67,13 +67,7 @@ pub fn enhance_notes(title: &str, user_notes: &str, transcript: &str) -> Vec<Mes
 }
 
 /// Answer a question about a meeting. `history` is earlier chat turns (oldest first).
-pub fn ask(
-    question: &str,
-    notes: &str,
-    transcript: &str,
-    docs: &[ContextDoc],
-    history: &[Message],
-) -> Vec<Message> {
+pub fn ask(question: &str, notes: &str, transcript: &str, docs: &[ContextDoc], history: &[Message]) -> Vec<Message> {
     let system = format!(
         "You answer questions about a meeting using only the provided material: the user's notes, \
          the transcript, and passages from the user's own files.\n\
@@ -86,7 +80,11 @@ pub fn ask(
     for d in docs {
         ctx.push_str(&format!("\n\n<context title=\"{}\">\n{}\n</context>", d.title.replace('"', "'"), d.text));
     }
-    let mut msgs = vec![Message::system(system), Message::user(ctx), Message::assistant("Understood. What would you like to know?")];
+    let mut msgs = vec![
+        Message::system(system),
+        Message::user(ctx),
+        Message::assistant("Understood. What would you like to know?"),
+    ];
     msgs.extend(history.iter().cloned());
     msgs.push(Message::user(question));
     msgs

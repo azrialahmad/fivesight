@@ -55,9 +55,27 @@ impl LangTracker {
         } else {
             let id_share = p_id / total;
             match self.last {
-                Some("id") => if 1.0 - id_share > SWITCH_SHARE { "en" } else { "id" },
-                Some(_) => if id_share > SWITCH_SHARE { "id" } else { "en" },
-                None => if id_share >= 0.5 { "id" } else { "en" },
+                Some("id") => {
+                    if 1.0 - id_share > SWITCH_SHARE {
+                        "en"
+                    } else {
+                        "id"
+                    }
+                }
+                Some(_) => {
+                    if id_share > SWITCH_SHARE {
+                        "id"
+                    } else {
+                        "en"
+                    }
+                }
+                None => {
+                    if id_share >= 0.5 {
+                        "id"
+                    } else {
+                        "en"
+                    }
+                }
             }
         };
         self.last = Some(pick);
