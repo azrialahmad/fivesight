@@ -17,6 +17,7 @@
 
 pub mod confluence;
 mod format;
+pub mod storage;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -50,6 +51,10 @@ pub enum AtlassianError {
 
 /// Text handed to the AI per lookup is capped so a big ticket can't crowd out the meeting.
 pub const MAX_OUTPUT_BYTES: usize = 12 * 1024;
+/// A Confluence page is often the spec the meeting is about, so it gets much more room: a long
+/// PRD cut at 12 KB loses most of its acceptance criteria, and the AI then fills the gap itself.
+pub const MAX_PAGE_BYTES: usize = 48 * 1024;
+const MAX_COMMENTS_BYTES: usize = 16 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(25);
 const SEARCH_FIELDS: &str = "key,issuetype,summary,status,assignee,priority";
 const VIEW_FIELDS: &str = "key,issuetype,summary,status,assignee,reporter,priority,labels,updated,description,comment";
@@ -196,9 +201,12 @@ impl ReadCommand {
             }
             Self::ConfluenceSearch { query, limit } => vec![confluence::search_argv(query, *limit)?],
             Self::ConfluenceFind { title, space } => vec![confluence::find_argv(title, space.as_deref())?],
-            Self::ConfluencePage { page_id } => {
-                vec![confluence::read_argv(page_id)?, confluence::comments_argv(page_id)?]
-            }
+            Self::ConfluencePage { page_id } => vec![
+                confluence::read_argv(page_id)?,
+                confluence::comments_argv(page_id)?,
+                confluence::info_argv(page_id)?,
+                confluence::read_markdown_argv(page_id)?,
+            ],
         })
     }
 
@@ -381,19 +389,86 @@ pub fn run(cmd: &ReadCommand) -> Result<String, AtlassianError> {
                 Err(_) => raw,
             }
         }
-        ReadCommand::ConfluencePage { .. } => {
-            let page = exec(tool, &plan[0])?;
-            // Decisions often live in the comment threads; a page still reads fine without them.
-            let comments = match exec(tool, &plan[1]) {
-                Ok(c) if !c.trim().is_empty() => c,
-                Ok(_) => "(no comments)".into(),
-                Err(e) => format!("(comments unavailable: {e})"),
-            };
-            format!("{}\n\n## Comments\n\n{}", page.trim(), comments.trim())
+        ReadCommand::ConfluencePage { page_id } => {
+            // Pages have their own, larger limits (see read_page).
+            let page = read_page(page_id)?;
+            return Ok(match page.title {
+                Some(t) => format!("# {t}\n\n{}", page.text),
+                None => page.text,
+            });
         }
         ReadCommand::ConfluenceSearch { .. } | ReadCommand::ConfluenceFind { .. } => exec(tool, &plan[0])?,
     };
     Ok(truncate_output(text))
+}
+
+/// A Confluence page, read whole: the body (with tables and lists kept) and its comment threads.
+#[derive(Debug, Clone)]
+pub struct Page {
+    pub id: String,
+    pub title: Option<String>,
+    pub text: String,
+}
+
+/// Read a page, its comments and its title. They're separate CLI runs, so they run in parallel.
+pub fn read_page(page_id: &str) -> Result<Page, AtlassianError> {
+    let tool = Tool::ConfluenceCli;
+    let run = |argv: Result<Vec<String>, AtlassianError>| argv.and_then(|a| exec(tool, &a));
+    let (body, comments, info) = std::thread::scope(|s| {
+        let body = s.spawn(|| run(confluence::read_argv(page_id)));
+        let comments = s.spawn(|| run(confluence::comments_argv(page_id)));
+        let info = s.spawn(|| run(confluence::info_argv(page_id)));
+        let crashed = || Err(AtlassianError::Failed("confluence-cli reader crashed".into()));
+        (
+            body.join().unwrap_or_else(|_| crashed()),
+            comments.join().unwrap_or_else(|_| crashed()),
+            info.join().unwrap_or_else(|_| crashed()),
+        )
+    });
+    let body = match body {
+        Ok(xhtml) => storage::to_text(&xhtml),
+        Err(
+            e @ (AtlassianError::ConfluenceLogin | AtlassianError::NotInstalled(_) | AtlassianError::InvalidArg(_)),
+        ) => return Err(e),
+        Err(e) => {
+            tracing::warn!("reading Confluence page {page_id} as storage failed ({e}); trying Markdown");
+            String::new()
+        }
+    };
+    // Nothing came out of the conversion: the CLI's own Markdown is better than nothing.
+    let body = if body.trim().is_empty() { run(confluence::read_markdown_argv(page_id))? } else { body };
+    // Decisions often live in the comment threads; a page still reads fine without them.
+    let comments = match comments {
+        Ok(c) if !c.trim().is_empty() => confluence::tidy_comments(&c),
+        Ok(_) => "(no comments)".into(),
+        Err(e) => format!("(comments unavailable: {e})"),
+    };
+    let text = format!(
+        "{}\n\n## Comments\n\n{}",
+        cut(body.trim().to_string(), MAX_PAGE_BYTES, "page"),
+        cut(comments, MAX_COMMENTS_BYTES, "comments")
+    );
+    let title = info.ok().as_deref().and_then(confluence::title_from_info);
+    Ok(Page { id: page_id.to_string(), title, text })
+}
+
+/// Cut on a char boundary and say plainly how much is missing, so the AI doesn't fill it in.
+fn cut(mut s: String, max: usize, what: &str) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let total = s.len();
+    let mut at = max;
+    while !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    s.truncate(at);
+    s.push_str(&format!(
+        "\n\n[The rest of the {what} (about {} KB) is not shown. If the answer could be in that part, say so \
+         instead of guessing.]",
+        (total - at).div_ceil(1024)
+    ));
+    s
 }
 
 /// What fivesight can reach. Never fails: missing pieces are just `None`/`false`.
@@ -480,7 +555,7 @@ pub fn tool_specs(jira: bool, confluence: bool) -> Value {
         }}));
         tools.push(json!({"type": "function", "function": {
             "name": "confluence_page",
-            "description": "Read a Confluence page as Markdown, followed by its comment threads (inline, footer and resolved), where decisions are often made. Read-only.",
+            "description": "Read a whole Confluence page (tables shown row by row, lists kept), followed by its comment threads (inline, footer and resolved), where decisions are often made. Read-only.",
             "parameters": {"type": "object", "properties": {
                 "page": {"type": "string", "description": "Page id (digits) or a Confluence page link"}
             }, "required": ["page"]}
@@ -685,5 +760,9 @@ mod tests {
         let t = truncate_output("é".repeat(MAX_OUTPUT_BYTES));
         assert!(t.ends_with("[truncated]"));
         assert!(t.len() <= MAX_OUTPUT_BYTES + 20);
+        let c = cut("é".repeat(3000), 1001, "page");
+        assert!(c.starts_with(&"é".repeat(500)) && !c.starts_with(&"é".repeat(501)), "{c}");
+        assert!(c.contains("(about 5 KB) is not shown"), "{c}");
+        assert_eq!(cut("short".into(), 100, "page"), "short");
     }
 }
