@@ -129,7 +129,7 @@ confluence init
 | `crates/fs-atlassian` | Read-only `acli` and `confluence-cli` wrappers and their allowlists |
 | `crates/fs-bridge` | Local endpoint for the Meet extension |
 | `extension/` | Chrome extension for Google Meet speaker names |
-| `cli/` | Headless benchmark and live-transcription tool for tuning |
+| `cli/` | Headless benchmark, recording replay and live-transcription tool for tuning |
 
 ## Contributing
 

@@ -119,6 +119,78 @@ fn live(secs: u64, lang: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Run a recording through the VAD and Whisper the way the app treats the other side's audio,
+/// and show the lines that only repeated the prompt and what a second try without its example
+/// sentence heard. `prompt` defaults to the language's base sentence.
+#[cfg(feature = "engine")]
+fn replay(wav: &str, lang: Option<&str>, prompt: Option<&str>) -> Result<()> {
+    use fs_pipeline::{judge_all, listen_again};
+    use fs_stt::hints::echoes_prompt;
+    use fs_stt::lang::{LangMode, LangTracker, MIN_DETECT_SECS};
+    use fs_vad::{silero::SileroVad, EndpointConfig, Endpointer, Event, FRAME, SAMPLE_RATE};
+    use std::path::Path;
+
+    let samples = read_wav_16k_mono(wav)?;
+    let mode = LangMode::parse(lang.unwrap_or("auto"));
+    let base = mode.base_prompt();
+    let prompt = prompt.or(base);
+    let filter = fs_stt::filter::FilterConfig::default();
+    let engine = fs_stt::engine::Engine::load(Path::new("models/ggml-large-v3-turbo.bin"), true)?;
+    let mut vad = SileroVad::load(Path::new("models/silero_vad.onnx"))?;
+    let mut ep = Endpointer::new(EndpointConfig::with_end_silence_ms(1100));
+
+    let mut finals = Vec::new();
+    for frame in samples.chunks_exact(FRAME) {
+        for ev in ep.push(frame, vad.prob(frame)?) {
+            if let Event::End { start_sample, audio, .. } = ev {
+                finals.push((start_sample, audio));
+            }
+        }
+    }
+    if let Some(Event::End { start_sample, audio, .. }) = ep.force_finalize() {
+        finals.push((start_sample, audio));
+    }
+
+    println!(
+        "prompt: {}\n'>>' kept, 'xx' repeated the prompt, '<>' repeated it but heard again\n",
+        prompt.unwrap_or("")
+    );
+    let mut tracker = LangTracker::default();
+    let (mut lines, mut echoes, mut recovered) = (0, 0, 0);
+    for (start, audio) in finals {
+        let secs = audio.len() as f32 / SAMPLE_RATE as f32;
+        let l = match mode {
+            LangMode::Id => "id",
+            LangMode::En => "en",
+            LangMode::Auto if secs >= MIN_DETECT_SECS => {
+                let p = engine.detect_among(&audio, &["id", "en"])?;
+                tracker.choose(p[0], p[1], secs)
+            }
+            LangMode::Auto => tracker.last().unwrap_or("id"),
+        };
+        let (text, _) = judge_all(&engine.transcribe(&audio, Some(l), 3, prompt)?, &filter);
+        if text.is_empty() {
+            continue;
+        }
+        lines += 1;
+        let at = format!("{:>7.1}s {secs:>4.1}s {l}", start as f32 / SAMPLE_RATE as f32);
+        if !prompt.is_some_and(|p| echoes_prompt(&text, p)) {
+            println!(">> {at} {text}");
+            continue;
+        }
+        echoes += 1;
+        match listen_again(&engine, &audio, Some(l), 3, prompt, base, &filter) {
+            Some(again) => {
+                recovered += 1;
+                println!("<> {at} {text}  =>  {again}");
+            }
+            None => println!("xx {at} {text}"),
+        }
+    }
+    println!("\n{lines} lines, {echoes} repeated the prompt, {recovered} of those heard again without it");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -136,10 +208,17 @@ fn main() -> Result<()> {
             let lang = args.get(4).map(String::as_str).filter(|l| *l != "auto");
             bench(model, wav, lang, args.get(5).map(String::as_str))
         }
+        #[cfg(feature = "engine")]
+        Some("replay") => {
+            let Some(wav) = args.get(2) else {
+                bail!("usage: fivesight-cli replay <wav16k-mono> [auto|id|en] [prompt]");
+            };
+            replay(wav, args.get(3).map(String::as_str), args.get(4).map(String::as_str))
+        }
         #[cfg(not(feature = "engine"))]
-        Some("bench") => bail!("built without the engine feature; rebuild with --features cuda"),
+        Some("bench" | "replay") => bail!("built without the engine feature; rebuild with --features cuda"),
         _ => {
-            println!("fivesight-cli {}\ncommands: bench", env!("CARGO_PKG_VERSION"));
+            println!("fivesight-cli {}\ncommands: bench, replay", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
     }

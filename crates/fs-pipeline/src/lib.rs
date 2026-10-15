@@ -22,9 +22,9 @@ use std::time::{Duration, Instant};
 
 use echo::{EchoConfig, EchoGuard};
 use fs_audio::{rms, Capture, Source};
-use fs_stt::engine::Engine;
+use fs_stt::engine::{Engine, Segment};
 use fs_stt::filter::{judge, FilterConfig, SegmentStats, Verdict};
-use fs_stt::hints::echoes_prompt;
+use fs_stt::hints::{echoes_prompt, retry_prompt};
 use fs_stt::lang::{LangMode, LangTracker, BILINGUAL_PROMPT, MIN_DETECT_SECS};
 use fs_vad::silero::SileroVad;
 use fs_vad::{EndpointConfig, Endpointer, Event, FRAME, SAMPLE_RATE};
@@ -474,23 +474,25 @@ fn worker_loop(
             Source::Loopback => cfg.min_rms_others,
         };
         let level = rms(&job.audio);
-        let mut kept = Vec::new();
-        let mut rejected: Vec<String> = Vec::new();
-        for s in &segments {
-            let stats = SegmentStats { no_speech_prob: s.no_speech_prob, avg_logprob: s.avg_logprob, vad_speech: true };
-            match judge(&s.text, stats, &cfg.filter) {
-                Verdict::Keep => kept.push(s.text.clone()),
-                Verdict::Drop(why) => rejected.push(format!("{why}: {}", s.text)),
+        let (mut text, rejected) = judge_all(&segments, &cfg.filter);
+        let mut parroted = !text.is_empty() && prompt.as_deref().is_some_and(|p| echoes_prompt(&text, p));
+        if parroted && job.kind == Kind::Final && level >= min_rms {
+            let base = cfg.language.base_prompt();
+            if let Some(again) =
+                listen_again(&engine, &job.audio, lang, cfg.final_beam, prompt.as_deref(), base, &cfg.filter)
+            {
+                tracing::debug!("prompt echo \"{text}\" heard again without it: {again}");
+                text = again;
+                parroted = false;
             }
         }
-        let text = trim_ellipsis(&kept.join(" "));
 
         let ev = if level < min_rms && job.kind == Kind::Final {
             let all = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
             (!all.is_empty()).then(|| mk(all, Some(format!("below energy gate (rms {level:.4})"))))
         } else if !text.is_empty() {
-            let parroted = prompt.as_deref().is_some_and(|p| echoes_prompt(&text, p));
-            Some(mk(text, parroted.then(|| "repeats the prompt".to_string())))
+            let why = || format!("repeats the prompt: {:?}, {secs:.1} s, {}", job.source, lang.unwrap_or("auto"));
+            Some(mk(text, parroted.then(why)))
         } else if job.kind == Kind::Final && !rejected.is_empty() {
             Some(mk(String::new(), Some(rejected.join(" | "))))
         } else {
@@ -538,6 +540,42 @@ fn worker_loop(
             let _ = events.send(ev);
         }
     }
+}
+
+/// Second try at an utterance whose text only repeated `prompt`: the same audio with the
+/// glossary but without the `base` example sentence. Returns the text when that hears
+/// something other than its own (smaller) prompt, which means someone said it.
+pub fn listen_again(
+    engine: &Engine,
+    audio: &[f32],
+    lang: Option<&str>,
+    beam: i32,
+    prompt: Option<&str>,
+    base: Option<&str>,
+    filter: &FilterConfig,
+) -> Option<String> {
+    let retry = prompt.and_then(|p| retry_prompt(p, base));
+    let segments = engine
+        .transcribe(audio, lang, beam, retry.as_deref())
+        .map_err(|e| tracing::error!("transcribe retry: {e}"))
+        .ok()?;
+    let (text, _) = judge_all(&segments, filter);
+    let echo = retry.as_deref().is_some_and(|p| echoes_prompt(&text, p));
+    (!text.is_empty() && !echo).then_some(text)
+}
+
+/// Text of the segments the filter keeps, and why the others were dropped.
+pub fn judge_all(segments: &[Segment], filter: &FilterConfig) -> (String, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut rejected = Vec::new();
+    for s in segments {
+        let stats = SegmentStats { no_speech_prob: s.no_speech_prob, avg_logprob: s.avg_logprob, vad_speech: true };
+        match judge(&s.text, stats, filter) {
+            Verdict::Keep => kept.push(s.text.clone()),
+            Verdict::Drop(why) => rejected.push(format!("{why}: {}", s.text)),
+        }
+    }
+    (trim_ellipsis(&kept.join(" ")), rejected)
 }
 
 /// Drop the "..." Whisper puts where audio was cut mid-sentence: at the end of every partial
