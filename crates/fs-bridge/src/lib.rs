@@ -437,6 +437,12 @@ mod tests {
             Incoming::Speaking { name: "Budi".into(), speaking: true, at: 5 }
         );
         drop(bridge);
-        assert!(TcpStream::connect(("127.0.0.1", port)).is_err(), "port should be released");
+        // tiny_http closes its listening socket on its own accept thread, which it doesn't wait
+        // for, so the port can stay open a moment after the drop. It must close soon after.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            assert!(std::time::Instant::now() < deadline, "port should be released");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
