@@ -59,8 +59,11 @@ pub enum Event {
     End {
         start_sample: u64,
         audio: Vec<f32>,
-        /// True when closed because of `max_segment_frames`, not silence.
+        /// True when closed because of `max_segment_frames` or [`Endpointer::split`], not silence.
         forced: bool,
+        /// Frames that came in after this audio ended (trimmed silence, or the part kept by a
+        /// split), so the caller can tell when the audio ended in real time.
+        tail_frames: usize,
     },
     /// The segment was too short and has been discarded.
     Dropped,
@@ -75,9 +78,12 @@ enum State {
 pub struct Endpointer {
     cfg: EndpointConfig,
     state: State,
-    preroll: VecDeque<Vec<f32>>,
-    pending_start: Vec<Vec<f32>>,
+    /// Frames before a segment, with their speech probability.
+    preroll: VecDeque<(Vec<f32>, f32)>,
+    pending_start: Vec<(Vec<f32>, f32)>,
     buf: Vec<f32>,
+    /// Speech probability of each frame in `buf`, to find where to split.
+    probs: Vec<f32>,
     seg_start_sample: u64,
     speech_frames: usize,
     silence_run: usize,
@@ -92,6 +98,7 @@ impl Endpointer {
             preroll: VecDeque::new(),
             pending_start: Vec::new(),
             buf: Vec::new(),
+            probs: Vec::new(),
             seg_start_sample: 0,
             speech_frames: 0,
             silence_run: 0,
@@ -118,17 +125,16 @@ impl Endpointer {
         match self.state {
             State::Idle => {
                 if prob >= self.cfg.threshold {
-                    self.pending_start.push(frame.to_vec());
+                    self.pending_start.push((frame.to_vec(), prob));
                     if self.pending_start.len() >= self.cfg.start_frames {
                         let pre = self.preroll.len();
                         let first = idx + 1 - self.pending_start.len() as u64 - pre as u64;
                         self.seg_start_sample = first * FRAME as u64;
                         self.buf.clear();
-                        for f in self.preroll.drain(..) {
+                        self.probs.clear();
+                        for (f, p) in self.preroll.drain(..).chain(self.pending_start.drain(..)) {
                             self.buf.extend_from_slice(&f);
-                        }
-                        for f in self.pending_start.drain(..) {
-                            self.buf.extend_from_slice(&f);
+                            self.probs.push(p);
                         }
                         self.speech_frames = self.cfg.start_frames;
                         self.silence_run = 0;
@@ -141,11 +147,12 @@ impl Endpointer {
                     for f in pending {
                         self.push_preroll(f);
                     }
-                    self.push_preroll(frame.to_vec());
+                    self.push_preroll((frame.to_vec(), prob));
                 }
             }
             State::Speaking => {
                 self.buf.extend_from_slice(frame);
+                self.probs.push(prob);
                 if prob >= self.cfg.threshold - self.cfg.hysteresis {
                     self.silence_run = 0;
                     if prob >= self.cfg.threshold {
@@ -178,7 +185,43 @@ impl Endpointer {
         (self.state == State::Speaking).then(|| self.close(false))
     }
 
-    fn push_preroll(&mut self, f: Vec<f32>) {
+    /// Cut the active segment where someone else takes over (the caller knows, from outside
+    /// the audio, that the speaker changed), and keep listening: the rest becomes a new segment.
+    ///
+    /// The cut goes at the quietest frame among the last `lookback` frames, since the change is
+    /// reported a little after it happens and people rarely talk over each other exactly. Both
+    /// parts keep at least `min_part` frames, so a split never makes slivers.
+    pub fn split(&mut self, lookback: usize, min_part: usize) -> Vec<Event> {
+        let n = self.probs.len();
+        let min_part = min_part.max(1);
+        if self.state != State::Speaking || n < 2 * min_part {
+            return Vec::new();
+        }
+        let from = n.saturating_sub(lookback).max(min_part);
+        let to = n - min_part;
+        if from > to {
+            return Vec::new();
+        }
+        // Quietest frame; on ties the latest, so the first speaker keeps their last word.
+        let cut = (from..=to).rev().min_by(|&a, &b| self.probs[a].total_cmp(&self.probs[b])).unwrap_or(to);
+
+        let audio: Vec<f32> = self.buf.drain(..cut * FRAME).collect();
+        let head: Vec<f32> = self.probs.drain(..cut).collect();
+        let threshold = self.cfg.threshold;
+        let speech = |p: &[f32]| p.iter().filter(|&&x| x >= threshold).count();
+        let start_sample = self.seg_start_sample;
+        let first = if speech(&head) >= self.cfg.min_speech_frames {
+            Event::End { start_sample, audio, forced: true, tail_frames: self.probs.len() }
+        } else {
+            Event::Dropped
+        };
+        self.seg_start_sample += (cut * FRAME) as u64;
+        self.speech_frames = speech(&self.probs);
+        self.silence_run = self.silence_run.min(self.probs.len());
+        vec![first, Event::Start { at_sample: self.seg_start_sample }]
+    }
+
+    fn push_preroll(&mut self, f: (Vec<f32>, f32)) {
         self.preroll.push_back(f);
         while self.preroll.len() > self.cfg.preroll_frames {
             self.preroll.pop_front();
@@ -187,10 +230,11 @@ impl Endpointer {
 
     fn close(&mut self, forced: bool) -> Event {
         let mut audio = std::mem::take(&mut self.buf);
+        self.probs.clear();
         // Trim trailing silence, but keep a short tail so the last word is not clipped.
         let keep_tail = self.cfg.preroll_frames.min(self.silence_run);
-        let trim = (self.silence_run - keep_tail) * FRAME;
-        audio.truncate(audio.len().saturating_sub(trim));
+        let tail_frames = self.silence_run - keep_tail;
+        audio.truncate(audio.len().saturating_sub(tail_frames * FRAME));
 
         let long_enough = self.speech_frames >= self.cfg.min_speech_frames;
         let start_sample = self.seg_start_sample;
@@ -201,7 +245,7 @@ impl Endpointer {
         self.pending_start.clear();
 
         if long_enough {
-            Event::End { start_sample, audio, forced }
+            Event::End { start_sample, audio, forced, tail_frames }
         } else {
             Event::Dropped
         }
@@ -314,6 +358,57 @@ mod tests {
         assert!(matches!(ep.force_finalize(), Some(Event::End { .. })));
         assert!(!ep.is_speaking());
         assert!(ep.force_finalize().is_none());
+    }
+
+    #[test]
+    fn split_cuts_at_the_pause_and_keeps_listening() {
+        let mut ep = Endpointer::new(cfg());
+        // Speaker A for 2 s, a 96 ms dip, speaker B for 0.6 s: the change is reported now.
+        run(&mut ep, &[(62, 0.9), (3, 0.2), (19, 0.9)]);
+        let total = ep.current_audio().len();
+        let ev = ep.split(40, 8);
+        let [Event::End { start_sample, audio, forced: true, tail_frames }, Event::Start { at_sample }] = ev.as_slice()
+        else {
+            panic!("{ev:?}")
+        };
+        assert_eq!(*start_sample, 0);
+        // Cut at the last quiet frame: A keeps everything before it.
+        assert_eq!(audio.len(), 64 * FRAME);
+        assert_eq!(*at_sample, 64 * FRAME as u64);
+        assert_eq!(*tail_frames, 20);
+        assert!(ep.is_speaking());
+        assert_eq!(ep.current_audio().len(), total - 64 * FRAME);
+        // B carries on and ends on silence as one more segment.
+        let ev = run(&mut ep, &[(40, 0.9), (47, 0.0)]);
+        let Event::End { start_sample, forced: false, .. } = &ev[0] else { panic!("{ev:?}") };
+        assert_eq!(*start_sample, 64 * FRAME as u64);
+    }
+
+    #[test]
+    fn split_leaves_short_or_idle_segments_alone() {
+        let mut ep = Endpointer::new(cfg());
+        assert!(ep.split(40, 8).is_empty());
+        run(&mut ep, &[(10, 0.9)]);
+        assert!(ep.split(40, 8).is_empty(), "under 2 x min_part");
+    }
+
+    #[test]
+    fn split_drops_a_first_part_without_enough_speech() {
+        let mut ep = Endpointer::new(cfg());
+        // Pre-roll, a short start, a mumble, then a long stretch of the next speaker.
+        run(&mut ep, &[(9, 0.0), (3, 0.9), (4, 0.3), (30, 0.9)]);
+        let ev = ep.split(40, 8);
+        assert!(matches!(ev.as_slice(), [Event::Dropped, Event::Start { .. }]), "{ev:?}");
+        assert!(ep.is_speaking());
+    }
+
+    #[test]
+    fn end_reports_the_trimmed_tail() {
+        let mut ep = Endpointer::new(cfg());
+        let ev = run(&mut ep, &[(62, 0.9), (47, 0.0)]);
+        let Event::End { tail_frames, .. } = &ev[1] else { panic!("{ev:?}") };
+        // 800 ms end silence = 25 frames, of which 7 (200 ms) are kept.
+        assert_eq!(*tail_frames, 25 - 7);
     }
 
     #[test]

@@ -80,20 +80,31 @@ pub struct SpeakerLog {
     closed: VecDeque<Interval>,
 }
 
+/// Someone starting to talk this soon after another person stopped is taking over from them.
+const TAKEOVER_MS: i64 = 1_500;
+
 impl SpeakerLog {
-    pub fn apply(&mut self, name: &str, speaking: bool, at: i64) {
+    /// Record a change. Returns true when this is a different person taking over: someone else
+    /// is still talking or just stopped, so a transcript line running across it should be cut.
+    pub fn apply(&mut self, name: &str, speaking: bool, at: i64) -> bool {
         let name = name.trim();
         if name.is_empty() {
-            return;
+            return false;
         }
+        let mut takeover = false;
         if speaking {
-            self.open.entry(name.to_string()).or_insert(at);
+            if !self.open.contains_key(name) {
+                takeover = self.open.keys().any(|n| n != name)
+                    || self.closed.back().is_some_and(|i| i.name != name && at - i.end <= TAKEOVER_MS);
+                self.open.insert(name.to_string(), at);
+            }
         } else if let Some(start) = self.open.remove(name) {
             self.closed.push_back(Interval { name: name.to_string(), start, end: at.max(start) });
         }
         while self.closed.front().is_some_and(|i| i.end < at - KEEP_MS) {
             self.closed.pop_front();
         }
+        takeover
     }
 
     /// Everyone's indicators go dark (the call ended or the tab closed).
@@ -328,6 +339,22 @@ mod tests {
         assert_eq!(route(&post("/other", o, auth, b""), TOKEN).status, 404);
         let get = RequestParts { method: "GET", path: "/ping", origin: o, authorization: auth, body: b"" };
         assert_eq!(route(&get, TOKEN).status, 405);
+    }
+
+    #[test]
+    fn says_when_someone_else_takes_over() {
+        let mut log = SpeakerLog::default();
+        assert!(!log.apply("Budi", true, 1_000), "first speaker");
+        assert!(!log.apply("Budi", true, 1_200), "still Budi");
+        assert!(log.apply("Sari", true, 3_000), "over Budi");
+        log.apply("Budi", false, 3_100);
+        log.apply("Sari", false, 5_000);
+        assert!(!log.apply("Sari", true, 5_500), "Sari again after a breath");
+        log.apply("Sari", false, 6_000);
+        assert!(log.apply("Budi", true, 7_000), "right after Sari stopped");
+        log.apply("Budi", false, 8_000);
+        assert!(!log.apply("Sari", true, 20_000), "after a long silence, nothing to cut");
+        assert!(!log.apply("  ", true, 20_100));
     }
 
     #[test]

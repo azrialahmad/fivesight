@@ -29,7 +29,10 @@ struct Allowed {
 const ALLOWED: &[Allowed] = &[
     Allowed { verb: "search", positional: 1, value_flags: &[("--limit", &[])], bool_flags: &[] },
     Allowed { verb: "find", positional: 1, value_flags: &[("--space", &[])], bool_flags: &[] },
-    Allowed { verb: "read", positional: 1, value_flags: &[("--format", &["markdown"])], bool_flags: &[] },
+    // Storage format is converted by fivesight (see `storage`); Markdown is the fallback.
+    Allowed { verb: "read", positional: 1, value_flags: &[("--format", &["storage", "markdown"])], bool_flags: &[] },
+    // Title and space of a page.
+    Allowed { verb: "info", positional: 1, value_flags: &[], bool_flags: &[] },
     Allowed {
         verb: "comments",
         positional: 1,
@@ -103,9 +106,52 @@ fn check_page_id(id: &str) -> Result<(), AtlassianError> {
     Ok(())
 }
 
+/// The page body in storage format (XHTML), which keeps lists inside table cells.
 pub fn read_argv(page_id: &str) -> Result<Vec<String>, AtlassianError> {
     check_page_id(page_id)?;
+    Ok(vec!["read".into(), page_id.into(), "--format".into(), "storage".into()])
+}
+
+/// The CLI's own Markdown, for when the storage body can't be read.
+pub fn read_markdown_argv(page_id: &str) -> Result<Vec<String>, AtlassianError> {
+    check_page_id(page_id)?;
     Ok(vec!["read".into(), page_id.into(), "--format".into(), "markdown".into()])
+}
+
+pub fn info_argv(page_id: &str) -> Result<Vec<String>, AtlassianError> {
+    check_page_id(page_id)?;
+    Ok(vec!["info".into(), page_id.into()])
+}
+
+/// The title from `info` output (`Title: Laporan Keuangan`).
+pub fn title_from_info(out: &str) -> Option<String> {
+    out.lines().find_map(|l| l.trim().strip_prefix("Title:").map(|t| t.trim().to_string())).filter(|t| !t.is_empty())
+}
+
+/// Comment listings carry ids, marker refs and version counters nobody reads; keep who, when,
+/// whether it's resolved, what it's about, and what was said.
+pub fn tidy_comments(out: &str) -> String {
+    let mut lines = Vec::new();
+    for line in out.lines() {
+        let t = line.trim();
+        if t.starts_with("Marker ref:") || t == "Body:" {
+            continue;
+        }
+        if let Some(meta) = t.strip_prefix("Created:") {
+            let date: String = meta.trim().chars().take(10).collect();
+            let resolved = meta.contains("Resolution: resolved");
+            let indent = &line[..line.len() - line.trim_start().len()];
+            lines.push(format!("{indent}{date}{}", if resolved { " (resolved)" } else { "" }));
+            continue;
+        }
+        // "1. Name (ID: 123) [inline]" -> "1. Name [inline]"
+        let line = match (line.find(" (ID: "), line.find(')')) {
+            (Some(a), Some(b)) if b > a => format!("{}{}", &line[..a], &line[b + 1..]),
+            _ => line.to_string(),
+        };
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n").trim().to_string()
 }
 
 pub fn comments_argv(page_id: &str) -> Result<Vec<String>, AtlassianError> {
@@ -195,6 +241,8 @@ mod tests {
             find_argv("Payments runbook", Some("ENG")).unwrap(),
             find_argv("Payments runbook", None).unwrap(),
             read_argv("123456").unwrap(),
+            read_markdown_argv("123456").unwrap(),
+            info_argv("123456").unwrap(),
             comments_argv("123456").unwrap(),
             status_argv(),
         ] {
@@ -238,8 +286,11 @@ mod tests {
     #[test]
     fn unexpected_flags_and_values_are_rejected() {
         for bad in [
-            v(&["read", "1", "--format", "storage"]),
+            v(&["read", "1", "--format", "html"]),
+            v(&["read", "1", "--format", "storage", "--format", "export"]),
             v(&["read", "1", "--front-matter", "x"]),
+            v(&["info", "1", "2"]),
+            v(&["info", "1", "--json"]),
             v(&["search", "q", "--cql"]),
             v(&["search", "q", "r"]),
             v(&["search", "--limit", "5"]),
@@ -274,5 +325,17 @@ mod tests {
             "❌ Bearer or basic authentication requires a token.\nPlease rerun \"confluence init\""
         ));
         assert!(!looks_like_error("Found 3 results"));
+    }
+
+    #[test]
+    fn page_title_and_tidy_comments() {
+        let info = "Page Information:\nTitle: Laporan Keuangan\nID: 4566089729\nType: page";
+        assert_eq!(title_from_info(info).as_deref(), Some("Laporan Keuangan"));
+        assert_eq!(title_from_info("ID: 1"), None);
+        let raw = "Found 2 comments:\n1. Citra (ID: 4566614048) [inline]\n   Created: 2026-09-23T08:37:43.142Z • Status: current • Version: 1 • Resolution: open\n   Highlight (original): AC1\n   Marker ref: 17b8\n   Body:\n     BE : 1\n2. Nuki (ID: 9) [footer]\n   Created: 2026-09-24T01:00:00.000Z • Status: current • Version: 2 • Resolution: resolved\n   Body:\n     done";
+        assert_eq!(
+            tidy_comments(raw),
+            "Found 2 comments:\n1. Citra [inline]\n   2026-09-23\n   Highlight (original): AC1\n     BE : 1\n2. Nuki [footer]\n   2026-09-24 (resolved)\n     done"
+        );
     }
 }

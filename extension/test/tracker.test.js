@@ -103,3 +103,11 @@ test('closing the tab leaves immediately, once', () => {
   assert.equal(c.leaveNow(), 'left');
   assert.equal(c.leaveNow(), null);
 });
+
+test('tile notices are not taken for names', () => {
+  const { looksLikeName } = require('../src/selectors.js');
+  assert.equal(looksLikeName('M Alvin Wijaya'), true);
+  assert.equal(looksLikeName('Muhammad Quwwamul Haq Djunaid'), true);
+  assert.equal(looksLikeName('Others might still see your full video.'), false);
+  assert.equal(looksLikeName('You are presenting to everyone now, please stop'), false);
+});

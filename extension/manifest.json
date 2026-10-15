@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "fivesight for Meet",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Tells the fivesight app on your PC who is speaking in Google Meet. Sends names and timings to 127.0.0.1 only.",
   "permissions": ["storage", "alarms"],
   "host_permissions": ["http://127.0.0.1:47285/*"],

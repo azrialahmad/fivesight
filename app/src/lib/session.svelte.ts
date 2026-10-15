@@ -1,5 +1,5 @@
 import { api, inTauri } from './api';
-import type { AskLookup, AskSources, CallEvent, ChatMsg, Hit, KbAddResult, KbDoc, Meeting, MeetingSummary, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
+import type { AskLookup, AskSources, CallEvent, ChatMsg, Hit, KbAddResult, KbDoc, Meeting, MeetingDoc, MeetingSummary, NotesMode, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
 export { inTauri };
 export type View = 'home' | 'meeting' | 'settings' | 'knowledge';
@@ -10,7 +10,7 @@ const DEFAULT_SETTINGS: Settings = {
   fallbackModel: '',
   language: 'auto',
   atlassian: true,
-  autoNotes: true,
+  notesMode: 'live',
   speechModel: 'large-v3-turbo',
   setupDone: true,
   vocabulary: '',
@@ -18,14 +18,18 @@ const DEFAULT_SETTINGS: Settings = {
   hasKey: false
 };
 
-/** Automatic AI notes while recording: at most one pass this often... */
-const AUTO_MIN_GAP_MS = 45_000;
+/**
+ * Live AI notes while recording (notes mode "live"): at most one pass this often... Each pass
+ * sends the last notes plus only what was said since, so a pass is small, but they add up over
+ * an hour: these keep it to about one every two minutes.
+ */
+const AUTO_MIN_GAP_MS = 90_000;
 /** ...after the user stops typing in their notes for this long... */
 const AUTO_TYPING_PAUSE_MS = 4_000;
 /** ...or once this many new transcript lines are in... */
-const AUTO_NEW_LINES = 6;
+const AUTO_NEW_LINES = 12;
 /** ...or after this long with any new line at all. */
-const AUTO_MAX_WAIT_MS = 90_000;
+const AUTO_MAX_WAIT_MS = 180_000;
 
 class Session {
   view = $state<View>('home');
@@ -33,6 +37,10 @@ class Session {
   current = $state<Meeting | null>(null);
   segs = $state<Seg[]>([]);
   chat = $state<ChatMsg[]>([]);
+  /** Pages attached to the open meeting. */
+  docs = $state<MeetingDoc[]>([]);
+  attaching = $state(false);
+  attachError = $state<string | null>(null);
   settings = $state<Settings>({ ...DEFAULT_SETTINGS });
 
   recording = $state(false);
@@ -135,10 +143,12 @@ class Session {
 
   async openMeeting(id: number) {
     await this.flushNotes();
-    const { meeting, transcript, chat } = await api.getMeeting(id);
+    const { meeting, transcript, chat, docs } = await api.getMeeting(id);
     this.current = meeting;
     this.segs = transcript.map(toSeg);
     this.chat = chat;
+    this.docs = docs;
+    this.attachError = null;
     this.answerLive = '';
     this.enhancedLive = '';
     this.drawer = false;
@@ -282,14 +292,15 @@ class Session {
     await this.runEnhance(this.current.id, false);
   }
 
-  private async runEnhance(id: number, auto: boolean) {
+  /** `update` builds on the last AI notes (live passes) instead of writing them fresh. */
+  private async runEnhance(id: number, auto: boolean, update = auto) {
     if (this.current?.id === id) await this.flushNotes();
     this.enhancingId = id;
     this.enhancingAuto = auto;
     this.enhancedLive = '';
     try {
-      // Automatic passes build on the last AI notes so they don't churn.
-      await api.enhance(id, auto);
+      // Live passes build on the last AI notes so they don't churn.
+      await api.enhance(id, update);
     } catch (e) {
       this.enhanceFailed(String(e));
     }
@@ -330,7 +341,7 @@ class Session {
     // Called from both stopRecording and the backend's "recording" event; the second call
     // finds nothing changed because the final pass stamps lastAutoAt.
     const changed = this.newLines > 0 || this.notesEditedAt > this.lastAutoAt;
-    if (this.settings.autoNotes && changed) {
+    if (this.settings.notesMode !== 'manual' && changed) {
       this.finalPassFor = id;
       this.autoTick();
     }
@@ -338,17 +349,19 @@ class Session {
 
   /** Start an automatic pass when one is due and nothing else is being written. */
   private autoTick() {
-    if (this.enhancingId !== null || !this.settings.autoNotes) return;
+    const mode = this.settings.notesMode;
+    if (this.enhancingId !== null || mode === 'manual') return;
     if (this.finalPassFor !== null) {
       const id = this.finalPassFor;
       this.finalPassFor = null;
       this.lastAutoAt = Date.now();
       this.newLines = 0;
-      this.runEnhance(id, true);
+      // Live: one last update over the whole meeting. Yours: the one write-up, from scratch.
+      this.runEnhance(id, true, mode === 'live');
       return;
     }
     const id = this.recordingMeetingId;
-    if (!this.recording || id === null) return;
+    if (mode !== 'live' || !this.recording || id === null) return;
     const now = Date.now();
     if (now - this.lastAutoAt < AUTO_MIN_GAP_MS) return;
     const typedThenPaused = this.notesEditedAt > this.lastAutoAt && now - this.notesEditedAt >= AUTO_TYPING_PAUSE_MS;
@@ -357,6 +370,48 @@ class Session {
     this.lastAutoAt = now;
     this.newLines = 0;
     this.runEnhance(id, true);
+  }
+
+  /** Switch who writes the notes; saved right away, applies to the meeting being recorded too. */
+  async setNotesMode(mode: NotesMode) {
+    if (this.settings.notesMode === mode) return;
+    const before = this.settings.notesMode;
+    this.settings.notesMode = mode;
+    try {
+      await this.saveSettings({ ...this.settings, notesMode: mode }, null);
+    } catch (e) {
+      this.settings.notesMode = before;
+      this.error = String(e);
+    }
+  }
+
+  /** Read a Confluence page in full and attach it to the open meeting. */
+  async attachPage(link: string): Promise<boolean> {
+    if (!this.current || this.attaching || !link.trim()) return false;
+    const id = this.current.id;
+    this.attaching = true;
+    this.attachError = null;
+    try {
+      const docs = await api.attachConfluence(id, link.trim());
+      if (this.current?.id === id) this.docs = docs;
+      return true;
+    } catch (e) {
+      if (this.current?.id === id) this.attachError = String(e);
+      return false;
+    } finally {
+      this.attaching = false;
+    }
+  }
+
+  async detachPage(docId: number) {
+    if (!this.current) return;
+    const id = this.current.id;
+    try {
+      const docs = await api.removeMeetingDoc(id, docId);
+      if (this.current?.id === id) this.docs = docs;
+    } catch (e) {
+      this.attachError = String(e);
+    }
   }
 
   async ask(question: string) {

@@ -92,7 +92,23 @@ pub struct TranscriptEvent {
     pub text: String,
     /// Set when a final was discarded (and `text` is what was discarded).
     pub dropped: Option<String>,
+    /// Wall-clock time (Unix ms) when this audio ended; for a partial, when it was taken.
+    /// Lines are matched to who Meet showed as speaking by this, not by sample counts, which
+    /// drift from the clock over a long call.
+    pub ended_at: i64,
+    /// Length of the audio this text came from.
+    pub duration_ms: u64,
 }
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// How far back a speaker change may be placed: Meet's indicator, the extension's smoothing
+/// and the trip to the app put the report up to about a second after the actual change.
+const SPLIT_LOOKBACK_FRAMES: usize = 1_200 * SAMPLE_RATE / 1000 / FRAME;
+/// Neither side of a split is shorter than this.
+const SPLIT_MIN_FRAMES: usize = 400 * SAMPLE_RATE / 1000 / FRAME;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -112,12 +128,14 @@ struct Job {
     kind: Kind,
     audio: Vec<f32>,
     start_sample: u64,
+    ended_at: i64,
 }
 
 pub struct Pipeline {
     captures: Vec<Capture>,
     threads: Vec<JoinHandle<()>>,
     prompt: Arc<Mutex<Option<String>>>,
+    split_others: Arc<AtomicBool>,
 }
 
 impl Pipeline {
@@ -130,6 +148,7 @@ impl Pipeline {
         let barge = Arc::new(AtomicBool::new(false));
         let other = Arc::new(OtherSide::default());
         let prompt = Arc::new(Mutex::new(cfg.initial_prompt.clone()));
+        let split_others = Arc::new(AtomicBool::new(false));
 
         // Whisper worker owns the engine; load it here and report errors synchronously.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -178,6 +197,7 @@ impl Pipeline {
                 },
                 inflight,
                 barge: barge.clone(),
+                split: split_others.clone(),
                 other: other.clone(),
                 jobs: job_tx.clone(),
             };
@@ -189,7 +209,13 @@ impl Pipeline {
             );
             captures.push(Capture::start(source, frame_tx)?);
         }
-        Ok(Self { captures, threads, prompt })
+        Ok(Self { captures, threads, prompt, split_others })
+    }
+
+    /// Someone else started talking on the call (the Meet extension says so): end the other
+    /// side's current line there and start a new one, even if there was no pause between them.
+    pub fn split_others(&self) {
+        self.split_others.store(true, Ordering::Relaxed);
     }
 
     /// Replace Whisper's initial prompt; the next utterance uses it.
@@ -220,6 +246,8 @@ struct StreamCtx {
     min_rms: f32,
     inflight: Arc<AtomicBool>,
     barge: Arc<AtomicBool>,
+    /// Loopback only: the speaker changed, cut the segment (see `Pipeline::split_others`).
+    split: Arc<AtomicBool>,
     other: Arc<OtherSide>,
     jobs: SyncSender<Job>,
 }
@@ -237,11 +265,22 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
     let mut seg_start = 0u64;
     let mut last_partial = Instant::now();
 
-    let send_final = |ctx: &StreamCtx, id: u64, start_sample: u64, audio: Vec<f32>| {
+    // Frames reach this thread as they are captured, so "now" minus the frames that came in
+    // after a segment's audio is when that audio ended.
+    let ended_at = |tail_frames: usize| unix_ms() - (tail_frames * FRAME * 1000 / SAMPLE_RATE) as i64;
+    let send_final = |ctx: &StreamCtx, id: u64, start_sample: u64, audio: Vec<f32>, tail_frames: usize| {
         if ctx.source == Source::Loopback {
             ctx.other.finals_sent.fetch_add(1, Ordering::Relaxed);
         }
-        let _ = ctx.jobs.send(Job { source: ctx.source, segment_id: id, kind: Kind::Final, audio, start_sample });
+        let job = Job {
+            source: ctx.source,
+            segment_id: id,
+            kind: Kind::Final,
+            audio,
+            start_sample,
+            ended_at: ended_at(tail_frames),
+        };
+        let _ = ctx.jobs.send(job);
     };
 
     loop {
@@ -258,14 +297,21 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
             }
         };
         debug_assert_eq!(frame.len(), FRAME);
-        for ev in ep.push(&frame, prob) {
+        let mut events = ep.push(&frame, prob);
+        // Someone else took over on the call: cut there, even without a pause.
+        if ctx.split.swap(false, Ordering::Relaxed) {
+            events.extend(ep.split(SPLIT_LOOKBACK_FRAMES, SPLIT_MIN_FRAMES));
+        }
+        for ev in events {
             match ev {
                 Event::Start { at_sample } => {
                     segment_id += 1;
                     seg_start = at_sample;
                     last_partial = Instant::now();
                 }
-                Event::End { start_sample, audio, .. } => send_final(&ctx, segment_id, start_sample, audio),
+                Event::End { start_sample, audio, tail_frames, .. } => {
+                    send_final(&ctx, segment_id, start_sample, audio, tail_frames)
+                }
                 Event::Dropped => {}
             }
         }
@@ -273,8 +319,8 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
         // Barge-in: the local user started talking, so close the other side's open segment.
         // The worker raises the flag once a mic partial is known not to be echo.
         if ctx.source == Source::Loopback && ctx.barge.swap(false, Ordering::Relaxed) && ep.is_speaking() {
-            if let Some(Event::End { start_sample, audio, .. }) = ep.force_finalize() {
-                send_final(&ctx, segment_id, start_sample, audio);
+            if let Some(Event::End { start_sample, audio, tail_frames, .. }) = ep.force_finalize() {
+                send_final(&ctx, segment_id, start_sample, audio, tail_frames);
             }
         }
         if ctx.source == Source::Loopback {
@@ -294,6 +340,7 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
                     kind: Kind::Partial,
                     audio: cur[from..].to_vec(),
                     start_sample: seg_start,
+                    ended_at: unix_ms(),
                 };
                 if ctx.jobs.try_send(job).is_err() {
                     ctx.inflight.store(false, Ordering::Relaxed);
@@ -302,8 +349,8 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
             }
         }
     }
-    if let Some(Event::End { start_sample, audio, .. }) = ep.force_finalize() {
-        send_final(&ctx, segment_id, start_sample, audio);
+    if let Some(Event::End { start_sample, audio, tail_frames, .. }) = ep.force_finalize() {
+        send_final(&ctx, segment_id, start_sample, audio, tail_frames);
     }
 }
 
@@ -399,6 +446,8 @@ fn worker_loop(
             start_ms,
             text,
             dropped,
+            ended_at: job.ended_at,
+            duration_ms: job.audio.len() as u64 * 1000 / SAMPLE_RATE as u64,
         };
 
         let prompt = shared.prompt.lock().ok().and_then(|p| p.clone());
