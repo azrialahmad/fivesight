@@ -5,8 +5,13 @@
 //! Here detection is restricted to the two languages that matter and made sticky.
 
 /// Bilingual prompt that nudges Whisper to keep English terms inside Indonesian speech.
-pub const BILINGUAL_PROMPT: &str =
-    "Oke, kita mulai meeting-nya sekarang. Let's review the sprint backlog dulu, terus deploy ke staging.";
+///
+/// Whisper sometimes says its prompt back on short or unclear audio, and a line that only
+/// repeats the prompt is dropped, taking any real words with it. So this is one Indonesian
+/// sentence with the English inside it: no stand-alone English clause (the old "Let's review
+/// the sprint backlog" came back 34 times in one hour-long meeting) and no greeting
+/// or opener that people say on their own.
+pub const BILINGUAL_PROMPT: &str = "Jadi PR-nya udah di-review, tinggal deploy ke staging terus update ticket-nya.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LangMode {
@@ -101,6 +106,19 @@ mod tests {
         assert_eq!(LangMode::parse("en"), LangMode::En);
         assert_eq!(LangMode::parse("auto"), LangMode::Auto);
         assert_eq!(LangMode::parse("ms"), LangMode::Auto);
+    }
+
+    #[test]
+    fn bilingual_prompt_is_one_mixed_sentence() {
+        let p = BILINGUAL_PROMPT;
+        assert_eq!(p.matches(['.', '!', '?']).count(), 1, "{p}");
+        assert!(p.ends_with('.'));
+        // Indonesian carries the sentence, English terms take Indonesian suffixes.
+        for w in ["udah", "tinggal", "PR-nya", "di-review", "deploy", "staging"] {
+            assert!(p.contains(w), "missing {w}");
+        }
+        assert_eq!(LangMode::En.base_prompt(), None);
+        assert_eq!(LangMode::Auto.base_prompt(), Some(p));
     }
 
     #[test]

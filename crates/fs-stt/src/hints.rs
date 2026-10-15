@@ -272,6 +272,18 @@ pub fn echoes_prompt(text: &str, prompt: &str) -> bool {
     t.split(' ').count() >= 3 && normalize(prompt).contains(&t)
 }
 
+/// The prompt for a second try at a line that repeated `prompt`: the glossary without the
+/// `base` sentence, so names and jargon still help. `None` (no prompt at all) when nothing
+/// would be left, or when `prompt` doesn't end in `base`.
+///
+/// Whisper can't say back what isn't in its prompt, so whatever the second try hears, short
+/// of another piece of this smaller prompt, is speech.
+pub fn retry_prompt(prompt: &str, base: Option<&str>) -> Option<String> {
+    let base = base.map(str::trim).filter(|b| !b.is_empty())?;
+    let rest = prompt.trim_end().strip_suffix(base)?.trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,5 +349,40 @@ mod tests {
         assert!(echoes_prompt("Playwright, backend engineer.", p));
         assert!(!echoes_prompt("Playwright", p)); // a real one-word answer stays
         assert!(!echoes_prompt("we use Playwright for the backend", p));
+    }
+
+    #[test]
+    fn retry_keeps_the_glossary_without_the_base_sentence() {
+        let base = "Jadi PR-nya udah di-review.";
+        let h = Hints { names: vec!["Budi Santoso".into()], ..Default::default() };
+        let p = build_prompt(Some(base), &h).unwrap();
+        assert_eq!(retry_prompt(&p, Some(base)).as_deref(), Some("People: Budi Santoso."));
+        // Only the base sentence, English mode (no base), or a prompt that doesn't end in it.
+        assert_eq!(retry_prompt(base, Some(base)), None);
+        assert_eq!(retry_prompt("People: Budi Santoso.", None), None);
+        assert_eq!(retry_prompt("People: Budi Santoso.", Some(base)), None);
+    }
+
+    #[test]
+    fn real_line_that_matches_the_base_survives_the_retry() {
+        let base = crate::lang::BILINGUAL_PROMPT;
+        let h = Hints { names: vec!["Azrial".into(), "Nuki Pratama".into()], ..Default::default() };
+        let p = build_prompt(Some(base), &h).unwrap();
+        // Someone really says a piece of the base sentence: the first pass can't tell.
+        let said = "tinggal deploy ke staging";
+        assert!(echoes_prompt(said, &p));
+        // The second try runs without the base, so hearing it again means it was spoken.
+        let retry = retry_prompt(&p, Some(base));
+        assert!(!retry.as_deref().is_some_and(|r| echoes_prompt(said, r)));
+        // Saying a name list back is still caught on the second try.
+        assert!(retry.as_deref().is_some_and(|r| echoes_prompt("People: Azrial, Nuki Pratama.", r)));
+    }
+
+    #[test]
+    fn old_prompt_echoes_no_longer_match() {
+        let p = build_prompt(Some(crate::lang::BILINGUAL_PROMPT), &Hints::default()).unwrap();
+        for old in ["Let's review the sprint.", "Let's review the sprint backlog.", "Oke, kita mulai meeting-nya."] {
+            assert!(!echoes_prompt(old, &p), "{old}");
+        }
     }
 }
