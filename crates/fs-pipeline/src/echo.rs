@@ -202,6 +202,8 @@ mod tests {
             start_ms,
             text: text.into(),
             dropped: None,
+            ended_at: 0,
+            duration_ms: 0,
         }
     }
 

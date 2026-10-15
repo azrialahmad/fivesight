@@ -347,6 +347,7 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     let now = now_ms();
     let mut call: Option<CallEvent> = None;
     let mut new_name: Option<String> = None;
+    let mut takeover = false;
     {
         let mut meet = lock(&st.meet);
         meet.last_seen = now;
@@ -365,7 +366,7 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
             Incoming::Speaking { name, speaking, at } => {
                 // Trust the browser's clock only if it agrees with ours; otherwise use ours.
                 let at = if (at - now).abs() < 5_000 { at } else { now };
-                meet.speakers.apply(&name, speaking, at);
+                takeover = meet.speakers.apply(&name, speaking, at) && is_person(&name);
                 new_name = Some(name);
             }
             Incoming::Call { state, title, .. } => match state {
@@ -388,6 +389,12 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     }
     if let Some(c) = call {
         let _ = app.emit("call", c);
+    }
+    // Two people talking back to back with no pause would land in one line; cut it here.
+    if takeover {
+        if let Some(r) = lock(&st.recording).as_ref() {
+            r.pipeline.split_others();
+        }
     }
     // Someone new on the call: add their name to the hints.
     if let Some(name) = new_name.filter(|n| is_person(n)) {
@@ -653,7 +660,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
 
     // Reuse the meeting or create one. Times in the transcript are measured from when the
     // meeting was created, and segment ids continue after any earlier recording in it.
-    let (mid, offset_ms, seg_base, language, meeting_started, names) = {
+    let (mid, offset_ms, seg_base, language, names) = {
         let st = lock(&state.store);
         let id = match meeting_id {
             Some(id) => {
@@ -672,7 +679,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
                 names.push(n);
             }
         }
-        (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language, meeting.started_at, names)
+        (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language, names)
     };
     tracing::info!("recording with {}", whisper_path.display());
     let mut cfg = PipelineConfig::new(whisper_path, vad_path);
@@ -702,8 +709,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
             let speaker = match ev.source {
                 Source::Loopback => {
                     let st = forward.state::<AppState>();
-                    let wall_start = meeting_started + ev.start_ms as i64;
-                    let found = lock(&st.meet).speakers.speaker_for(wall_start, now_ms());
+                    let found = lock(&st.meet).speakers.speaker_for(ev.ended_at - ev.duration_ms as i64, ev.ended_at);
                     found
                 }
                 Source::Mic => None,
