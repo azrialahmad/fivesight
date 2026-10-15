@@ -31,7 +31,12 @@
     return fam.includes('material') || fam.includes('icon');
   }
 
-  /** The display name shown on a tile: the first plain text label that isn't a button or icon. */
+  /** Notices Meet shows on tiles ("Others might still see your full video.") read like sentences; names don't. */
+  function looksLikeName(text) {
+    return !/[.!?]$/.test(text) && text.split(/\s+/).length <= 6;
+  }
+
+  /** The display name shown on a tile: the first plain text label that isn't a button, icon or notice. */
   function tileName(tile) {
     const walker = tile.ownerDocument.createTreeWalker(tile, NodeFilter.SHOW_ELEMENT);
     for (let el = walker.nextNode(); el; el = walker.nextNode()) {
@@ -40,6 +45,7 @@
       const text = (el.textContent || '').trim();
       if (!text || text.length > 80) continue;
       if (isIconText(el)) continue;
+      if (!looksLikeName(text)) continue;
       return text;
     }
     return null;
@@ -67,7 +73,7 @@
     return t;
   }
 
-  const api = { meetCode, tiles, tileId, ownName, tileName, hasLeaveButton, inCall, callTitle };
+  const api = { meetCode, tiles, tileId, ownName, looksLikeName, tileName, hasLeaveButton, inCall, callTitle };
   root.FSSelectors = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof self !== 'undefined' ? self : globalThis);
