@@ -14,6 +14,23 @@ pub enum LlmError {
     Api { status: u16, body: String },
     #[error("stream error: {0}")]
     Stream(String),
+    /// The server answered, but with no text at all.
+    #[error("the model returned an empty answer")]
+    Empty,
+}
+
+/// How long to wait for a complete non-streamed reply, and for the next piece of a streamed one.
+/// Without these a stalled server leaves the app "thinking" forever.
+const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn client(total: Option<std::time::Duration>) -> reqwest::Client {
+    let b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(15));
+    let b = match total {
+        Some(t) => b.timeout(t),
+        None => b.read_timeout(STREAM_IDLE_TIMEOUT),
+    };
+    b.build().unwrap_or_default()
 }
 
 impl LlmError {
@@ -31,8 +48,15 @@ impl LlmError {
                 "The AI server doesn't recognise that address or model name. Check both in Settings.".into()
             }
             LlmError::Api { status: 429, .. } => "The AI server is rate limiting you. Try again in a moment.".into(),
-            LlmError::Http(e) if e.is_connect() || e.is_timeout() => {
+            LlmError::Http(e) if e.is_connect() => {
                 "Couldn't reach the AI server. Check the address in Settings, or that your local server is running."
+                    .into()
+            }
+            LlmError::Http(e) if e.is_timeout() => {
+                "The AI server stopped responding. Try again, or pick a faster model in Settings.".into()
+            }
+            LlmError::Empty => {
+                "The AI sent back an empty answer. Try again; if it keeps happening, try another model in Settings."
                     .into()
             }
             other => other.to_string(),
@@ -149,7 +173,7 @@ pub async fn chat_with_tools(
     tools: &serde_json::Value,
 ) -> Result<Reply, LlmError> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let mut req = reqwest::Client::new().post(url).json(&serde_json::json!({
+    let mut req = client(Some(REPLY_TIMEOUT)).post(url).json(&serde_json::json!({
         "model": cfg.model,
         "messages": messages,
         "tools": tools,
@@ -211,24 +235,29 @@ async fn stream_once(
                     full.push_str(&d);
                 }
                 sse::SseEvent::Error(e) => return Err(LlmError::Stream(e)),
-                sse::SseEvent::Done => return Ok(full),
+                sse::SseEvent::Done => break,
             }
         }
+    }
+    if full.trim().is_empty() {
+        return Err(LlmError::Empty);
     }
     Ok(full)
 }
 
-/// Stream a chat completion, calling `on_delta` for each piece of text. Returns the full text.
+/// Stream a chat completion, calling `on_delta` for each piece of text. Returns the full text,
+/// never empty: a reply with no text is [`LlmError::Empty`].
 /// If the primary model fails before any output, the fallback model (if set) is tried once.
 pub async fn chat_stream(
     cfg: &LlmConfig,
     messages: &[Message],
     mut on_delta: impl FnMut(&str) + Send,
 ) -> Result<String, LlmError> {
-    let client = reqwest::Client::new();
+    let client = client(None);
     let mut produced = false;
     let mut tracked = |d: &str| {
-        produced = true;
+        // Whitespace alone isn't an answer yet; the fallback can still take over.
+        produced |= !d.trim().is_empty();
         on_delta(d);
     };
     match stream_once(&client, cfg, &cfg.model, messages, &mut tracked).await {
@@ -357,14 +386,14 @@ mod tests {
     async fn sends_bearer_key_when_configured() {
         let (url, head) = capture_head().await;
         let cfg = LlmConfig::custom(&url, Some("sk-test".into()), "m");
-        chat_stream(&cfg, &[Message::user("x")], |_| {}).await.unwrap();
+        chat_stream(&cfg, &[Message::user("x")], |_| {}).await.unwrap_err(); // the fake server sends no text
         assert!(head.await.unwrap().contains("authorization: bearer sk-test"));
     }
 
     #[tokio::test]
     async fn sends_no_auth_header_without_a_key() {
         let (url, head) = capture_head().await;
-        chat_stream(&LlmConfig::custom(&url, None, "m"), &[Message::user("x")], |_| {}).await.unwrap();
+        chat_stream(&LlmConfig::custom(&url, None, "m"), &[Message::user("x")], |_| {}).await.unwrap_err();
         assert!(!head.await.unwrap().contains("authorization"));
     }
 
@@ -448,6 +477,17 @@ mod tests {
         cfg.fallback_model = Some("fallback".into());
         let out = chat_stream(&cfg, &[Message::user("x")], |_| {}).await.unwrap();
         assert_eq!(out, "from fallback");
+        assert_eq!(*models.lock().unwrap(), ["primary", "fallback"]);
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_is_an_error_and_tries_the_fallback() {
+        let (url, models) = fake_seq(vec![("200 OK", sse(&[" "])), ("200 OK", sse(&[]))]).await;
+        let mut cfg = LlmConfig::local(&url, "primary");
+        cfg.fallback_model = Some("fallback".into());
+        let err = chat_stream(&cfg, &[Message::user("x")], |_| {}).await.unwrap_err();
+        assert!(matches!(err, LlmError::Empty), "{err}");
+        assert!(err.user_message(true).contains("empty answer"));
         assert_eq!(*models.lock().unwrap(), ["primary", "fallback"]);
     }
 

@@ -48,10 +48,12 @@ async fn lookup(app: &AppHandle, meeting_id: Option<i64>, id: String, cmd: ReadC
     let result = tauri::async_runtime::spawn_blocking(move || run(&cmd)).await;
     match result {
         Ok(Ok(text)) => {
+            tracing::info!("{label}: {} bytes", text.len());
             let _ = app.emit("ask-lookup", event("done", None));
             text
         }
         Ok(Err(e)) => {
+            tracing::warn!("{label} failed: {e}");
             let _ = app.emit("ask-lookup", event("failed", Some(e.to_string())));
             format!("Lookup failed: {e}")
         }
@@ -118,6 +120,11 @@ pub async fn run_lookups(
                 break;
             }
         };
+        tracing::debug!(
+            "lookup round {round}: {} tool call(s), {} chars of answer",
+            reply.tool_calls.len(),
+            reply.content.trim().len()
+        );
         if reply.tool_calls.is_empty() {
             if let Some(material) = msgs.get_mut(1) {
                 material.content.push_str(&tool_results);
@@ -145,6 +152,7 @@ pub async fn run_lookups(
     }
 
     // Out of rounds or no tool support: answer from what was gathered.
+    tracing::debug!("lookups done without an answer; streaming one from what was read");
     if let Some(material) = msgs.get_mut(1) {
         material.content.push_str(&tool_results);
     }
