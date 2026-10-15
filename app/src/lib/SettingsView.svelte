@@ -108,6 +108,7 @@
       form.atlassian !== s.atlassian ||
       form.autoNotes !== s.autoNotes ||
       form.vocabulary.trim() !== s.vocabulary.trim() ||
+      form.userName.trim() !== s.userName.trim() ||
       apiKey.trim() !== ''
     );
   });
@@ -158,6 +159,20 @@
     {#if notice}
       <p class="break-words rounded-xl bg-rec-soft px-4 py-3 text-sm text-rec" role="alert">{notice}</p>
     {/if}
+
+    <section>
+      <label class="font-semibold" for="me">Your name</label>
+      <p class="mt-0.5 text-sm text-muted">
+        Your lines in the transcript and AI notes use it instead of "You", so it's clear when someone talks to you or
+        gives you a task. It also helps the transcript spell your name right.
+      </p>
+      <input id="me" class={field} placeholder="Your name as people say it in calls" spellcheck="false" bind:value={form.userName} />
+      {#if bridge?.meetName && form.userName.trim() !== bridge.meetName}
+        <button class="mt-2 text-xs font-medium underline" onclick={() => (form.userName = bridge?.meetName ?? form.userName)}>
+          Use "{bridge.meetName}" from Google Meet
+        </button>
+      {/if}
+    </section>
 
     <section>
       <label class="font-semibold" for="lang">Language for new meetings</label>

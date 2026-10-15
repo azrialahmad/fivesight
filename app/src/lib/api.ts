@@ -71,6 +71,8 @@ export interface Settings {
   setupDone: boolean;
   /** Names and jargon the speech model should listen for, separated by commas or new lines. */
   vocabulary: string;
+  /** What the transcript and AI notes call you, instead of "You". */
+  userName: string;
   /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
   hasKey: boolean;
 }
@@ -165,6 +167,8 @@ export interface BridgeStatus {
   outdated: boolean;
   /** Folder to pick in Chrome's Load unpacked. */
   folder: string | null;
+  /** Your display name in Meet, once a call tab has reported it. */
+  meetName: string | null;
 }
 
 export interface CallEvent {
@@ -353,6 +357,7 @@ function createMockApi(): Api {
     // The preview opens on the home screen; Settings → Run setup shows the wizard.
     setupDone: true,
     vocabulary: 'Playwright, Claude',
+    userName: '',
     hasKey: false
   };
   const speechModels: SpeechModelInfo[] = [
@@ -508,7 +513,7 @@ function createMockApi(): Api {
       return { installed: true, jiraSite: 'yourcompany.atlassian.net', confluenceCli: true, confluence: false };
     },
     onAskLookup: (cb) => sub('ask-lookup', cb),
-    getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: true, inCall: false, callTitle: null, error: null, version: '0.1.0', latest: '0.2.0', outdated: true, folder: 'C:\\Users\\you\\AppData\\Local\\fivesight\\extension' }),
+    getBridge: async () => ({ port: 47285, token: '3f9a1c7e5b2d4a60918c7be2d41f0a55', connected: true, inCall: false, callTitle: null, error: null, version: '0.1.0', latest: '0.2.0', outdated: true, meetName: 'Azrial Ahmad', folder: 'C:\\Users\\you\\AppData\\Local\\fivesight\\extension' }),
     openExtensionFolder: async () => {},
     setupInfo: async () => {
       await new Promise((r) => setTimeout(r, 500));

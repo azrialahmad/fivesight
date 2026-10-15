@@ -80,8 +80,10 @@
   const toEvent = (e) => ({ type: 'speaking', name: e.name, speaking: e.speaking, at: e.at });
 
   timers.push(setInterval(tick, TICK_MS));
-  timers.push(setInterval(() => send([{ type: 'hello' }]), HELLO_MS));
-  send([{ type: 'hello' }]);
+  // Hellos carry your Meet name once it's known, so the app can suggest it as yours.
+  const hello = () => send([{ type: 'hello', me: ownName }]);
+  timers.push(setInterval(hello, HELLO_MS));
+  hello();
 
   addEventListener('pagehide', () => {
     if (call.leaveNow()) send([{ type: 'call', state: 'left' }]);
