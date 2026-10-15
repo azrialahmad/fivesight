@@ -26,7 +26,7 @@
   <ul class="flex flex-col {compact ? 'gap-4' : 'gap-5'}" aria-live="polite">
     {#each rows as r (r.key)}
       {@const me = r.source === 'mic'}
-      {@const who = me ? 'You' : (r.speaker ?? 'Others')}
+      {@const who = me ? session.settings.userName.trim() || 'You' : (r.speaker ?? 'Others')}
       <li class="rise flex gap-3">
         <span
           class="grid shrink-0 place-items-center rounded-full font-semibold {compact ? 'h-7 w-7 text-[11px]' : 'h-8 w-8 text-xs'} {me

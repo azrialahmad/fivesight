@@ -228,6 +228,12 @@
           </div>
         {/if}
 
+        <label class="mt-6 block text-sm font-medium" for="su-me">What should fivesight call you?</label>
+        <input id="su-me" class={field} placeholder="Your name as people say it in calls" spellcheck="false" bind:value={form.userName} />
+        <p class="mt-1.5 text-xs text-muted">
+          Used instead of "You" in transcripts and AI notes, so it's clear when someone talks to you. Optional.
+        </p>
+
       {:else if step === 1}
         <h1 class="mt-8 text-2xl font-semibold tracking-tight">Speech model</h1>
         <p class="mt-1 text-sm text-muted">

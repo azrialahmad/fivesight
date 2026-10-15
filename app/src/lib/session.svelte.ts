@@ -14,6 +14,7 @@ const DEFAULT_SETTINGS: Settings = {
   speechModel: 'large-v3-turbo',
   setupDone: true,
   vocabulary: '',
+  userName: '',
   hasKey: false
 };
 

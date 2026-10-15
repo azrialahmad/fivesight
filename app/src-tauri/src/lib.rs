@@ -70,6 +70,9 @@ struct Settings {
     /// Names and jargon Whisper should listen for, separated by commas or new lines.
     #[serde(default)]
     vocabulary: String,
+    /// What the transcript and AI notes call the user, instead of "You". Also a Whisper hint.
+    #[serde(default)]
+    user_name: String,
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
@@ -96,6 +99,7 @@ impl Default for Settings {
             speech_model: default_speech_model(),
             setup_done: false,
             vocabulary: String::new(),
+            user_name: String::new(),
             has_key: false,
             provider: None,
             openrouter_model: None,
@@ -169,6 +173,8 @@ struct Recording {
 /// terms from the notes, so names and jargon come out spelled right.
 fn meeting_prompt(state: &AppState, meeting_id: i64, language: LangMode, names: &[String]) -> Option<String> {
     let vocabulary = hints::split_list(&lock(&state.settings).vocabulary);
+    // The user's own name first: people say it to them, and it's the one that matters most.
+    let names: Vec<String> = user_name(state).into_iter().chain(names.iter().cloned()).collect();
     let meeting = lock(&state.store).get_meeting(meeting_id).ok();
     let call_title = lock(&state.meet).call_title.clone();
     // Meet's own titles are often just the room code (abc-defg-hij).
@@ -180,7 +186,7 @@ fn meeting_prompt(state: &AppState, meeting_id: i64, language: LangMode, names: 
         .or(call_title.filter(|t| !code_like(t)));
     let h = hints::Hints {
         vocabulary,
-        names: names.to_vec(),
+        names,
         title,
         terms: meeting.map(|m| hints::terms_from(&m.notes)).unwrap_or_default(),
     };
@@ -241,6 +247,8 @@ struct MeetState {
     call_title: Option<String>,
     /// The extension's version, from its hello. `None` for versions before 0.2.
     ext_version: Option<String>,
+    /// The user's own display name in Meet, to suggest as their name in Settings.
+    meet_name: Option<String>,
 }
 
 /// Nothing from the extension for this long means Chrome is closed or the extension is off.
@@ -306,7 +314,10 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
             meet.last_tab_seen = now;
         }
         match ev {
-            Incoming::Hello { version, .. } => {
+            Incoming::Hello { version, me, .. } => {
+                if let Some(me) = me.filter(|m| !m.trim().is_empty()) {
+                    meet.meet_name = Some(me.trim().to_string());
+                }
                 if version.is_some() {
                     meet.ext_version = version;
                 }
@@ -370,6 +381,8 @@ struct BridgeStatus {
     outdated: bool,
     /// The folder to load in Chrome with Load unpacked.
     folder: Option<String>,
+    /// Your display name in Meet, if a call tab has reported it.
+    meet_name: Option<String>,
 }
 
 #[tauri::command]
@@ -388,6 +401,7 @@ fn get_bridge(app: AppHandle, state: State<'_, AppState>) -> BridgeStatus {
         outdated: connected && m.ext_version.as_deref().is_none_or(|v| older_version(v, &latest)),
         latest,
         folder: extension_dir(&app).map(|p| p.display().to_string()),
+        meet_name: m.meet_name.clone(),
     }
 }
 
@@ -437,12 +451,18 @@ fn llm_config(state: &AppState) -> Result<LlmConfig, String> {
     build_config(&s, key)
 }
 
-fn lines(transcript: &[Segment]) -> Vec<prompts::Line> {
+/// The user's name from Settings, if they gave one.
+fn user_name(state: &AppState) -> Option<String> {
+    Some(lock(&state.settings).user_name.trim().to_string()).filter(|n| !n.is_empty())
+}
+
+/// Transcript lines for the AI. The user's own lines carry their name (or "You").
+fn lines(transcript: &[Segment], me: Option<&str>) -> Vec<prompts::Line> {
     transcript
         .iter()
         .map(|s| prompts::Line {
             speaker: match (s.source.as_str(), &s.speaker) {
-                ("mic", _) => "You".into(),
+                ("mic", _) => me.unwrap_or("You").into(),
                 (_, Some(name)) => name.clone(),
                 _ => "Others".into(),
             },
@@ -682,11 +702,12 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
     };
     let live = lock(&state.recording).as_ref().is_some_and(|r| r.meeting_id == id);
     let previous = (update && !meeting.enhanced.trim().is_empty()).then_some(meeting.enhanced.as_str());
+    let me = user_name(&state);
     let msgs = prompts::enhance_notes(
         &meeting.title,
         &meeting.notes,
-        &prompts::format_transcript(&lines(&transcript), 60_000),
-        prompts::EnhanceMode { live, previous },
+        &prompts::format_transcript(&lines(&transcript, me.as_deref()), 60_000),
+        prompts::EnhanceMode { live, previous, me: me.as_deref() },
     );
     tracing::debug!("enhancing meeting {id} (live: {live}, update: {})", previous.is_some());
     let key_sent = cfg.api_key.is_some();
@@ -719,6 +740,8 @@ async fn ask(
     let now = now_ms();
     let key_sent = cfg.api_key.is_some();
     let sources: Vec<String>;
+    let me = user_name(&state);
+    let me = me.as_deref();
     let msgs = {
         let st = lock(&state.store);
         let history: Vec<Message> = st
@@ -734,7 +757,8 @@ async fn ask(
             Some(id) => {
                 let m = st.get_meeting(id).map_err(err)?;
                 let t = st.transcript(id).map_err(err)?;
-                prompts::ask(&question, &m.notes, &prompts::format_transcript(&lines(&t), 60_000), &docs, &history)
+                let transcript = prompts::format_transcript(&lines(&t, me), 60_000);
+                prompts::ask(&question, &m.notes, &transcript, &docs, &history, me)
             }
             None => {
                 // No meeting open: ground the answer in the best-matching transcript lines too.
@@ -748,7 +772,7 @@ async fn ask(
                     })
                     .collect();
                 found.append(&mut docs);
-                prompts::ask(&question, "", "", &found, &history)
+                prompts::ask(&question, "", "", &found, &history, me)
             }
         }
     };
@@ -925,6 +949,7 @@ fn save_settings(state: State<'_, AppState>, settings: Settings, api_key: Option
     to_store.base_url = to_store.base_url.trim().to_string();
     to_store.model = to_store.model.trim().to_string();
     to_store.fallback_model = to_store.fallback_model.trim().to_string();
+    to_store.user_name = to_store.user_name.trim().to_string();
     if models::speech_model(&to_store.speech_model).is_none() {
         return Err(format!("Unknown speech model \"{}\".", to_store.speech_model));
     }
