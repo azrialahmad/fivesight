@@ -1,6 +1,7 @@
 //! fivesight desktop shell: owns the pipeline, the database and the LLM calls, and
 //! forwards everything to the UI as commands and events.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,7 +10,7 @@ use fs_audio::Source;
 use fs_bridge::{Bridge, CallState, Incoming, SpeakerLog};
 use fs_llm::{chat_stream, prompts, LlmConfig, Message};
 use fs_pipeline::{Kind, Pipeline, PipelineConfig, TranscriptEvent};
-use fs_store::{ChatMessage, KbDoc, Meeting, MeetingSummary, SearchHit, Segment, Store};
+use fs_store::{ChatMessage, KbDoc, Meeting, MeetingDoc, MeetingSummary, SearchHit, Segment, Store};
 use fs_stt::hints;
 use fs_stt::lang::LangMode;
 use serde::{Deserialize, Serialize};
@@ -58,8 +59,14 @@ struct Settings {
     /// Let Ask read Jira and Confluence through acli (read-only).
     #[serde(default = "enabled")]
     atlassian: bool,
-    /// Keep the AI notes up to date on their own while recording (one AI request every minute or so).
-    #[serde(default = "enabled")]
+    /// Who writes the notes during a meeting:
+    /// - "live": the AI keeps notes as the meeting goes (a small update every couple of minutes).
+    /// - "end": you take notes; the AI enhances them once, when recording stops.
+    /// - "manual": only when you press Enhance.
+    #[serde(default)]
+    notes_mode: String,
+    /// Before notes_mode: true meant "live", false "manual". Read once to migrate, never written.
+    #[serde(default = "enabled", skip_serializing)]
     auto_notes: bool,
     /// Which Whisper model to transcribe with (an id from `models::SPEECH_MODELS`).
     #[serde(default = "default_speech_model")]
@@ -95,6 +102,7 @@ impl Default for Settings {
             fallback_model: String::new(),
             language: "auto".into(),
             atlassian: true,
+            notes_mode: "live".into(),
             auto_notes: true,
             speech_model: default_speech_model(),
             setup_done: false,
@@ -127,6 +135,9 @@ impl Settings {
                     legacy_slot = Some(LEGACY_KEY_OPENROUTER);
                 }
             }
+        }
+        if !matches!(self.notes_mode.as_str(), "live" | "end" | "manual") {
+            self.notes_mode = if self.auto_notes { "live" } else { "manual" }.into();
         }
         self.provider = None;
         self.openrouter_model = None;
@@ -209,10 +220,15 @@ fn refresh_hints(state: &AppState) {
     }
 }
 
-/// Meet's tile names that aren't people.
+/// Meet's tile names that aren't people. Older extensions also sent tile notices
+/// ("Others might still see your full video."), which read like sentences.
 fn is_person(name: &str) -> bool {
     let n = name.trim();
-    !n.is_empty() && !n.eq_ignore_ascii_case("you") && !n.to_lowercase().contains("presentation")
+    !n.is_empty()
+        && !n.eq_ignore_ascii_case("you")
+        && !n.to_lowercase().contains("presentation")
+        && !n.ends_with(['.', '!', '?'])
+        && n.split_whitespace().count() <= 6
 }
 
 struct AppState {
@@ -229,6 +245,30 @@ struct AppState {
     meet: Mutex<MeetState>,
     /// Last known acli login state; refreshed when Settings opens.
     atlassian: Mutex<fs_atlassian::Status>,
+    /// Per meeting: the start (ms) of the newest transcript line the saved AI notes were written
+    /// from. Live updates send only the lines after it (plus a little overlap).
+    notes_upto: Mutex<HashMap<i64, i64>>,
+}
+
+/// Live notes updates re-send this much of the transcript before the last pass, so a line that
+/// was still being said then is seen whole.
+const NOTES_OVERLAP_MS: i64 = 45_000;
+/// Attached documents given to the AI with a meeting, at most (each page is already capped).
+const MEETING_DOCS_BUDGET: usize = 96 * 1024;
+
+/// A meeting's attached documents for a prompt, oldest first, within the budget.
+fn meeting_context(st: &Store, meeting_id: i64) -> fs_store::Result<Vec<prompts::ContextDoc>> {
+    let mut used = 0;
+    let mut out = Vec::new();
+    for d in st.meeting_docs(meeting_id)? {
+        if used + d.text.len() > MEETING_DOCS_BUDGET {
+            tracing::warn!("meeting {meeting_id}: leaving out attached \"{}\" (over the size budget)", d.title);
+            continue;
+        }
+        used += d.text.len();
+        out.push(prompts::ContextDoc { title: format!("Confluence: {}", d.title), text: d.text });
+    }
+    Ok(out)
 }
 
 #[derive(Default)]
@@ -501,6 +541,8 @@ struct MeetingDetail {
     meeting: Meeting,
     transcript: Vec<Segment>,
     chat: Vec<ChatMessage>,
+    /// Pages attached to the meeting (titles and sizes; the text stays here).
+    docs: Vec<MeetingDoc>,
 }
 
 #[tauri::command]
@@ -531,7 +573,35 @@ fn get_meeting(state: State<'_, AppState>, id: i64) -> Result<MeetingDetail, Str
         meeting: st.get_meeting(id).map_err(err)?,
         transcript: st.transcript(id).map_err(err)?,
         chat: st.chat_history(Some(id)).map_err(err)?,
+        docs: st.meeting_docs(id).map_err(err)?,
     })
+}
+
+/// Read a whole Confluence page (from a link or an id) and attach it to the meeting, so the AI
+/// notes and Ask know it from the start. Attaching it again refreshes it.
+#[tauri::command]
+async fn attach_confluence(app: AppHandle, id: i64, page: String) -> Result<Vec<MeetingDoc>, String> {
+    let Some(page_id) = fs_atlassian::page_id_from(&page) else {
+        return Err("That doesn't look like a Confluence page link or page id.".into());
+    };
+    if !lock(&app.state::<AppState>().settings).atlassian {
+        return Err("Jira and Confluence are turned off in Settings.".into());
+    }
+    let read = tauri::async_runtime::spawn_blocking(move || fs_atlassian::read_page(&page_id)).await.map_err(err)?;
+    let page = read.map_err(err)?;
+    let title = page.title.clone().unwrap_or_else(|| format!("Page {}", page.id));
+    tracing::info!("attached Confluence page {} ({} bytes) to meeting {id}", page.id, page.text.len());
+    let st = app.state::<AppState>();
+    let store = lock(&st.store);
+    store.put_meeting_doc(id, "confluence", &page.id, &title, &page.text, now_ms()).map_err(err)?;
+    store.meeting_docs(id).map_err(err)
+}
+
+#[tauri::command]
+fn remove_meeting_doc(state: State<'_, AppState>, id: i64, doc_id: i64) -> Result<Vec<MeetingDoc>, String> {
+    let st = lock(&state.store);
+    st.remove_meeting_doc(id, doc_id).map_err(err)?;
+    st.meeting_docs(id).map_err(err)
 }
 
 #[tauri::command]
@@ -696,20 +766,39 @@ fn emit_stream(app: &AppHandle, event: &str, meeting_id: Option<i64>, delta: &st
 /// automatic passes during a meeting use it so the notes don't churn.
 async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, update: bool) -> Result<(), String> {
     let cfg = llm_config(&state)?;
-    let (meeting, transcript) = {
+    let (meeting, mut transcript, docs) = {
         let st = lock(&state.store);
-        (st.get_meeting(id).map_err(err)?, st.transcript(id).map_err(err)?)
+        (st.get_meeting(id).map_err(err)?, st.transcript(id).map_err(err)?, meeting_context(&st, id).map_err(err)?)
     };
     let live = lock(&state.recording).as_ref().is_some_and(|r| r.meeting_id == id);
     let previous = (update && !meeting.enhanced.trim().is_empty()).then_some(meeting.enhanced.as_str());
+    let newest = transcript.iter().map(|s| s.start_ms).max().unwrap_or(0);
+    // While recording, an update only needs what was said since the last pass: the previous
+    // notes stand for the rest. The pass after recording stops reads everything once more.
+    let upto = lock(&state.notes_upto).get(&id).copied();
+    let since = match (live, previous, upto) {
+        (true, Some(_), Some(upto)) => {
+            let from = (upto - NOTES_OVERLAP_MS).max(0);
+            let before = transcript.len();
+            transcript.retain(|s| s.start_ms >= from);
+            (transcript.len() < before).then(|| clock_label(from))
+        }
+        _ => None,
+    };
     let me = user_name(&state);
     let msgs = prompts::enhance_notes(
         &meeting.title,
         &meeting.notes,
         &prompts::format_transcript(&lines(&transcript, me.as_deref()), 60_000),
-        prompts::EnhanceMode { live, previous, me: me.as_deref() },
+        prompts::EnhanceMode { live, previous, me: me.as_deref(), since: since.as_deref(), docs: &docs },
     );
-    tracing::debug!("enhancing meeting {id} (live: {live}, update: {})", previous.is_some());
+    tracing::debug!(
+        "enhancing meeting {id} (live: {live}, update: {}, from: {}, {} lines, {} docs)",
+        previous.is_some(),
+        since.as_deref().unwrap_or("start"),
+        transcript.len(),
+        docs.len()
+    );
     let key_sent = cfg.api_key.is_some();
 
     tauri::async_runtime::spawn(async move {
@@ -720,6 +809,8 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
                 let saved = lock(&st.store).set_enhanced(id, &full);
                 if let Err(e) = saved {
                     tracing::error!("saving AI notes: {e}");
+                } else {
+                    lock(&st.notes_upto).insert(id, newest);
                 }
                 emit_stream(&app, "enhance-delta", Some(id), "", true, None);
             }
@@ -755,6 +846,10 @@ async fn ask(
         sources = used;
         match meeting_id {
             Some(id) => {
+                // Pages attached to the meeting come before passages from files.
+                let mut attached = meeting_context(&st, id).map_err(err)?;
+                attached.append(&mut docs);
+                let docs = attached;
                 let m = st.get_meeting(id).map_err(err)?;
                 let t = st.transcript(id).map_err(err)?;
                 let transcript = prompts::format_transcript(&lines(&t, me), 60_000);
@@ -1274,6 +1369,7 @@ pub fn run() {
                 download_cancel: Default::default(),
                 meet: Mutex::new(MeetState::default()),
                 atlassian: Mutex::new(fs_atlassian::Status::default()),
+                notes_upto: Mutex::new(HashMap::new()),
             });
             // Asking acli who is logged in takes a second or two; don't hold up startup.
             let handle = app.handle().clone();
@@ -1312,6 +1408,8 @@ pub fn run() {
             new_meeting,
             list_meetings,
             get_meeting,
+            attach_confluence,
+            remove_meeting_doc,
             set_notes,
             rename_meeting,
             set_meeting_language,
@@ -1378,7 +1476,17 @@ mod tests {
         assert_eq!(s.fallback_model, "");
         assert_eq!(s.language, "auto");
         assert!(s.atlassian);
-        assert!(s.auto_notes);
+        assert_eq!(s.migrated().0.notes_mode, "live");
+    }
+
+    #[test]
+    fn notes_mode_comes_from_the_old_switch_once() {
+        assert_eq!(parse(r#"{"baseUrl":"x","autoNotes":false}"#).migrated().0.notes_mode, "manual");
+        assert_eq!(parse(r#"{"baseUrl":"x","autoNotes":true}"#).migrated().0.notes_mode, "live");
+        assert_eq!(parse(r#"{"baseUrl":"x","autoNotes":true,"notesMode":"end"}"#).migrated().0.notes_mode, "end");
+        assert_eq!(parse(r#"{"baseUrl":"x","notesMode":"bogus"}"#).migrated().0.notes_mode, "live");
+        let json = serde_json::to_string(&parse(r#"{"baseUrl":"x","notesMode":"end"}"#).migrated().0).unwrap();
+        assert!(json.contains("\"notesMode\":\"end\"") && !json.contains("autoNotes"), "{json}");
     }
 
     #[test]

@@ -59,6 +59,18 @@ CREATE TABLE IF NOT EXISTS chat (
 );
 CREATE INDEX IF NOT EXISTS chat_meeting ON chat(meeting_id, id);
 
+-- Documents attached to one meeting (a Confluence page read in full), given to the AI with it.
+CREATE TABLE IF NOT EXISTS meeting_docs (
+    id          INTEGER PRIMARY KEY,
+    meeting_id  INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+    source      TEXT NOT NULL,
+    ref         TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    text        TEXT NOT NULL,
+    added_at    INTEGER NOT NULL,
+    UNIQUE (meeting_id, source, ref)
+);
+
 CREATE TABLE IF NOT EXISTS kb_docs (
     id          INTEGER PRIMARY KEY,
     path        TEXT NOT NULL UNIQUE,
@@ -122,6 +134,23 @@ pub struct Segment {
     pub text: String,
     /// Participant name from the Meet extension, when known. Only set for other people.
     pub speaker: Option<String>,
+}
+
+/// A document attached to a meeting, such as a Confluence page.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingDoc {
+    pub id: i64,
+    /// Where it came from: "confluence".
+    pub source: String,
+    /// The id there (a Confluence page id).
+    pub r#ref: String,
+    pub title: String,
+    #[serde(skip_serializing)]
+    pub text: String,
+    /// Size of `text`, for the UI.
+    pub bytes: usize,
+    pub added_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -557,6 +586,54 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Attach a document to a meeting; attaching the same one again refreshes it in place.
+    pub fn put_meeting_doc(
+        &self,
+        meeting_id: i64,
+        source: &str,
+        r#ref: &str,
+        title: &str,
+        text: &str,
+        now: i64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO meeting_docs (meeting_id, source, ref, title, text, added_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT (meeting_id, source, ref) DO UPDATE SET title = excluded.title, text = excluded.text,
+                 added_at = excluded.added_at",
+            params![meeting_id, source, r#ref, title, text, now],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT id FROM meeting_docs WHERE meeting_id = ?1 AND source = ?2 AND ref = ?3",
+            params![meeting_id, source, r#ref],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Oldest first, so the AI sees them in the order they were added.
+    pub fn meeting_docs(&self, meeting_id: i64) -> Result<Vec<MeetingDoc>> {
+        let mut st = self.conn.prepare(
+            "SELECT id, source, ref, title, text, added_at FROM meeting_docs WHERE meeting_id = ?1 ORDER BY id",
+        )?;
+        let rows = st.query_map(params![meeting_id], |r| {
+            let text: String = r.get(4)?;
+            Ok(MeetingDoc {
+                id: r.get(0)?,
+                source: r.get(1)?,
+                r#ref: r.get(2)?,
+                title: r.get(3)?,
+                bytes: text.len(),
+                text,
+                added_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    pub fn remove_meeting_doc(&self, meeting_id: i64, doc_id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM meeting_docs WHERE id = ?1 AND meeting_id = ?2", params![doc_id, meeting_id])?;
+        Ok(())
+    }
+
     pub fn add_chat(&self, meeting_id: Option<i64>, role: &str, content: &str, now: i64) -> Result<()> {
         self.conn.execute(
             "INSERT INTO chat (meeting_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4)",
@@ -579,6 +656,28 @@ mod tests {
 
     fn store() -> Store {
         Store::open_memory().unwrap()
+    }
+
+    #[test]
+    fn meeting_docs_attach_refresh_and_go_with_the_meeting() {
+        let s = store();
+        let m = s.create_meeting("Grooming", 1).unwrap();
+        let other = s.create_meeting("Other", 2).unwrap();
+        let a = s.put_meeting_doc(m, "confluence", "123", "PRD", "v1", 10).unwrap();
+        s.put_meeting_doc(m, "confluence", "456", "Runbook", "rb", 11).unwrap();
+        // Same page again: refreshed in place, same id, same position.
+        assert_eq!(s.put_meeting_doc(m, "confluence", "123", "PRD v2", "v2 text", 12).unwrap(), a);
+        let docs = s.meeting_docs(m).unwrap();
+        assert_eq!(docs.iter().map(|d| d.title.as_str()).collect::<Vec<_>>(), ["PRD v2", "Runbook"]);
+        assert_eq!((docs[0].text.as_str(), docs[0].bytes), ("v2 text", 7));
+        assert!(s.meeting_docs(other).unwrap().is_empty());
+        // Removing needs the right meeting.
+        s.remove_meeting_doc(other, a).unwrap();
+        assert_eq!(s.meeting_docs(m).unwrap().len(), 2);
+        s.remove_meeting_doc(m, a).unwrap();
+        assert_eq!(s.meeting_docs(m).unwrap().len(), 1);
+        s.delete_meeting(m).unwrap();
+        assert!(s.meeting_docs(m).unwrap().is_empty());
     }
 
     #[test]

@@ -6,6 +6,12 @@
   import type { AtlassianStatus, BridgeStatus, Settings } from './api';
   import { onMount } from 'svelte';
 
+  const notesModes: [Settings['notesMode'], string, string][] = [
+    ['live', 'The AI takes notes as the meeting goes', 'Your notes, if you jot any, are the outline. A small AI request every couple of minutes while recording, and one when you stop.'],
+    ['end', 'I take notes, the AI enhances them', 'One AI request when you stop recording, from the whole meeting.'],
+    ['manual', 'Only when I press Enhance', 'Nothing goes to the AI until you ask.']
+  ];
+
   let form = $state<Settings>({ ...session.settings });
   let apiKey = $state('');
   let saved = $state(false);
@@ -106,7 +112,7 @@
       form.fallbackModel.trim() !== s.fallbackModel.trim() ||
       form.language !== s.language ||
       form.atlassian !== s.atlassian ||
-      form.autoNotes !== s.autoNotes ||
+      form.notesMode !== s.notesMode ||
       form.vocabulary.trim() !== s.vocabulary.trim() ||
       form.userName.trim() !== s.userName.trim() ||
       apiKey.trim() !== ''
@@ -284,15 +290,18 @@
         {/if}
       </div>
 
-      <label class="mt-5 flex cursor-pointer items-start gap-2.5 text-sm">
-        <input type="checkbox" class="mt-0.5 h-4 w-4 accent-ink" bind:checked={form.autoNotes} />
-        <span>
-          Update AI notes automatically while recording
-          <span class="mt-0.5 block text-xs text-muted">
-            When you pause typing and as the meeting goes on: about one AI request a minute while things change, and one when you stop.
-          </span>
-        </span>
-      </label>
+      <fieldset class="mt-5 text-sm">
+        <legend class="font-medium">Who writes the notes</legend>
+        {#each notesModes as [value, label, note]}
+          <label class="mt-2 flex cursor-pointer items-start gap-2.5">
+            <input type="radio" name="notes-mode" class="mt-0.5 h-4 w-4 accent-ink" {value} bind:group={form.notesMode} />
+            <span>
+              {label}
+              <span class="mt-0.5 block text-xs text-muted">{note}</span>
+            </span>
+          </label>
+        {/each}
+      </fieldset>
 
       <p class="mt-3 text-xs text-muted">
         {isLocal ? 'Nothing leaves this PC.' : 'Meeting text is sent to this server when AI notes are written or you ask a question.'}

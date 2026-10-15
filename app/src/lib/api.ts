@@ -63,8 +63,8 @@ export interface Settings {
   language: string;
   /** Let Ask read Jira and Confluence through acli (read-only). */
   atlassian: boolean;
-  /** Keep the AI notes up to date on their own while recording. */
-  autoNotes: boolean;
+  /** Who writes the notes: the AI as the meeting goes, you (enhanced when recording stops), or only on Enhance. */
+  notesMode: NotesMode;
   /** Whisper model id, from the setup's speech model list. */
   speechModel: string;
   /** First-run setup finished or skipped. */
@@ -187,6 +187,19 @@ export interface KbDoc {
   chunks: number;
 }
 
+export type NotesMode = 'live' | 'end' | 'manual';
+
+/** A document attached to one meeting, such as a Confluence page read in full. */
+export interface MeetingDoc {
+  id: number;
+  source: 'confluence' | string;
+  /** The page id. */
+  ref: string;
+  title: string;
+  bytes: number;
+  addedAt: number;
+}
+
 export interface KbAddResult {
   path: string;
   title: string | null;
@@ -232,7 +245,10 @@ export interface Api {
   setMeetingLanguage(id: number, language: string): Promise<void>;
   stopRecording(): Promise<void>;
   listMeetings(): Promise<MeetingSummary[]>;
-  getMeeting(id: number): Promise<{ meeting: Meeting; transcript: StoredSeg[]; chat: ChatMsg[] }>;
+  getMeeting(id: number): Promise<{ meeting: Meeting; transcript: StoredSeg[]; chat: ChatMsg[]; docs: MeetingDoc[] }>;
+  /** Read a whole Confluence page (link or id) and attach it to the meeting. Returns the meeting's docs. */
+  attachConfluence(id: number, page: string): Promise<MeetingDoc[]>;
+  removeMeetingDoc(id: number, docId: number): Promise<MeetingDoc[]>;
   newMeeting(): Promise<number>;
   setNotes(id: number, notes: string): Promise<void>;
   renameMeeting(id: number, title: string): Promise<void>;
@@ -290,6 +306,8 @@ const tauriApi: Api = {
   stopRecording: () => invoke('stop_recording'),
   listMeetings: () => invoke('list_meetings'),
   getMeeting: (id) => invoke('get_meeting', { id }),
+  attachConfluence: (id, page) => invoke('attach_confluence', { id, page }),
+  removeMeetingDoc: (id, docId) => invoke('remove_meeting_doc', { id, docId }),
   newMeeting: () => invoke('new_meeting'),
   setNotes: (id, notes) => invoke('set_notes', { id, notes }),
   renameMeeting: (id, title) => invoke('rename_meeting', { id, title }),
@@ -344,6 +362,8 @@ function createMockApi(): Api {
   const emit = <T>(name: string, e: T) => bus[name]?.forEach((h) => (h as Handler<T>)(e));
 
   let nextId = 4;
+  const docs: Record<number, MeetingDoc[]> = {};
+  let docNext = 1;
   let recording: number | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let settings: Settings = {
@@ -352,7 +372,7 @@ function createMockApi(): Api {
     fallbackModel: '',
     language: 'auto',
     atlassian: true,
-    autoNotes: true,
+    notesMode: 'live',
     speechModel: 'large-v3-turbo',
     // The preview opens on the home screen; Settings → Run setup shows the wizard.
     setupDone: true,
@@ -444,7 +464,17 @@ function createMockApi(): Api {
       emit('recording', false);
     },
     listMeetings: async () => meetings.map((m) => ({ id: m.id, title: m.title, startedAt: m.startedAt, endedAt: m.endedAt, segmentCount: transcripts[m.id]?.length ?? 0 })),
-    getMeeting: async (id) => ({ meeting: { ...get(id) }, transcript: [...(transcripts[id] ?? [])], chat: [...(chats[id] ?? [])] }),
+    getMeeting: async (id) => ({ meeting: { ...get(id) }, transcript: [...(transcripts[id] ?? [])], chat: [...(chats[id] ?? [])], docs: [...(docs[id] ?? [])] }),
+    attachConfluence: async (id, page) => {
+      await new Promise((r) => setTimeout(r, 900));
+      const ref = /(\d{4,})/.exec(page)?.[1];
+      if (!ref) throw "That doesn't look like a Confluence page link or page id.";
+      const list = (docs[id] ??= []).filter((d) => d.ref !== ref);
+      list.push({ id: docNext++, source: 'confluence', ref, title: 'Laporan Keuangan PRD', bytes: 28_765, addedAt: Date.now() });
+      docs[id] = list;
+      return [...list];
+    },
+    removeMeetingDoc: async (id, docId) => [...(docs[id] = (docs[id] ?? []).filter((d) => d.id !== docId))],
     setNotes: async (id, notes) => void (get(id).notes = notes),
     renameMeeting: async (id, title) => void (get(id).title = title),
     deleteMeeting: async (id) => void meetings.splice(meetings.findIndex((m) => m.id === id), 1),

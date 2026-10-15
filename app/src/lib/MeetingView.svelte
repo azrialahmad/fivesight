@@ -6,6 +6,7 @@
   import Transcript from './Transcript.svelte';
   import { session } from './session.svelte';
   import { clock, dayLabel, timeOfDay } from './format';
+  import type { NotesMode } from './api';
 
   let now = $state(Date.now());
   let timer: ReturnType<typeof setInterval>;
@@ -26,7 +27,23 @@
   // don't blank out and retype every minute. A manual pass (or the very first) streams in.
   const streaming = $derived(session.enhancing && (!session.enhancingAuto || !m.enhanced));
   const shownNotes = $derived(streaming ? session.enhancedLive : m.enhanced);
-  const auto = $derived(session.settings.autoNotes && live);
+  const mode = $derived(session.settings.notesMode);
+  const auto = $derived(mode === 'live' && live);
+  const modes: [NotesMode, string, string][] = [
+    ['live', 'AI takes notes', 'The AI keeps notes as the meeting goes, with yours as the outline. A small update every couple of minutes.'],
+    ['end', 'I take notes, AI enhances', 'You take notes. When you stop recording, the AI fills them in once from the whole meeting.'],
+    ['manual', 'Only when I press Enhance', 'Nothing is sent to the AI until you press Enhance.']
+  ];
+
+  let pageLink = $state('');
+  let addingPage = $state(false);
+  async function attach() {
+    if (await session.attachPage(pageLink)) {
+      pageLink = '';
+      addingPage = false;
+    }
+  }
+  const kb = (n: number) => (n < 1024 ? `${n} B` : `${Math.round(n / 1024)} KB`);
 
   const sub = $derived(
     [dayLabel(m.startedAt), timeOfDay(m.startedAt), session.segs.length ? `${session.segs.length} lines of transcript` : '']
@@ -99,12 +116,54 @@
     <div class="mx-6 mb-2 rounded-xl bg-rec-soft px-4 py-2.5 text-sm text-rec" role="alert">{session.error}</div>
   {/if}
 
+  <div class="flex flex-wrap items-center gap-2 px-6 pb-3 text-[13px]">
+    {#each session.docs as d (d.id)}
+      <span class="flex max-w-xs items-center gap-1.5 rounded-full border border-line bg-paper py-1 pl-3 pr-1" title="Confluence page {d.ref}, read in full. The AI notes and Ask use it.">
+        <Icon name="book" size={14} />
+        <span class="truncate font-medium">{d.title}</span>
+        <span class="shrink-0 text-xs text-faint">{kb(d.bytes)}</span>
+        <button class="grid h-6 w-6 shrink-0 place-items-center rounded-full text-muted hover:bg-soft" aria-label="Remove {d.title}" onclick={() => session.detachPage(d.id)}>
+          <Icon name="close" size={13} />
+        </button>
+      </span>
+    {/each}
+    {#if addingPage}
+      <form class="flex min-w-0 flex-1 items-center gap-2" onsubmit={(e) => (e.preventDefault(), attach())}>
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          class="min-w-0 max-w-md flex-1 rounded-full border border-line bg-card px-3.5 py-1.5 outline-none focus:border-ink"
+          placeholder="Paste a Confluence page link"
+          aria-label="Confluence page link"
+          bind:value={pageLink}
+          autofocus
+          disabled={session.attaching}
+          onkeydown={(e) => e.key === 'Escape' && ((addingPage = false), (session.attachError = null))}
+        />
+        <button class="rounded-full bg-ink px-3.5 py-1.5 font-semibold text-white disabled:opacity-60" disabled={session.attaching || !pageLink.trim()}>
+          {session.attaching ? 'Reading page…' : 'Add'}
+        </button>
+        <button type="button" class="rounded-full px-2 py-1.5 text-muted hover:text-ink" onclick={() => ((addingPage = false), (session.attachError = null))}>Cancel</button>
+      </form>
+    {:else}
+      <button
+        class="flex items-center gap-1.5 rounded-full border border-dashed border-line px-3 py-1 text-muted hover:border-ink hover:text-ink"
+        title="Read a whole Confluence page (a PRD, a spec) so the AI notes and Ask know it during the meeting"
+        onclick={() => (addingPage = true)}
+      >
+        <Icon name="plus" size={14} /> Confluence page
+      </button>
+    {/if}
+    {#if session.attachError}
+      <span class="basis-full text-xs text-rec" role="alert">{session.attachError}</span>
+    {/if}
+  </div>
+
   <div class="grid min-h-[9rem] flex-1 grid-cols-2 border-t border-line">
     <div class="flex min-h-0 flex-col border-r border-line">
       <div class="px-6 pb-1 pt-4 text-[11px] font-semibold tracking-wider text-faint">YOUR NOTES</div>
       <textarea
         class="min-h-0 w-full flex-1 resize-none bg-transparent px-6 pb-4 text-[15px] leading-relaxed outline-none placeholder:text-faint"
-        placeholder="Jot quick notes while you talk. fivesight fills in the rest."
+        placeholder={mode === 'live' ? 'Jot quick notes while you talk, or nothing at all. fivesight keeps the AI notes going.' : 'Jot quick notes while you talk. fivesight fills in the rest.'}
         value={m.notes}
         oninput={(e) => session.setNotes(e.currentTarget.value)}
         aria-label="Your notes"
@@ -112,8 +171,17 @@
     </div>
 
     <div class="flex min-h-0 flex-col bg-paper/60">
-      <div class="flex items-center px-6 pb-1 pt-3">
-        <span class="text-[11px] font-semibold tracking-wider text-faint">AI NOTES</span>
+      <div class="flex items-center whitespace-nowrap px-6 pb-1 pt-3">
+        <span class="shrink-0 text-[11px] font-semibold tracking-wider text-faint">AI NOTES</span>
+        <label class="relative ml-2 flex min-w-0 items-center text-xs text-muted hover:text-ink" title={modes.find(([v]) => v === mode)?.[2]}>
+          <span class="sr-only">Who writes the notes</span>
+          <select class="min-w-0 appearance-none truncate rounded-full bg-transparent py-1 pl-2 pr-6 outline-none focus:bg-card" value={mode} onchange={(e) => session.setNotesMode(e.currentTarget.value as NotesMode)}>
+            {#each modes as [value, label]}
+              <option {value}>{label}</option>
+            {/each}
+          </select>
+          <span class="pointer-events-none absolute right-1 rotate-90 text-faint"><Icon name="chevron" size={13} /></span>
+        </label>
         {#if session.enhancing && session.enhancingAuto}
           <span class="ml-3 flex items-center gap-1.5 text-xs text-muted" role="status">
             <span class="rec-dot h-1.5 w-1.5 rounded-full bg-lime-deep"></span>Updating…
@@ -121,10 +189,10 @@
         {:else if auto && session.autoError}
           <span class="ml-3 min-w-0 truncate text-xs text-rec" title={session.autoError}>Couldn't update; trying again soon</span>
         {:else if auto}
-          <span class="ml-3 text-xs text-muted" title="Updates when you pause typing and as the meeting goes on">Auto</span>
+          <span class="ml-1 flex items-center gap-1.5 text-xs text-muted" title="Updates when you pause typing and as the meeting goes on"><span class="h-1.5 w-1.5 rounded-full bg-lime-deep"></span>Live</span>
         {/if}
         <button
-          class="ml-auto flex items-center gap-1.5 rounded-full bg-lime px-3.5 py-1.5 text-[13px] font-semibold text-ink transition-colors hover:bg-lime-deep disabled:bg-soft disabled:text-faint"
+          class="ml-auto flex shrink-0 items-center gap-1.5 rounded-full bg-lime px-3.5 py-1.5 text-[13px] font-semibold text-ink transition-colors hover:bg-lime-deep disabled:bg-soft disabled:text-faint"
           disabled={!canEnhance || session.enhancing}
           title={canEnhance ? '' : 'Take some notes or record first'}
           onclick={() => session.enhance()}
@@ -148,8 +216,10 @@
             <span class="grid h-12 w-12 place-items-center rounded-2xl bg-lime text-ink"><Icon name="spark" size={24} /></span>
             <p class="mt-4 font-semibold">Your notes, expanded</p>
             <p class="mt-1 max-w-[16rem] text-sm leading-relaxed text-muted">
-              {#if session.settings.autoNotes}
-                Take a few quick notes while you talk. While recording, fivesight fills them in from what was said as the meeting goes.
+              {#if mode === 'live'}
+                While recording, fivesight takes notes from what was said as the meeting goes. Anything you jot becomes their outline.
+              {:else if mode === 'end'}
+                Take a few quick notes while you talk. When you stop recording, fivesight fills them in from what was said.
               {:else}
                 Take a few quick notes while you talk. When you're ready, press Enhance and fivesight writes it up from what was said.
               {/if}
