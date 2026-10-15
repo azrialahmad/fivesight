@@ -174,10 +174,13 @@ fn parse_attrs(s: &str) -> Vec<(String, String)> {
     out
 }
 
+/// An element still open while parsing: name, attributes, children so far.
+type Open = (String, Vec<(String, String)>, Vec<Node>);
+
 fn parse(src: &str) -> Vec<Node> {
     // A stack of open elements; index 0 is the document root.
-    let mut stack: Vec<(String, Vec<(String, String)>, Vec<Node>)> = vec![(String::new(), Vec::new(), Vec::new())];
-    let close = |stack: &mut Vec<(String, Vec<(String, String)>, Vec<Node>)>| {
+    let mut stack: Vec<Open> = vec![(String::new(), Vec::new(), Vec::new())];
+    let close = |stack: &mut Vec<Open>| {
         let (name, attrs, kids) = stack.pop().expect("not the root");
         stack.last_mut().expect("root").2.push(Node::El { name, attrs, kids });
     };
