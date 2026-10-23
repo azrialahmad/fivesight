@@ -19,7 +19,7 @@ Thanks for helping. A few conventions keep the history easy to read.
 cargo fmt --all
 cargo test -p fs-store -p fs-kb -p fs-llm -p fs-atlassian -p fs-bridge -p fs-stt -p fs-vad -p fs-audio
 cd app && npm run build
-cd extension && node --test test/tracker.test.js
+cd extension && node --test test/tracker.test.js test/selectors.test.js
 ```
 
 CI runs the same checks. Crates that need whisper.cpp, CUDA or ONNX Runtime (`fs-pipeline`, the

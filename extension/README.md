@@ -35,7 +35,7 @@ they list the tiles and names it found and each speaking change.
 ## Tests
 
 ```
-node --test test/tracker.test.js
+node --test test/tracker.test.js test/selectors.test.js
 ```
 
 The speaking and call logic is covered. The page-reading code in `selectors.js` can only be checked

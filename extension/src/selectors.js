@@ -2,7 +2,8 @@
 // Meet changes its markup without notice; when speaker names stop appearing, fix it here.
 // Turn on "Debug logging" in the extension popup to see what these functions find.
 (function (root) {
-  const CODE = /^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:$|[/?])/;
+  // Meet serves calls at /abc-defg-hij and also under /meet/abc-defg-hij.
+  const CODE = /^(?:\/meet)?\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:$|[/?])/;
 
   /** The meeting code from the address, or null on Meet's home page and other screens. */
   function meetCode(pathname) {
