@@ -20,9 +20,13 @@ audio), so it works with any meeting app.
 ## Features
 
 - **Notes first.** Your notes on the left, AI-expanded notes on the right, written from your
-  notes and the transcript. The live transcript stays in a drawer.
+  notes and the transcript. Or let the AI take the notes on one page that you correct and add to
+  as it goes; it keeps your edits. The live transcript stays in a drawer.
+- **Follow-up meetings.** Attach the earlier meeting a call continues, and the AI notes and Ask
+  pick up its open questions and action items. Attach a Confluence page to read it in full, with
+  its comment threads.
 - **Ask.** Questions about the open meeting or all past meetings, answered with `[m:ss]`
-  timestamp citations.
+  timestamp citations. Add an answer to your notes in one click; pasted text keeps its formatting.
 - **Your files.** Add Markdown, text and PDF files; Ask uses the passages that match a question
   and says which file it used. Files are indexed on your PC.
 - **Jira and Confluence, read-only.** Jira through Atlassian's official CLI (`acli`), Confluence

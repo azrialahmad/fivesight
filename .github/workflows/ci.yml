@@ -42,7 +42,7 @@ jobs:
           npm run build
       - name: UI tests
         working-directory: app
-        run: node --test test/mine.test.ts
+        run: node --test test/mine.test.ts test/htmlmd.test.ts
       - name: Extension tests
         working-directory: extension
         run: node --test test/tracker.test.js test/selectors.test.js

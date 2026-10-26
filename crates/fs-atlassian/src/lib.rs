@@ -452,6 +452,16 @@ pub fn read_page(page_id: &str) -> Result<Page, AtlassianError> {
     Ok(Page { id: page_id.to_string(), title, text })
 }
 
+/// How many comments a page read by [`read_page`] came with: `None` when they couldn't be read.
+pub fn comment_count(page_text: &str) -> Option<usize> {
+    let (_, comments) = page_text.rsplit_once("\n## Comments\n\n")?;
+    if comments.starts_with("(no comments)") {
+        return Some(0);
+    }
+    // confluence-cli starts its listing with "Found 3 comments:".
+    comments.strip_prefix("Found ")?.split_whitespace().next()?.parse().ok()
+}
+
 /// Cut on a char boundary and say plainly how much is missing, so the AI doesn't fill it in.
 fn cut(mut s: String, max: usize, what: &str) -> String {
     if s.len() <= max {
@@ -764,5 +774,15 @@ mod tests {
         assert!(c.starts_with(&"é".repeat(500)) && !c.starts_with(&"é".repeat(501)), "{c}");
         assert!(c.contains("(about 5 KB) is not shown"), "{c}");
         assert_eq!(cut("short".into(), 100, "page"), "short");
+    }
+
+    #[test]
+    fn counts_the_comments_a_page_came_with() {
+        let page = |c: &str| format!("# PRD\n\n## Comments\n\nnot this one\n\n## Comments\n\n{c}");
+        assert_eq!(comment_count(&page("Found 12 comments:\n1. Citra [inline]")), Some(12));
+        assert_eq!(comment_count(&page("Found 1 comment:\n1. Citra [inline]")), Some(1));
+        assert_eq!(comment_count(&page("(no comments)")), Some(0));
+        assert_eq!(comment_count(&page("(comments unavailable: confluence-cli failed)")), None);
+        assert_eq!(comment_count("no comment section"), None);
     }
 }

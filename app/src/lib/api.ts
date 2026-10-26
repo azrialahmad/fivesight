@@ -189,15 +189,17 @@ export interface KbDoc {
 
 export type NotesMode = 'live' | 'end' | 'manual';
 
-/** A document attached to one meeting, such as a Confluence page read in full. */
+/** Something attached to one meeting: a Confluence page read in full, or an earlier meeting it continues. */
 export interface MeetingDoc {
   id: number;
-  source: 'confluence' | string;
-  /** The page id. */
+  source: 'confluence' | 'meeting' | string;
+  /** The page id, or the earlier meeting's id. */
   ref: string;
   title: string;
   bytes: number;
   addedAt: number;
+  /** Comments read with a Confluence page; null when they couldn't be read. */
+  comments?: number | null;
 }
 
 export interface KbAddResult {
@@ -234,6 +236,8 @@ export interface StreamEvent {
   delta: string;
   done: boolean;
   error: string | null;
+  /** AI notes finished but not saved, because you edited the notes while they were written. */
+  stale?: boolean;
 }
 
 type Off = () => void;
@@ -248,9 +252,13 @@ export interface Api {
   getMeeting(id: number): Promise<{ meeting: Meeting; transcript: StoredSeg[]; chat: ChatMsg[]; docs: MeetingDoc[] }>;
   /** Read a whole Confluence page (link or id) and attach it to the meeting. Returns the meeting's docs. */
   attachConfluence(id: number, page: string): Promise<MeetingDoc[]>;
+  /** Give the AI an earlier meeting's notes with this one (a meeting that continues it). Returns the meeting's docs. */
+  attachMeeting(id: number, from: number): Promise<MeetingDoc[]>;
   removeMeetingDoc(id: number, docId: number): Promise<MeetingDoc[]>;
   newMeeting(): Promise<number>;
   setNotes(id: number, notes: string): Promise<void>;
+  /** Save your edits to the AI notes. */
+  setAiNotes(id: number, text: string): Promise<void>;
   renameMeeting(id: number, title: string): Promise<void>;
   deleteMeeting(id: number): Promise<void>;
   /** `update` builds on the last AI notes (automatic passes) instead of starting over. */
@@ -307,9 +315,11 @@ const tauriApi: Api = {
   listMeetings: () => invoke('list_meetings'),
   getMeeting: (id) => invoke('get_meeting', { id }),
   attachConfluence: (id, page) => invoke('attach_confluence', { id, page }),
+  attachMeeting: (id, from) => invoke('attach_meeting', { id, from }),
   removeMeetingDoc: (id, docId) => invoke('remove_meeting_doc', { id, docId }),
   newMeeting: () => invoke('new_meeting'),
   setNotes: (id, notes) => invoke('set_notes', { id, notes }),
+  setAiNotes: (id, text) => invoke('set_ai_notes', { id, text }),
   renameMeeting: (id, title) => invoke('rename_meeting', { id, title }),
   deleteMeeting: (id) => invoke('delete_meeting', { id }),
   enhance: (id, update) => invoke('enhance_notes', { id, update }),
@@ -411,12 +421,12 @@ function createMockApi(): Api {
   const chats: Record<number, ChatMsg[]> = {};
   const get = (id: number) => meetings.find((m) => m.id === id)!;
 
-  const stream = async (name: string, meetingId: number | null, text: string) => {
+  const stream = async (name: string, meetingId: number | null, text: string, stale = () => false) => {
     for (const w of text.split(/(?<= )/)) {
       await new Promise((r) => setTimeout(r, 35));
       emit<StreamEvent>(name, { meetingId, delta: w, done: false, error: null });
     }
-    emit<StreamEvent>(name, { meetingId, delta: '', done: true, error: null });
+    emit<StreamEvent>(name, { meetingId, delta: '', done: true, error: null, stale: stale() });
   };
 
   return {
@@ -470,16 +480,35 @@ function createMockApi(): Api {
       const ref = /(\d{4,})/.exec(page)?.[1];
       if (!ref) throw "That doesn't look like a Confluence page link or page id.";
       const list = (docs[id] ??= []).filter((d) => d.ref !== ref);
-      list.push({ id: docNext++, source: 'confluence', ref, title: 'Laporan Keuangan PRD', bytes: 28_765, addedAt: Date.now() });
+      list.push({ id: docNext++, source: 'confluence', ref, title: 'Laporan Keuangan PRD', bytes: 28_765, addedAt: Date.now(), comments: 7 });
+      docs[id] = list;
+      return [...list];
+    },
+    attachMeeting: async (id, from) => {
+      if (id === from) throw "A meeting can't continue itself.";
+      const m = get(from);
+      const text = m.enhanced || m.notes || (transcripts[from] ?? []).map((s) => s.text).join('\n');
+      if (!text.trim()) throw `"${m.title}" has no notes or transcript to go on.`;
+      const list = (docs[id] ??= []).filter((d) => !(d.source === 'meeting' && d.ref === String(from)));
+      list.push({ id: docNext++, source: 'meeting', ref: String(from), title: m.title, bytes: text.length, addedAt: Date.now(), comments: null });
       docs[id] = list;
       return [...list];
     },
     removeMeetingDoc: async (id, docId) => [...(docs[id] = (docs[id] ?? []).filter((d) => d.id !== docId))],
     setNotes: async (id, notes) => void (get(id).notes = notes),
+    setAiNotes: async (id, text) => void (get(id).enhanced = text),
     renameMeeting: async (id, title) => void (get(id).title = title),
     deleteMeeting: async (id) => void meetings.splice(meetings.findIndex((m) => m.id === id), 1),
-    enhance: async (id) => {
+    enhance: async (id, update) => {
       const m = get(id);
+      const base = m.enhanced;
+      if (update && base.trim()) {
+        // Like the real prompt for notes you edit: keep every line, add what's new.
+        const md = `${base.trimEnd()}\n- Also agreed: a regression test goes in with the fix [0:21]\n`;
+        await stream('enhance-delta', id, md, () => m.enhanced !== base);
+        if (m.enhanced === base) m.enhanced = md;
+        return;
+      }
       // Mirrors the real prompt: the user's lines are the skeleton, details go underneath.
       const mine = m.notes.split('\n').map((l) => l.replace(/^\s*[-*]\s*/, '').trim()).filter(Boolean);
       const details = ['Reproduced on staging; the retry waits thirty seconds [0:07]', 'Owner and date agreed in the call [0:15]', 'Came up again near the end'];
@@ -487,8 +516,8 @@ function createMockApi(): Api {
         ? mine.map((l, i) => `- ${l}\n  - ${details[i % details.length]}`).join('\n')
         : '## PAY-142 checkout timeout\n\n- The retry logic waits thirty seconds before failing [0:07]';
       const md = `${body}\n\n## Action items\n\n- Budi: ship the fix by Friday\n- You: update the Confluence page\n`;
-      await stream('enhance-delta', id, md);
-      m.enhanced = md;
+      await stream('enhance-delta', id, md, () => m.enhanced !== base);
+      if (m.enhanced === base) m.enhanced = md;
     },
     ask: async (meetingId, question) => {
       const a = `Based on the transcript, the checkout timeout comes from the retry logic waiting thirty seconds before failing [0:07]. Budi was asked to ship a fix by Friday [0:15].`;
