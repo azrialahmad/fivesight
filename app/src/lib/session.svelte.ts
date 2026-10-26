@@ -136,7 +136,9 @@ class Session {
     this.recordingMeetingId = status.recordingMeetingId;
     this.modelsDir = status.modelsDir;
     this.settings = settings;
-    if (!settings.setupDone) this.setupOpen = true;
+    // Also when the models it downloads aren't there (an earlier setup that didn't fetch them):
+    // the app can't record without them. Setup lets a PC that can't transcribe through anyway.
+    if (!settings.setupDone || (inTauri && !status.modelsDir)) this.setupOpen = true;
     await Promise.all([this.refreshMeetings(), this.loadKb()]);
     if (status.recording && status.recordingMeetingId !== null) {
       this.recordingStarted();

@@ -1,7 +1,7 @@
 // node --test test/downloads.test.ts (Node 22.18+ runs TypeScript directly)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { missingModels, startsDownload, VAD_BYTES } from '../src/lib/downloads.ts';
+import { holdsSetup, missingModels, startsDownload, VAD_BYTES } from '../src/lib/downloads.ts';
 import type { SetupInfo } from '../src/lib/api.ts';
 
 function pc(present: string[], vadPresent: boolean, supported = true): SetupInfo {
@@ -34,4 +34,14 @@ test('nothing to start when everything is there, a download runs, or the PC cann
   assert.ok(!startsDownload(pc([], false), ['large-v3-turbo'], true));
   assert.ok(!startsDownload(pc([], false, false), ['large-v3-turbo'], false));
   assert.ok(!startsDownload(null, ['large-v3-turbo'], false));
+});
+
+test('setup stays open until the picked model and the voice detection model are on disk', () => {
+  assert.ok(holdsSetup(pc([], false), 'large-v3-turbo'));
+  assert.ok(holdsSetup(pc(['large-v3-turbo'], false), 'large-v3-turbo'));
+  assert.ok(holdsSetup(pc(['small-q5_1'], true), 'large-v3-turbo'));
+  assert.ok(!holdsSetup(pc(['large-v3-turbo'], true), 'large-v3-turbo'));
+  // Nothing to wait for on a PC that can't transcribe, or when setup couldn't look at the PC.
+  assert.ok(!holdsSetup(pc([], false, false), 'large-v3-turbo'));
+  assert.ok(!holdsSetup(null, 'large-v3-turbo'));
 });

@@ -19,3 +19,13 @@ export function missingModels(info: SetupInfo, wanted: string[]) {
 export function startsDownload(info: SetupInfo | null, wanted: string[], downloading: boolean) {
   return !!info && info.recommendation.supported && !downloading && missingModels(info, wanted).any;
 }
+
+/**
+ * Whether setup has to stay open until `active` and the voice detection model are on disk: the
+ * app is no use without them. A PC that can't transcribe, or one setup couldn't look at
+ * (`info` null), isn't held up.
+ */
+export function holdsSetup(info: SetupInfo | null, active: string) {
+  if (!info?.recommendation.supported) return false;
+  return !info.vadPresent || !info.speechModels.find((m) => m.id === active)?.present;
+}

@@ -3,9 +3,9 @@
   import { session } from './session.svelte';
   import { api } from './api';
   import { presets, presetFor, isLocalUrl } from './providers';
-  import { missingModels, startsDownload } from './downloads';
+  import { holdsSetup, missingModels, startsDownload } from './downloads';
   import type { AtlassianStatus, BridgeStatus, DownloadEvent, LocalServer, Settings, SetupInfo } from './api';
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
 
   const steps = ['This PC', 'Speech model', 'AI model', 'Integrations'];
   let step = $state(0);
@@ -87,6 +87,7 @@
   /** Moving on from the speech model step (or finishing) downloads what was picked, unasked. */
   function go(to: number) {
     if (to > 1 && auto) download();
+    waiting = false;
     step = to;
   }
 
@@ -126,15 +127,31 @@
   let finishError = $state<string | null>(null);
   let copied = $state(false);
 
+  /** Finish was pressed before the models were on disk: setup stays open until they are. */
+  let waiting = $state(false);
+  const held = $derived(holdsSetup(info, active));
+  /** Leaving without finishing only once the app can record (or never could, on this PC). */
+  const canLeave = $derived(!!session.modelsDir || !!infoError || (!!info && !info.recommendation.supported));
+
+  $effect(() => {
+    if (waiting && !held) {
+      waiting = false;
+      untrack(() => finish());
+    }
+  });
+
   async function finish(skip = false) {
+    if (!skip && held) {
+      waiting = true;
+      // Finishing is a clear go-ahead, even after a pause.
+      if (!session.downloading) download();
+      return;
+    }
     finishing = true;
     finishError = null;
     try {
       if (skip) await session.finishSetup(session.settings, null);
-      else {
-        if (auto) download();
-        await session.finishSetup({ ...form, speechModel: active }, apiKey.trim() || null);
-      }
+      else await session.finishSetup({ ...form, speechModel: active }, apiKey.trim() || null);
     } catch (e) {
       finishError = String(e);
     } finally {
@@ -161,9 +178,11 @@
   <header class="flex items-center gap-2.5 px-8 pt-6">
     <span class="grid h-8 w-8 place-items-center rounded-[10px] bg-ink text-lime"><Icon name="logo" size={18} /></span>
     <span class="text-[19px] font-semibold tracking-tight">fivesight</span>
-    <button class="ml-auto rounded-full px-3 py-1.5 text-[13px] text-muted hover:bg-soft disabled:opacity-50" disabled={finishing} onclick={() => finish(true)}>
-      {session.settings.setupDone ? 'Close' : 'Skip setup'}
-    </button>
+    {#if canLeave}
+      <button class="ml-auto rounded-full px-3 py-1.5 text-[13px] text-muted hover:bg-soft disabled:opacity-50" disabled={finishing} onclick={() => finish(true)}>
+        {session.settings.setupDone ? 'Close' : 'Skip setup'}
+      </button>
+    {/if}
   </header>
 
   <div class="min-h-0 flex-1 overflow-y-auto" bind:this={scroller}>
@@ -179,7 +198,28 @@
         {/each}
       </ol>
 
-      {#if step === 0}
+      {#if waiting}
+        <h1 class="mt-8 text-2xl font-semibold tracking-tight">Almost done</h1>
+        <p class="mt-1 text-sm text-muted">
+          fivesight needs the speech model and the voice detection model on this PC to record. It opens as soon as they're downloaded.
+        </p>
+        <div class="mt-6 rounded-2xl bg-soft px-5 py-4">
+          {#if session.downloadError}
+            <p class="break-words text-sm text-rec" role="alert">{session.downloadError}</p>
+            <p class="mt-1 text-xs text-muted">Trying again picks up where it stopped.</p>
+            <button class="{primary} mt-3" onclick={download}>Try again</button>
+          {:else if dl}
+            <p class="text-sm font-medium">Downloading {dl.file} <span class="text-muted">({dl.index + 1} of {dl.count})</span></p>
+            <div class="mt-2 h-2 overflow-hidden rounded-full bg-line">
+              <div class="h-full rounded-full bg-ink transition-[width]" style="width: {pct(dl)}%"></div>
+            </div>
+            <p class="mt-1.5 text-xs text-muted" role="status">{size(dl.received)} of {size(dl.total)} · {pct(dl)}%</p>
+          {:else}
+            <p class="text-sm text-muted" role="status">Starting the download…</p>
+          {/if}
+        </div>
+
+      {:else if step === 0}
         <h1 class="mt-8 text-2xl font-semibold tracking-tight">Let's set up fivesight for this PC</h1>
         <p class="mt-1 text-sm text-muted">fivesight transcribes on your own graphics card, so the options depend on what's in this PC.</p>
 
@@ -395,9 +435,15 @@
 
   <footer class="border-t border-line">
     <div class="mx-auto flex max-w-2xl items-center gap-3 px-8 py-3">
-      {#if step > 0}<button class={secondary} onclick={() => go(step - 1)}>Back</button>{/if}
-      {#if step === 1 && info && !activeReady}
-        <span class="text-xs text-muted">{session.downloading ? 'You can keep going while it downloads.' : 'Recording needs the picked model downloaded.'}</span>
+      {#if waiting}
+        <button class={secondary} onclick={() => (waiting = false)}>Back</button>
+      {:else if step > 0}
+        <button class={secondary} onclick={() => go(step - 1)}>Back</button>
+      {/if}
+      {#if waiting}
+        <!-- Progress is on the page. -->
+      {:else if step === 1 && info && !activeReady}
+        <span class="text-xs text-muted">{session.downloading ? 'You can keep going while it downloads.' : 'Setup finishes once the picked model is downloaded.'}</span>
       {:else if step > 1 && session.downloadError}
         <span class="min-w-0 break-words text-xs text-rec" role="alert">Models not downloaded: {session.downloadError}</span>
         <button class="{secondary} shrink-0" onclick={() => session.retryDownload()}>Try again</button>
@@ -408,12 +454,16 @@
       {/if}
       {#if finishError}<span class="min-w-0 break-words text-sm text-rec" role="alert">{finishError}</span>{/if}
       <span class="ml-auto"></span>
-      {#if step < steps.length - 1}
+      {#if waiting}
+        <button class={primary} disabled>Opening when done…</button>
+      {:else if step < steps.length - 1}
         <button class={primary} onclick={() => go(step + 1)}>
           {step === 1 && auto ? 'Download and continue' : 'Continue'}
         </button>
       {:else}
-        <button class={primary} disabled={finishing} onclick={() => finish()}>{finishing ? 'Saving…' : 'Finish'}</button>
+        <button class={primary} disabled={finishing} onclick={() => finish()}>
+          {finishing ? 'Saving…' : held ? 'Finish when downloaded' : 'Finish'}
+        </button>
       {/if}
     </div>
   </footer>
