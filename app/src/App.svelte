@@ -46,6 +46,22 @@
     </nav>
 
     <div class="mt-auto space-y-3 px-1">
+      <!-- The download setup started keeps going after it closes. -->
+      {#if session.downloadError}
+        <div class="rounded-2xl bg-rec-soft px-3.5 py-2.5 text-xs" role="alert">
+          <p class="font-semibold text-rec">Models not downloaded</p>
+          <p class="mt-0.5 break-words text-rec">{session.downloadError}</p>
+          <button class="mt-2 rounded-full bg-card px-3 py-1 font-medium hover:bg-soft" onclick={() => session.retryDownload()}>Try again</button>
+        </div>
+      {:else if session.downloading}
+        {@const d = session.download}
+        {@const pct = d?.total ? Math.floor((d.received / d.total) * 100) : 0}
+        <div class="rounded-2xl bg-soft px-3.5 py-2.5 text-xs" role="status">
+          <p class="font-semibold">Downloading models</p>
+          <p class="mt-0.5 truncate text-muted">{d ? `${pct}% · ${d.index + 1} of ${d.count} · ${d.file}` : 'Starting…'}</p>
+          <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-line"><div class="h-full rounded-full bg-ink" style="width: {pct}%"></div></div>
+        </div>
+      {/if}
       {#if session.recording}
         <button
           class="flex w-full items-center gap-2 rounded-2xl bg-rec-soft px-3.5 py-2.5 text-left text-xs font-semibold text-rec"
