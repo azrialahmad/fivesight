@@ -11,6 +11,16 @@
   const chips = ['What did we decide?', 'List the action items', 'Summarize in 3 bullets'];
   const hasThread = $derived(session.chat.length > 0 || session.asking);
 
+  /** Answer just added to the notes, to show "Added" on it for a moment. */
+  let added = $state<number | null>(null);
+  let addedTimer: ReturnType<typeof setTimeout>;
+  function addToNotes(i: number, answer: string) {
+    session.addToNotes(answer);
+    added = i;
+    clearTimeout(addedTimer);
+    addedTimer = setTimeout(() => (added = null), 2000);
+  }
+
   function submit(q: string = text) {
     if (!q.trim() || session.asking) return;
     session.ask(q);
@@ -28,13 +38,22 @@
 <div class="border-t border-line bg-card px-5 pb-4 pt-3">
   {#if hasThread && open}
     <div bind:this={thread} class="mb-3 max-h-[30vh] space-y-3 overflow-y-auto pr-1">
-      {#each session.chat as m}
+      {#each session.chat as m, i}
         {#if m.role === 'user'}
           <div class="rise flex justify-end">
             <p class="max-w-[80%] rounded-2xl rounded-br-md bg-ink px-4 py-2 text-sm text-white">{m.content}</p>
           </div>
         {:else}
-          <div class="rise max-w-[92%] rounded-2xl rounded-bl-md bg-paper px-4 py-3"><Markdown text={m.content} /></div>
+          <div class="rise max-w-[92%]">
+            <div class="rounded-2xl rounded-bl-md bg-paper px-4 py-3"><Markdown text={m.content} /></div>
+            <button
+              class="mt-1 flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium text-muted hover:bg-soft hover:text-ink"
+              title="Add this answer to the end of your notes, formatting and all. To add just part of it, select it, copy and paste it into your notes."
+              onclick={() => addToNotes(i, m.content)}
+            >
+              <Icon name={added === i ? 'check' : 'plus'} size={13} />{added === i ? 'Added to notes' : 'Add to notes'}
+            </button>
+          </div>
         {/if}
       {/each}
       {#if session.lookups.length && (session.asking || session.chat.at(-1)?.role === 'assistant')}

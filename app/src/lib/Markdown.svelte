@@ -1,21 +1,11 @@
 <script lang="ts">
-  import { marked } from 'marked';
-  import DOMPurify from 'dompurify';
   import { markMine } from './mine';
+  import { renderMarkdown } from './markdown';
 
   /** `mine`: the user's own notes. Their lines are shown in ink, what the AI added in grey. */
   let { text, mine = '' }: { text: string; mine?: string } = $props();
 
-  // Model output is untrusted: always sanitize before it reaches {@html}.
-  // [m:ss] citations become highlighter chips.
-  const html = $derived(
-    markMine(
-      DOMPurify.sanitize(
-        marked.parse(text.replace(/\[(\d{1,2}:\d{2})\]/g, '<mark class="cite">$1</mark>'), { async: false, breaks: true }) as string
-      ),
-      mine
-    )
-  );
+  const html = $derived(markMine(renderMarkdown(text), mine));
 
   // A stray link must never navigate the app window away.
   function stopLinks(e: MouseEvent) {

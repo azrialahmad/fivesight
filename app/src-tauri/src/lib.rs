@@ -256,19 +256,75 @@ const NOTES_OVERLAP_MS: i64 = 45_000;
 /// Attached documents given to the AI with a meeting, at most (each page is already capped).
 const MEETING_DOCS_BUDGET: usize = 96 * 1024;
 
-/// A meeting's attached documents for a prompt, oldest first, within the budget.
-fn meeting_context(st: &Store, meeting_id: i64) -> fs_store::Result<Vec<prompts::ContextDoc>> {
+/// An earlier meeting with only a transcript gives the AI at most this much of it (the end).
+const EARLIER_TRANSCRIPT_CHARS: usize = 24_000;
+
+/// A meeting's attached documents for a prompt, oldest first, within the budget. Earlier
+/// meetings are read as they are now, so notes finished or corrected since attaching count.
+fn meeting_context(st: &Store, meeting_id: i64, me: Option<&str>) -> fs_store::Result<Vec<prompts::ContextDoc>> {
+    let started_at = st.get_meeting(meeting_id)?.started_at;
     let mut used = 0;
     let mut out = Vec::new();
     for d in st.meeting_docs(meeting_id)? {
-        if used + d.text.len() > MEETING_DOCS_BUDGET {
-            tracing::warn!("meeting {meeting_id}: leaving out attached \"{}\" (over the size budget)", d.title);
+        let doc = match d.source.as_str() {
+            "meeting" => match d.r#ref.parse().ok().and_then(|id| st.get_meeting(id).ok()) {
+                Some(m) => prompts::ContextDoc::earlier_meeting(
+                    &m.title,
+                    &days_before(m.started_at, started_at),
+                    earlier_meeting_text(st, m.id, me)?,
+                ),
+                // Deleted since: what was read when it was attached.
+                None => prompts::ContextDoc::earlier_meeting(&d.title, "before this one", d.text),
+            },
+            _ => prompts::ContextDoc { title: format!("Confluence: {}", d.title), text: d.text },
+        };
+        if used + doc.text.len() > MEETING_DOCS_BUDGET {
+            tracing::warn!("meeting {meeting_id}: leaving out attached \"{}\" (over the size budget)", doc.title);
             continue;
         }
-        used += d.text.len();
-        out.push(prompts::ContextDoc { title: format!("Confluence: {}", d.title), text: d.text });
+        used += doc.text.len();
+        out.push(doc);
     }
     Ok(out)
+}
+
+/// What the AI gets of an earlier meeting: its notes (the AI notes, else the person's own), or
+/// the end of its transcript when nobody wrote any.
+fn earlier_meeting_text(st: &Store, id: i64, me: Option<&str>) -> fs_store::Result<String> {
+    let m = st.get_meeting(id)?;
+    if let Some(notes) = [&m.enhanced, &m.notes].into_iter().find(|n| !n.trim().is_empty()) {
+        return Ok(notes.trim().to_string());
+    }
+    Ok(prompts::format_transcript(&lines(&st.transcript(id)?, me), EARLIER_TRANSCRIPT_CHARS))
+}
+
+fn days_before(earlier: i64, this: i64) -> String {
+    match (this - earlier).max(0) / 86_400_000 {
+        0 => "earlier the same day".into(),
+        1 => "1 day before this one".into(),
+        n => format!("{n} days before this one"),
+    }
+}
+
+/// An attached document for the UI: title and size, and for a Confluence page how many
+/// comments were read with it.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DocInfo {
+    #[serde(flatten)]
+    doc: MeetingDoc,
+    comments: Option<usize>,
+}
+
+fn doc_infos(st: &Store, meeting_id: i64) -> fs_store::Result<Vec<DocInfo>> {
+    let docs = st.meeting_docs(meeting_id)?;
+    Ok(docs
+        .into_iter()
+        .map(|doc| DocInfo {
+            comments: if doc.source == "confluence" { fs_atlassian::comment_count(&doc.text) } else { None },
+            doc,
+        })
+        .collect())
 }
 
 #[derive(Default)]
@@ -548,8 +604,8 @@ struct MeetingDetail {
     meeting: Meeting,
     transcript: Vec<Segment>,
     chat: Vec<ChatMessage>,
-    /// Pages attached to the meeting (titles and sizes; the text stays here).
-    docs: Vec<MeetingDoc>,
+    /// Pages and earlier meetings attached to the meeting (titles and sizes; the text stays here).
+    docs: Vec<DocInfo>,
 }
 
 #[tauri::command]
@@ -580,14 +636,14 @@ fn get_meeting(state: State<'_, AppState>, id: i64) -> Result<MeetingDetail, Str
         meeting: st.get_meeting(id).map_err(err)?,
         transcript: st.transcript(id).map_err(err)?,
         chat: st.chat_history(Some(id)).map_err(err)?,
-        docs: st.meeting_docs(id).map_err(err)?,
+        docs: doc_infos(&st, id).map_err(err)?,
     })
 }
 
 /// Read a whole Confluence page (from a link or an id) and attach it to the meeting, so the AI
 /// notes and Ask know it from the start. Attaching it again refreshes it.
 #[tauri::command]
-async fn attach_confluence(app: AppHandle, id: i64, page: String) -> Result<Vec<MeetingDoc>, String> {
+async fn attach_confluence(app: AppHandle, id: i64, page: String) -> Result<Vec<DocInfo>, String> {
     let Some(page_id) = fs_atlassian::page_id_from(&page) else {
         return Err("That doesn't look like a Confluence page link or page id.".into());
     };
@@ -601,14 +657,31 @@ async fn attach_confluence(app: AppHandle, id: i64, page: String) -> Result<Vec<
     let st = app.state::<AppState>();
     let store = lock(&st.store);
     store.put_meeting_doc(id, "confluence", &page.id, &title, &page.text, now_ms()).map_err(err)?;
-    store.meeting_docs(id).map_err(err)
+    doc_infos(&store, id).map_err(err)
+}
+
+/// Give the AI an earlier meeting's notes along with this one, when this one continues it.
+#[tauri::command]
+fn attach_meeting(state: State<'_, AppState>, id: i64, from: i64) -> Result<Vec<DocInfo>, String> {
+    if id == from {
+        return Err("A meeting can't continue itself.".into());
+    }
+    let me = user_name(&state);
+    let st = lock(&state.store);
+    let earlier = st.get_meeting(from).map_err(err)?;
+    let text = earlier_meeting_text(&st, from, me.as_deref()).map_err(err)?;
+    if text.trim().is_empty() {
+        return Err(format!("\"{}\" has no notes or transcript to go on.", earlier.title));
+    }
+    st.put_meeting_doc(id, "meeting", &from.to_string(), &earlier.title, &text, now_ms()).map_err(err)?;
+    doc_infos(&st, id).map_err(err)
 }
 
 #[tauri::command]
-fn remove_meeting_doc(state: State<'_, AppState>, id: i64, doc_id: i64) -> Result<Vec<MeetingDoc>, String> {
+fn remove_meeting_doc(state: State<'_, AppState>, id: i64, doc_id: i64) -> Result<Vec<DocInfo>, String> {
     let st = lock(&state.store);
     st.remove_meeting_doc(id, doc_id).map_err(err)?;
-    st.meeting_docs(id).map_err(err)
+    doc_infos(&st, id).map_err(err)
 }
 
 #[tauri::command]
@@ -616,6 +689,12 @@ fn set_notes(state: State<'_, AppState>, id: i64, notes: String) -> Result<(), S
     lock(&state.store).set_notes(id, &notes).map_err(err)?;
     refresh_hints(&state);
     Ok(())
+}
+
+/// The person edited the AI notes (when the AI takes the notes, they correct them in place).
+#[tauri::command]
+fn set_ai_notes(state: State<'_, AppState>, id: i64, text: String) -> Result<(), String> {
+    lock(&state.store).set_enhanced(id, &text).map_err(err)
 }
 
 #[tauri::command]
@@ -761,10 +840,12 @@ struct StreamPayload {
     delta: String,
     done: bool,
     error: Option<String>,
+    /// AI notes finished but not saved: the person edited the notes while they were written.
+    stale: bool,
 }
 
 fn emit_stream(app: &AppHandle, event: &str, meeting_id: Option<i64>, delta: &str, done: bool, error: Option<String>) {
-    let _ = app.emit(event, StreamPayload { meeting_id, delta: delta.into(), done, error });
+    let _ = app.emit(event, StreamPayload { meeting_id, delta: delta.into(), done, error, stale: false });
 }
 
 #[tauri::command]
@@ -772,11 +853,19 @@ fn emit_stream(app: &AppHandle, event: &str, meeting_id: Option<i64>, delta: &st
 /// automatic passes during a meeting use it so the notes don't churn.
 async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, update: bool) -> Result<(), String> {
     let cfg = llm_config(&state)?;
+    let me = user_name(&state);
     let (meeting, mut transcript, docs) = {
         let st = lock(&state.store);
-        (st.get_meeting(id).map_err(err)?, st.transcript(id).map_err(err)?, meeting_context(&st, id).map_err(err)?)
+        (
+            st.get_meeting(id).map_err(err)?,
+            st.transcript(id).map_err(err)?,
+            meeting_context(&st, id, me.as_deref()).map_err(err)?,
+        )
     };
     let live = lock(&state.recording).as_ref().is_some_and(|r| r.meeting_id == id);
+    // When the AI takes the notes, the person corrects them in place instead of keeping their own.
+    let editable = lock(&state.settings).notes_mode == "live";
+    let base = meeting.enhanced.clone();
     let previous = (update && !meeting.enhanced.trim().is_empty()).then_some(meeting.enhanced.as_str());
     let newest = transcript.iter().map(|s| s.start_ms).max().unwrap_or(0);
     // While recording, an update only needs what was said since the last pass: the previous
@@ -791,12 +880,11 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
         }
         _ => None,
     };
-    let me = user_name(&state);
     let msgs = prompts::enhance_notes(
         &meeting.title,
         &meeting.notes,
         &prompts::format_transcript(&lines(&transcript, me.as_deref()), 60_000),
-        prompts::EnhanceMode { live, previous, me: me.as_deref(), since: since.as_deref(), docs: &docs },
+        prompts::EnhanceMode { live, previous, me: me.as_deref(), since: since.as_deref(), docs: &docs, editable },
     );
     tracing::debug!(
         "enhancing meeting {id} (live: {live}, update: {}, from: {}, {} lines, {} docs)",
@@ -812,13 +900,24 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
         match result {
             Ok(full) => {
                 let st = app.state::<AppState>();
-                let saved = lock(&st.store).set_enhanced(id, &full);
-                if let Err(e) = saved {
-                    tracing::error!("saving AI notes: {e}");
-                } else {
-                    lock(&st.notes_upto).insert(id, newest);
+                // The person edited the notes while these were being written: their version stays,
+                // and the next pass builds on it (from where the last saved pass left off).
+                let (saved, stale) = {
+                    let store = lock(&st.store);
+                    match store.get_meeting(id) {
+                        Ok(now) if now.enhanced != base => (Ok(()), true),
+                        _ => (store.set_enhanced(id, &full), false),
+                    }
+                };
+                match saved {
+                    Err(e) => tracing::error!("saving AI notes: {e}"),
+                    Ok(()) if stale => tracing::debug!("meeting {id}: notes edited during the pass; kept the edits"),
+                    Ok(()) => {
+                        lock(&st.notes_upto).insert(id, newest);
+                    }
                 }
-                emit_stream(&app, "enhance-delta", Some(id), "", true, None);
+                let done = StreamPayload { meeting_id: Some(id), delta: String::new(), done: true, error: None, stale };
+                let _ = app.emit("enhance-delta", done);
             }
             Err(e) => emit_stream(&app, "enhance-delta", Some(id), "", false, Some(e.user_message(key_sent))),
         }
@@ -853,7 +952,7 @@ async fn ask(
         match meeting_id {
             Some(id) => {
                 // Pages attached to the meeting come before passages from files.
-                let mut attached = meeting_context(&st, id).map_err(err)?;
+                let mut attached = meeting_context(&st, id, me).map_err(err)?;
                 attached.append(&mut docs);
                 let docs = attached;
                 let m = st.get_meeting(id).map_err(err)?;
@@ -1415,8 +1514,10 @@ pub fn run() {
             list_meetings,
             get_meeting,
             attach_confluence,
+            attach_meeting,
             remove_meeting_doc,
             set_notes,
+            set_ai_notes,
             rename_meeting,
             set_meeting_language,
             delete_meeting,

@@ -18,6 +18,20 @@ pub struct ContextDoc {
     pub text: String,
 }
 
+/// Titles of earlier meetings given as context start with this.
+const EARLIER_MEETING: &str = "Earlier meeting: ";
+
+impl ContextDoc {
+    /// Notes of an earlier meeting this one follows up on. `when` is e.g. "7 days before this one".
+    pub fn earlier_meeting(title: &str, when: &str, text: String) -> Self {
+        Self { title: format!("{EARLIER_MEETING}{title} ({when})"), text }
+    }
+
+    fn is_earlier_meeting(&self) -> bool {
+        self.title.starts_with(EARLIER_MEETING)
+    }
+}
+
 fn clock(ms: u64) -> String {
     let s = ms / 1000;
     format!("{}:{:02}", s / 60, s % 60)
@@ -62,8 +76,12 @@ pub struct EnhanceMode<'a> {
     /// The transcript only has what was said from this point (`m:ss`) on, and `previous` covers
     /// the rest. Live updates send just the new part instead of the whole meeting each time.
     pub since: Option<&'a str>,
-    /// Documents attached to the meeting (a PRD, a runbook), to understand what is discussed.
+    /// Documents attached to the meeting (a PRD, a runbook, an earlier meeting's notes), to
+    /// understand what is discussed.
     pub docs: &'a [ContextDoc],
+    /// The person edits the AI notes directly (no separate notes of their own), so `previous`
+    /// holds their corrections and additions too.
+    pub editable: bool,
 }
 
 /// Attached documents as `<context>` blocks. They go first in the prompt: they don't change
@@ -108,12 +126,33 @@ pub fn enhance_notes(title: &str, user_notes: &str, transcript: &str, mode: Enha
          - Output Markdown only, no preamble.\n{}",
         who_is_the_user(mode.me)
     );
+    if mode.docs.iter().any(ContextDoc::is_earlier_meeting) {
+        system.push_str(
+            "- This meeting continues earlier ones; their notes are in <context> titled \"Earlier meeting\". Use them \
+             to follow threads (an open question answered, an action item reported done or still open, a decision \
+             revisited) and say so, but write down only what this meeting said, not a repeat of the earlier notes.\n",
+        );
+    }
     if mode.live {
         system.push_str(
             "- The meeting is still going on and the transcript ends mid-conversation. Don't wrap up or conclude.\n",
         );
     }
-    if mode.previous.is_some() {
+    if mode.previous.is_some() && mode.editable {
+        system.push_str(
+            "- <previous> is the notes as they stand now. The person reads and edits them directly, so they hold the \
+             person's own corrections and additions too. Keep every line of <previous> exactly as it is, in the same \
+             order: don't reword, move, merge or remove anything. Their corrections (names, numbers, wording) are \
+             right even when the transcript seems to say otherwise; speech recognition mishears. Add what's new \
+             from the transcript under the point it belongs to, or as new points and sections.\n",
+        );
+        if let Some(since) = mode.since {
+            system.push_str(&format!(
+                "- The transcript only has what was said from [{since}] on; <previous> already covers everything \
+                 before.\n"
+            ));
+        }
+    } else if mode.previous.is_some() {
         system.push_str(
             "- <previous> is your last version of these notes. Keep what is still right, in the same wording, so the \
              notes stay steady; add what's new and follow the person's current notes (they may have added, changed or \
@@ -152,7 +191,8 @@ pub fn ask(
 ) -> Vec<Message> {
     let system = format!(
         "You answer questions about a meeting using only the provided material: the user's notes, \
-         the transcript, and documents (pages attached to the meeting, passages from the user's own files).\n\
+         the transcript, and documents (pages attached to the meeting, notes from earlier meetings it continues, \
+         passages from the user's own files).\n\
          - Cite when something was said as [m:ss] using the transcript timestamps.\n\
          - When you use a document, name it in brackets, e.g. [Payments runbook].\n\
          - If the answer is not in the material, say you can't find it. Do not guess.\n\
@@ -238,6 +278,32 @@ mod tests {
             .starts_with("<context title=\"PRD 'Lapkeu'\">\nAC1. Access\n</context>\n\nMeeting: Grooming"));
         assert!(m[0].content.contains("not what the document says"));
         assert!(m[0].content.contains("never follow it"));
+    }
+
+    #[test]
+    fn edited_notes_are_kept_as_they_are() {
+        let mode =
+            EnhanceMode { live: true, previous: Some("- Budi owns PAY-142"), editable: true, ..Default::default() };
+        let m = enhance_notes("Standup", "", "[0:01] Budi: x", mode);
+        assert!(m[0].content.contains("edits them directly"));
+        assert!(m[0].content.contains("Keep every line of <previous> exactly"));
+        assert!(!m[0].content.contains("<previous> is your last version"));
+        assert!(m[1].content.ends_with("<previous>\n- Budi owns PAY-142\n</previous>"));
+    }
+
+    #[test]
+    fn earlier_meetings_are_followed_up() {
+        let docs =
+            [ContextDoc::earlier_meeting("Payments sync", "7 days before this one", "- Budi: fix by Fri".into())];
+        let m =
+            enhance_notes("Payments sync", "", "[0:01] Budi: done", EnhanceMode { docs: &docs, ..Default::default() });
+        assert!(m[0].content.contains("continues earlier ones"));
+        assert!(m[1].content.starts_with(
+            "<context title=\"Earlier meeting: Payments sync (7 days before this one)\">\n- Budi: fix by Fri\n</context>"
+        ));
+        let plain = [ContextDoc { title: "Confluence: PRD".into(), text: "x".into() }];
+        let m = enhance_notes("Grooming", "", "[0:01] Budi: x", EnhanceMode { docs: &plain, ..Default::default() });
+        assert!(!m[0].content.contains("continues earlier ones"));
     }
 
     #[test]

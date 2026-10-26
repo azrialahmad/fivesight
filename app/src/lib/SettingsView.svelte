@@ -7,7 +7,7 @@
   import { onMount } from 'svelte';
 
   const notesModes: [Settings['notesMode'], string, string][] = [
-    ['live', 'The AI takes notes as the meeting goes', 'Your notes, if you jot any, are the outline. A small AI request every couple of minutes while recording, and one when you stop.'],
+    ['live', 'The AI takes notes as the meeting goes', 'One page: the AI writes, you correct and add to it, and it keeps your edits. A small AI request every couple of minutes while recording, and one when you stop.'],
     ['end', 'I take notes, the AI enhances them', 'One AI request when you stop recording, from the whole meeting.'],
     ['manual', 'Only when I press Enhance', 'Nothing goes to the AI until you ask.']
   ];

@@ -83,6 +83,11 @@ class Session {
   enhancing = $derived(this.enhancingId !== null && this.enhancingId === this.current?.id);
 
   private notesTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Edits not yet saved: your notes, and (when the AI takes the notes) your edits to its notes. */
+  private notesDirty = false;
+  private aiDirty = false;
+  /** You edited the AI notes while the pass being written started from the old version. */
+  private editedDuringPass = false;
   private ready = false;
 
   // Automatic AI notes for the meeting being recorded (which need not be the one on screen).
@@ -246,7 +251,39 @@ class Session {
   setNotes(text: string) {
     if (!this.current) return;
     this.current.notes = text;
-    if (this.current.id === this.recordingMeetingId) this.notesEditedAt = Date.now();
+    this.notesDirty = true;
+    this.edited();
+  }
+
+  /** You edited the AI notes (when the AI takes the notes, you correct them in place). */
+  setAiNotes(text: string) {
+    if (!this.current) return;
+    this.current.enhanced = text;
+    this.aiDirty = true;
+    if (this.enhancingId === this.current.id) {
+      this.editedDuringPass = true;
+      // Save right away, so the pass being written sees the edit and doesn't overwrite it.
+      this.flushNotes();
+    } else this.edited();
+  }
+
+  /** What the single notes page shows when the AI takes the notes. */
+  get liveDoc(): string {
+    const m = this.current;
+    return m ? m.enhanced || m.notes : '';
+  }
+
+  /** Add Markdown (an Ask answer) to the end of the notes you're writing, formatting and all. */
+  addToNotes(markdown: string) {
+    const add = markdown.trim();
+    if (!this.current || !add) return;
+    const join = (doc: string) => (doc.trim() ? `${doc.trimEnd()}\n\n${add}` : add);
+    if (this.settings.notesMode === 'live') this.setAiNotes(join(this.liveDoc));
+    else this.setNotes(join(this.current.notes));
+  }
+
+  private edited() {
+    if (this.current?.id === this.recordingMeetingId) this.notesEditedAt = Date.now();
     if (this.notesTimer) clearTimeout(this.notesTimer);
     this.notesTimer = setTimeout(() => this.flushNotes(), 600);
   }
@@ -254,7 +291,14 @@ class Session {
   async flushNotes() {
     if (this.notesTimer) clearTimeout(this.notesTimer);
     this.notesTimer = null;
-    if (this.current) await api.setNotes(this.current.id, this.current.notes).catch(() => {});
+    const m = this.current;
+    if (!m) return;
+    const [notes, ai] = [this.notesDirty, this.aiDirty];
+    this.notesDirty = this.aiDirty = false;
+    await Promise.all([
+      notes && api.setNotes(m.id, m.notes).catch(() => {}),
+      ai && api.setAiNotes(m.id, m.enhanced).catch(() => {})
+    ]);
   }
 
   async rename(title: string) {
@@ -285,11 +329,14 @@ class Session {
     await this.refreshMeetings();
   }
 
-  /** Write the AI notes from scratch now (the Enhance button). */
+  /**
+   * The Enhance button: write the AI notes from scratch now. When the AI takes the notes you
+   * edit them in place, so it catches them up with the meeting instead, keeping your edits.
+   */
   async enhance() {
     if (!this.current || this.enhancingId !== null) return;
     this.error = null;
-    await this.runEnhance(this.current.id, false);
+    await this.runEnhance(this.current.id, false, this.settings.notesMode === 'live');
   }
 
   /** `update` builds on the last AI notes (live passes) instead of writing them fresh. */
@@ -298,6 +345,7 @@ class Session {
     this.enhancingId = id;
     this.enhancingAuto = auto;
     this.enhancedLive = '';
+    this.editedDuringPass = false;
     try {
       // Live passes build on the last AI notes so they don't churn.
       await api.enhance(id, update);
@@ -318,7 +366,16 @@ class Session {
     if (e.error) {
       this.enhanceFailed(e.error);
     } else if (e.done) {
-      if (this.current?.id === e.meetingId) this.current.enhanced = this.enhancedLive;
+      // Your edits made while it was written win over the pass; the next one builds on them.
+      const here = this.current?.id === e.meetingId;
+      if (this.editedDuringPass) {
+        // It was saved just before your edit reached the app: save yours over it.
+        if (here && !e.stale) {
+          this.aiDirty = true;
+          this.flushNotes();
+        }
+      } else if (here && !e.stale) this.current!.enhanced = this.enhancedLive;
+      this.editedDuringPass = false;
       if (this.enhancingAuto) this.autoError = null;
       this.enhancingId = null;
       this.enhancedLive = '';
@@ -393,6 +450,24 @@ class Session {
     this.attachError = null;
     try {
       const docs = await api.attachConfluence(id, link.trim());
+      if (this.current?.id === id) this.docs = docs;
+      return true;
+    } catch (e) {
+      if (this.current?.id === id) this.attachError = String(e);
+      return false;
+    } finally {
+      this.attaching = false;
+    }
+  }
+
+  /** Give the AI an earlier meeting's notes with the open one, which continues it. */
+  async attachMeeting(from: number): Promise<boolean> {
+    if (!this.current || this.attaching) return false;
+    const id = this.current.id;
+    this.attaching = true;
+    this.attachError = null;
+    try {
+      const docs = await api.attachMeeting(id, from);
       if (this.current?.id === id) this.docs = docs;
       return true;
     } catch (e) {
