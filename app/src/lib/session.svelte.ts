@@ -1,5 +1,5 @@
 import { api, inTauri } from './api';
-import type { AskLookup, AskSources, CallEvent, ChatMsg, Hit, KbAddResult, KbDoc, Meeting, MeetingDoc, MeetingSummary, NotesMode, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
+import type { AskLookup, AskSources, CallEvent, ChatMsg, DownloadEvent, Hit, KbAddResult, KbDoc, Meeting, MeetingDoc, MeetingSummary, NotesMode, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
 export { inTauri };
 export type View = 'home' | 'meeting' | 'settings' | 'knowledge';
@@ -73,6 +73,14 @@ class Session {
 
   /** The first-run setup is showing (on first start, or from Settings → Run setup). */
   setupOpen = $state(false);
+  /**
+   * The model download setup started. It keeps going after setup closes, so its progress and why
+   * it failed live here rather than in Setup.svelte.
+   */
+  downloading = $state(false);
+  download = $state<DownloadEvent | null>(null);
+  downloadError = $state<string | null>(null);
+  private downloadIds: string[] = [];
 
   drawer = $state(false);
   query = $state('');
@@ -121,9 +129,7 @@ class Session {
       api.onEnhance((e) => this.onEnhance(e)),
       api.onAsk((e) => this.onAsk(e)),
       // A download started in setup can finish after setup closes.
-      api.onModelDownload(async (e) => {
-        if (e.done) this.modelsDir = (await api.status()).modelsDir;
-      })
+      api.onModelDownload((e) => this.onDownload(e))
     ]);
     const [status, settings] = await Promise.all([api.status(), api.getSettings()]);
     this.recording = status.recording;
@@ -581,6 +587,39 @@ class Session {
 
   openSetup() {
     this.setupOpen = true;
+  }
+
+  /** Download the voice detection model if it's missing, and these speech models. Progress arrives as events. */
+  async downloadModels(speechModels: string[]) {
+    this.downloadIds = speechModels;
+    this.downloadError = null;
+    this.download = null;
+    this.downloading = true;
+    try {
+      // With nothing to fetch the backend still sends "done".
+      await api.downloadModels(speechModels);
+    } catch (e) {
+      this.downloadError = String(e);
+      this.downloading = false;
+    }
+  }
+
+  retryDownload() {
+    return this.downloadModels(this.downloadIds);
+  }
+
+  private async onDownload(e: DownloadEvent) {
+    if (e.error) {
+      this.downloadError = e.error;
+      this.downloading = false;
+      this.download = null;
+    } else if (e.done) {
+      this.downloading = false;
+      this.download = null;
+      this.modelsDir = (await api.status()).modelsDir;
+    } else {
+      this.download = e;
+    }
   }
 
   /** Save what the setup chose and close it. Also used to skip it (with the current settings). */

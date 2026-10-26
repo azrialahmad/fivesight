@@ -3,6 +3,7 @@
   import { session } from './session.svelte';
   import { api } from './api';
   import { presets, presetFor, isLocalUrl } from './providers';
+  import { missingModels, startsDownload } from './downloads';
   import type { AtlassianStatus, BridgeStatus, DownloadEvent, LocalServer, Settings, SetupInfo } from './api';
   import { onMount } from 'svelte';
 
@@ -43,8 +44,9 @@
     const pollBridge = () => api.getBridge().then((b) => (bridge = b)).catch(() => {});
     pollBridge();
     const bridgeTimer = setInterval(pollBridge, 3000);
+    // Progress itself is tracked by the session; here, only notice what's on disk now.
     let off: (() => void) | undefined;
-    api.onModelDownload(onProgress).then((o) => (off = o));
+    api.onModelDownload((e) => (e.done || e.error) && refresh()).then((o) => (off = o));
     return () => {
       clearInterval(bridgeTimer);
       off?.();
@@ -56,29 +58,11 @@
 
   // ---------- downloads ----------
 
-  let dl = $state<DownloadEvent | null>(null);
-  let downloading = $state(false);
-  let dlError = $state<string | null>(null);
-
   const wanted = $derived([active, ...extras.filter((x) => x !== active)]);
-  const missing = $derived(info ? info.speechModels.filter((m) => wanted.includes(m.id) && !m.present) : []);
-  const missingBytes = $derived(missing.reduce((n, m) => n + m.bytes, 0) + (info && !info.vadPresent ? 2_327_524 : 0));
+  const missing = $derived(info ? missingModels(info, wanted) : null);
   const activeReady = $derived(!!info && info.vadPresent && !!info.speechModels.find((m) => m.id === active)?.present);
-
-  function onProgress(e: DownloadEvent) {
-    if (e.error) {
-      dlError = e.error;
-      downloading = false;
-      dl = null;
-      refresh();
-    } else if (e.done) {
-      downloading = false;
-      dl = null;
-      refresh();
-    } else {
-      dl = e;
-    }
-  }
+  const dl = $derived(session.download);
+  const pct = (e: DownloadEvent) => (e.total ? Math.floor((e.received / e.total) * 100) : 0);
 
   async function refresh() {
     try {
@@ -86,19 +70,24 @@
     } catch {}
   }
 
-  async function download() {
-    dlError = null;
-    downloading = true;
-    try {
-      const files = await api.downloadModels(wanted);
-      if (!files.length) {
-        downloading = false;
-        await refresh();
-      }
-    } catch (e) {
-      dlError = String(e);
-      downloading = false;
-    }
+  /** Paused by hand: leave it paused until Download is pressed again. */
+  let paused = $state(false);
+  const auto = $derived(!paused && startsDownload(info, wanted, session.downloading));
+
+  function download() {
+    paused = false;
+    session.downloadModels(wanted);
+  }
+
+  function pause() {
+    paused = true;
+    api.cancelDownload();
+  }
+
+  /** Moving on from the speech model step (or finishing) downloads what was picked, unasked. */
+  function go(to: number) {
+    if (to > 1 && auto) download();
+    step = to;
   }
 
   function toggleExtra(id: string) {
@@ -142,7 +131,10 @@
     finishError = null;
     try {
       if (skip) await session.finishSetup(session.settings, null);
-      else await session.finishSetup({ ...form, speechModel: active }, apiKey.trim() || null);
+      else {
+        if (auto) download();
+        await session.finishSetup({ ...form, speechModel: active }, apiKey.trim() || null);
+      }
     } catch (e) {
       finishError = String(e);
     } finally {
@@ -179,7 +171,7 @@
       <ol class="flex gap-2" aria-label="Setup steps">
         {#each steps as s, i}
           <li class="flex-1">
-            <button class="w-full text-left" onclick={() => (step = i)} aria-current={step === i ? 'step' : undefined}>
+            <button class="w-full text-left" onclick={() => go(i)} aria-current={step === i ? 'step' : undefined}>
               <span class="block h-1 rounded-full {i <= step ? 'bg-ink' : 'bg-line'}"></span>
               <span class="mt-1.5 block text-xs {i === step ? 'font-semibold' : 'text-muted'}">{i + 1}. {s}</span>
             </button>
@@ -276,25 +268,26 @@
           </p>
 
           <div class="mt-4 rounded-2xl bg-soft px-5 py-4">
-            {#if downloading}
+            {#if session.downloading}
               {#if dl}
-                {@const pct = dl.total ? Math.floor((dl.received / dl.total) * 100) : 0}
                 <p class="text-sm font-medium">Downloading {dl.file} <span class="text-muted">({dl.index + 1} of {dl.count})</span></p>
                 <div class="mt-2 h-2 overflow-hidden rounded-full bg-line">
-                  <div class="h-full rounded-full bg-ink transition-[width]" style="width: {pct}%"></div>
+                  <div class="h-full rounded-full bg-ink transition-[width]" style="width: {pct(dl)}%"></div>
                 </div>
-                <p class="mt-1.5 text-xs text-muted">{size(dl.received)} of {size(dl.total)} · {pct}%</p>
+                <p class="mt-1.5 text-xs text-muted">{size(dl.received)} of {size(dl.total)} · {pct(dl)}%</p>
               {:else}
                 <p class="text-sm text-muted">Starting…</p>
               {/if}
-              <button class="{secondary} mt-3" onclick={() => api.cancelDownload()}>Pause download</button>
-            {:else if missing.length || !info.vadPresent}
-              <p class="text-sm">{size(missingBytes)} to download. If it stops, it picks up where it left off.</p>
-              <button class="{primary} mt-3" onclick={download}>Download</button>
+              <button class="{secondary} mt-3" onclick={pause}>Pause download</button>
+            {:else if missing?.any}
+              <p class="text-sm">
+                {size(missing.bytes)} to download{auto ? ', starting when you continue' : ''}. If it stops, it picks up where it left off.
+              </p>
+              <button class="{primary} mt-3" onclick={download}>{session.downloadError ? 'Try again' : 'Download now'}</button>
             {:else}
               <p class="flex items-center gap-2 text-sm font-medium"><Icon name="check" size={18} /> Everything you picked is downloaded.</p>
             {/if}
-            {#if dlError}<p class="mt-2 break-words text-sm text-rec" role="alert">{dlError}</p>{/if}
+            {#if session.downloadError}<p class="mt-2 break-words text-sm text-rec" role="alert">{session.downloadError}</p>{/if}
           </div>
         {:else}
           <p class="mt-6 text-sm text-muted">Looking at this PC…</p>
@@ -402,14 +395,23 @@
 
   <footer class="border-t border-line">
     <div class="mx-auto flex max-w-2xl items-center gap-3 px-8 py-3">
-      {#if step > 0}<button class={secondary} onclick={() => step--}>Back</button>{/if}
+      {#if step > 0}<button class={secondary} onclick={() => go(step - 1)}>Back</button>{/if}
       {#if step === 1 && info && !activeReady}
-        <span class="text-xs text-muted">{downloading ? 'You can keep going while it downloads.' : 'Recording needs the picked model downloaded.'}</span>
+        <span class="text-xs text-muted">{session.downloading ? 'You can keep going while it downloads.' : 'Recording needs the picked model downloaded.'}</span>
+      {:else if step > 1 && session.downloadError}
+        <span class="min-w-0 break-words text-xs text-rec" role="alert">Models not downloaded: {session.downloadError}</span>
+        <button class="{secondary} shrink-0" onclick={() => session.retryDownload()}>Try again</button>
+      {:else if step > 1 && session.downloading}
+        <span class="text-xs text-muted" role="status">
+          {dl ? `Downloading ${dl.file} (${dl.index + 1} of ${dl.count}) · ${pct(dl)}%` : 'Starting the download…'}
+        </span>
       {/if}
       {#if finishError}<span class="min-w-0 break-words text-sm text-rec" role="alert">{finishError}</span>{/if}
       <span class="ml-auto"></span>
       {#if step < steps.length - 1}
-        <button class={primary} onclick={() => step++}>Continue</button>
+        <button class={primary} onclick={() => go(step + 1)}>
+          {step === 1 && auto ? 'Download and continue' : 'Continue'}
+        </button>
       {:else}
         <button class={primary} disabled={finishing} onclick={() => finish()}>{finishing ? 'Saving…' : 'Finish'}</button>
       {/if}
