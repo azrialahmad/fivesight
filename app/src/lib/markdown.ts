@@ -1,16 +1,15 @@
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
+import { citeChips } from './cite';
 import { htmlToMarkdown } from './htmlmd';
 
 /**
  * Notes Markdown as HTML. Model output is untrusted: it is always sanitized here before it
- * reaches {@html} or an editor. [m:ss] citations become highlighter chips; in an editor they
- * are one piece you can delete but not type into.
+ * reaches {@html} or an editor. [m:ss] citations become highlighter chips (see cite.ts); in an
+ * editor they are one piece you can delete but not type into.
  */
 export function renderMarkdown(text: string, editable = false): string {
-  const html = DOMPurify.sanitize(
-    marked.parse(text.replace(/\[(\d{1,2}:\d{2})\]/g, '<mark class="cite">$1</mark>'), { async: false, breaks: true }) as string
-  );
+  const html = DOMPurify.sanitize(marked.parse(citeChips(text), { async: false, breaks: true }) as string);
   return editable ? html.replaceAll('<mark class="cite">', '<mark class="cite" contenteditable="false">') : html;
 }
 

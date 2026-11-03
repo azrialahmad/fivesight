@@ -52,8 +52,8 @@ function inline(n: HtmlNode): string {
     case 'CODE':
       return wrap((n.textContent ?? '').replace(/\s+/g, ' '), '`');
     case 'MARK':
-      // A citation chip shows "0:07"; the notes say "[0:07]".
-      return /^\d{1,2}:\d{2}$/.test((n.textContent ?? '').trim()) ? `[${n.textContent!.trim()}]` : inner();
+      // A citation chip shows "0:07"; the notes say "[0:07]". Same times as cite.ts.
+      return /^\d{1,3}:\d{2}(?::\d{2})?$/.test((n.textContent ?? '').trim()) ? `[${n.textContent!.trim()}]` : inner();
     case 'A': {
       const href = n.getAttribute?.('href') ?? '';
       const text = inner();
