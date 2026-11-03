@@ -38,6 +38,9 @@ audio), so it works with any meeting app.
 - **Google Meet extension (optional).** Names who is speaking in the transcript and offers to
   start recording when you join a call. It never sends audio or video, shows nothing on the Meet
   page, and only talks to the app on `127.0.0.1`.
+- **For AI agents (optional).** `fivesight-mcp` lets Claude Code, Claude Desktop, Cursor or any
+  other MCP client read your meetings, notes, transcripts and files. Read-only: it can't record,
+  edit or delete anything.
 - **Bring your own model.** Any OpenAI-compatible endpoint: OpenRouter, OpenAI, Gemini, Groq,
   Together, a company gateway, or a local server such as Ollama or LM Studio. Keys are stored in
   Windows Credential Manager, one per server.
@@ -48,6 +51,8 @@ audio), so it works with any meeting app.
   local SQLite database.
 - Meeting text, matching file passages and ticket text go to the AI model you configure, only
   when you enhance notes or ask a question. Use a local model to keep everything on your PC.
+- If you connect an agent with `fivesight-mcp`, the meetings and files it reads go to that
+  agent's AI model.
 - **Tell people you're transcribing.** fivesight doesn't hide; please don't use it to.
 
 ## Requirements
@@ -118,6 +123,32 @@ confluence init
 
 **Settings → Jira & Confluence** shows what fivesight can see.
 
+### AI agents (MCP)
+
+`fivesight-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio.
+It opens fivesight's database read-only, so it works whether or not the app is running. Build it:
+
+```
+cargo build --release -p fivesight-mcp
+```
+
+Then add `target\release\fivesight-mcp.exe` to your agent as a stdio server. For Claude Code:
+
+```
+claude mcp add fivesight -- C:\path\to\fivesight\target\release\fivesight-mcp.exe
+```
+
+It reads `%LOCALAPPDATA%\dev.fivesight.app\fivesight.db`; pass `--db <path>` or set
+`FIVESIGHT_DB` to read another. Tools:
+
+| Tool | What it returns |
+|---|---|
+| `list_meetings` | Meetings, newest first, with ids, start times and transcript length |
+| `get_meeting` | Your notes, the AI notes, and attached documents |
+| `get_transcript` | `[m:ss] Speaker: text` lines, in pages for long meetings |
+| `search_transcripts` | Matching lines across all meetings, with meeting id and time |
+| `list_files`, `search_files` | Your files, and passages that match a question |
+
 ## Project layout
 
 | Path | What |
@@ -133,6 +164,7 @@ confluence init
 | `crates/fs-atlassian` | Read-only `acli` and `confluence-cli` wrappers and their allowlists |
 | `crates/fs-bridge` | Local endpoint for the Meet extension |
 | `extension/` | Chrome extension for Google Meet speaker names |
+| `mcp/` | Read-only MCP server so AI agents can read meetings and files |
 | `cli/` | Headless benchmark, recording replay and live-transcription tool for tuning |
 
 ## Contributing

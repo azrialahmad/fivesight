@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -324,6 +324,18 @@ fn fts_query(q: &str) -> Option<String> {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Self::init(Connection::open(path)?)
+    }
+
+    /// For readers outside the app (the MCP server): no schema changes, and every write fails.
+    /// The app brings the file up to date when it starts, so this expects a current schema.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
+        )?;
+        // The app may be writing a transcript line at this moment; wait briefly rather than fail.
+        conn.busy_timeout(std::time::Duration::from_secs(2))?;
+        Ok(Self { conn })
     }
 
     pub fn open_memory() -> Result<Self> {
@@ -678,6 +690,31 @@ mod tests {
         assert_eq!(s.meeting_docs(m).unwrap().len(), 1);
         s.delete_meeting(m).unwrap();
         assert!(s.meeting_docs(m).unwrap().is_empty());
+    }
+
+    #[test]
+    fn read_only_sees_the_apps_writes_and_cannot_write() {
+        let dir = std::env::temp_dir().join(format!("fs-store-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("fivesight.db");
+        let app = Store::open(&path).unwrap();
+        let id = app.create_meeting("Standup", 1).unwrap();
+        let reader = Store::open_read_only(&path).unwrap();
+        assert_eq!(reader.get_meeting(id).unwrap().title, "Standup");
+        // A line the app adds afterwards shows up on the next read.
+        app.add_segment(id, "mic", 1, 0, "hello").unwrap();
+        assert_eq!(reader.transcript(id).unwrap().len(), 1);
+        assert!(reader.set_notes(id, "nope").is_err());
+        assert!(reader.create_meeting("nope", 2).is_err());
+        drop((app, reader));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_only_never_creates_a_database() {
+        let path = std::env::temp_dir().join(format!("fs-store-missing-{}.db", std::process::id()));
+        assert!(Store::open_read_only(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]
