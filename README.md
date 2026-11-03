@@ -23,8 +23,8 @@ audio), so it works with any meeting app.
   notes and the transcript. Or let the AI take the notes on one page that you correct and add to
   as it goes; it keeps your edits. The live transcript stays in a drawer.
 - **Follow-up meetings.** Attach the earlier meeting a call continues, and the AI notes and Ask
-  pick up its open questions and action items. Attach a Confluence page to read it in full, with
-  its comment threads.
+  pick up its open questions and action items. Attach a Confluence page (read in full, with its
+  comment threads) or a Jira ticket (its details, description and latest comments) the same way.
 - **Ask.** Questions about the open meeting or all past meetings, answered with `[m:ss]`
   timestamp citations. Add an answer to your notes in one click; pasted text keeps its formatting.
 - **Your files.** Add Markdown, text and PDF files; Ask uses the passages that match a question
@@ -58,7 +58,8 @@ audio), so it works with any meeting app.
 ## Requirements
 
 - Windows 10 or 11
-- An NVIDIA GPU with a recent driver (CUDA). About 2 GB of VRAM for `large-v3-turbo`.
+- An NVIDIA GPU with a recent driver (CUDA). About 2.3 GB of VRAM for the default speech model
+  (`large-v3-turbo`); the smaller ones need from about 600 MB.
 
 ## Building from source
 
@@ -73,13 +74,6 @@ Install:
 capability 12.0 (RTX 50 series); set `FS_CUDA_ARCH` for other cards, e.g. `86` for RTX 30 or
 `89` for RTX 40.
 
-Download the speech models into `%LOCALAPPDATA%\fivesight\models`:
-
-- `ggml-large-v3-turbo.bin` from
-  [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)
-- `silero_vad.onnx` from
-  [snakers4/silero-vad](https://github.com/snakers4/silero-vad/tree/master/src/silero_vad/data)
-
 Then run the app in development mode:
 
 ```
@@ -90,6 +84,14 @@ scripts\dev.bat
 ```
 
 The first build takes several minutes (whisper.cpp with CUDA).
+
+On first run, setup suggests a speech model that fits your graphics card and downloads it, along
+with the voice detector, into `%LOCALAPPDATA%\fivesight\models`. Each file is checked against a
+pinned SHA-256. To use files you already have, put them there (or point `FIVESIGHT_MODELS` at
+their folder): a Whisper model such as `ggml-large-v3-turbo.bin` from
+[ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main), and
+`silero_vad.onnx` from
+[snakers4/silero-vad](https://github.com/snakers4/silero-vad/tree/master/src/silero_vad/data).
 
 ### Meet extension
 
