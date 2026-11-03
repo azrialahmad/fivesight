@@ -442,14 +442,14 @@ class Session {
     }
   }
 
-  /** Read a Confluence page in full and attach it to the open meeting. */
-  async attachPage(link: string): Promise<boolean> {
+  /** Read a Confluence page in full, or a Jira ticket, and attach it to the open meeting. */
+  async attachPage(link: string, kind: 'confluence' | 'jira' = 'confluence'): Promise<boolean> {
     if (!this.current || this.attaching || !link.trim()) return false;
     const id = this.current.id;
     this.attaching = true;
     this.attachError = null;
     try {
-      const docs = await api.attachConfluence(id, link.trim());
+      const docs = await (kind === 'jira' ? api.attachJira : api.attachConfluence)(id, link.trim());
       if (this.current?.id === id) this.docs = docs;
       return true;
     } catch (e) {

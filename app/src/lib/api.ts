@@ -189,11 +189,11 @@ export interface KbDoc {
 
 export type NotesMode = 'live' | 'end' | 'manual';
 
-/** Something attached to one meeting: a Confluence page read in full, or an earlier meeting it continues. */
+/** Something attached to one meeting: a Confluence page read in full, a Jira ticket, or an earlier meeting it continues. */
 export interface MeetingDoc {
   id: number;
-  source: 'confluence' | 'meeting' | string;
-  /** The page id, or the earlier meeting's id. */
+  source: 'confluence' | 'jira' | 'meeting' | string;
+  /** The page id, the ticket key, or the earlier meeting's id. */
   ref: string;
   title: string;
   bytes: number;
@@ -252,6 +252,8 @@ export interface Api {
   getMeeting(id: number): Promise<{ meeting: Meeting; transcript: StoredSeg[]; chat: ChatMsg[]; docs: MeetingDoc[] }>;
   /** Read a whole Confluence page (link or id) and attach it to the meeting. Returns the meeting's docs. */
   attachConfluence(id: number, page: string): Promise<MeetingDoc[]>;
+  /** Read a Jira ticket (key or link) and attach it to the meeting. Returns the meeting's docs. */
+  attachJira(id: number, issue: string): Promise<MeetingDoc[]>;
   /** Give the AI an earlier meeting's notes with this one (a meeting that continues it). Returns the meeting's docs. */
   attachMeeting(id: number, from: number): Promise<MeetingDoc[]>;
   removeMeetingDoc(id: number, docId: number): Promise<MeetingDoc[]>;
@@ -315,6 +317,7 @@ const tauriApi: Api = {
   listMeetings: () => invoke('list_meetings'),
   getMeeting: (id) => invoke('get_meeting', { id }),
   attachConfluence: (id, page) => invoke('attach_confluence', { id, page }),
+  attachJira: (id, issue) => invoke('attach_jira', { id, issue }),
   attachMeeting: (id, from) => invoke('attach_meeting', { id, from }),
   removeMeetingDoc: (id, docId) => invoke('remove_meeting_doc', { id, docId }),
   newMeeting: () => invoke('new_meeting'),
@@ -481,6 +484,15 @@ function createMockApi(): Api {
       if (!ref) throw "That doesn't look like a Confluence page link or page id.";
       const list = (docs[id] ??= []).filter((d) => d.ref !== ref);
       list.push({ id: docNext++, source: 'confluence', ref, title: 'Laporan Keuangan PRD', bytes: 28_765, addedAt: Date.now(), comments: 7 });
+      docs[id] = list;
+      return [...list];
+    },
+    attachJira: async (id, issue) => {
+      await new Promise((r) => setTimeout(r, 700));
+      const ref = /(?:browse\/|selectedIssue=)?([A-Za-z][A-Za-z0-9_]*-\d+)/.exec(issue)?.[1]?.toUpperCase();
+      if (!ref) throw "That doesn't look like a Jira ticket key (PAY-142) or link.";
+      const list = (docs[id] ??= []).filter((d) => !(d.source === 'jira' && d.ref === ref));
+      list.push({ id: docNext++, source: 'jira', ref, title: 'Checkout times out on staging', bytes: 2_310, addedAt: Date.now(), comments: null });
       docs[id] = list;
       return [...list];
     },

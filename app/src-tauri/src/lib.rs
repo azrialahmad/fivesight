@@ -276,6 +276,7 @@ fn meeting_context(st: &Store, meeting_id: i64, me: Option<&str>) -> fs_store::R
                 // Deleted since: what was read when it was attached.
                 None => prompts::ContextDoc::earlier_meeting(&d.title, "before this one", d.text),
             },
+            "jira" => prompts::ContextDoc { title: format!("Jira {}: {}", d.r#ref, d.title), text: d.text },
             _ => prompts::ContextDoc { title: format!("Confluence: {}", d.title), text: d.text },
         };
         if used + doc.text.len() > MEETING_DOCS_BUDGET {
@@ -657,6 +658,26 @@ async fn attach_confluence(app: AppHandle, id: i64, page: String) -> Result<Vec<
     let st = app.state::<AppState>();
     let store = lock(&st.store);
     store.put_meeting_doc(id, "confluence", &page.id, &title, &page.text, now_ms()).map_err(err)?;
+    doc_infos(&store, id).map_err(err)
+}
+
+/// Read a Jira ticket (from a key or a link) and attach it to the meeting, so the AI notes and
+/// Ask know it from the start. Attaching it again refreshes it.
+#[tauri::command]
+async fn attach_jira(app: AppHandle, id: i64, issue: String) -> Result<Vec<DocInfo>, String> {
+    let Some(key) = fs_atlassian::issue_key_from(&issue) else {
+        return Err("That doesn't look like a Jira ticket key (PAY-142) or link.".into());
+    };
+    if !lock(&app.state::<AppState>().settings).atlassian {
+        return Err("Jira and Confluence are turned off in Settings.".into());
+    }
+    let read = tauri::async_runtime::spawn_blocking(move || fs_atlassian::read_issue(&key)).await.map_err(err)?;
+    let issue = read.map_err(err)?;
+    let title = issue.summary.clone().unwrap_or_else(|| issue.key.clone());
+    tracing::info!("attached Jira {} ({} bytes) to meeting {id}", issue.key, issue.text.len());
+    let st = app.state::<AppState>();
+    let store = lock(&st.store);
+    store.put_meeting_doc(id, "jira", &issue.key, &title, &issue.text, now_ms()).map_err(err)?;
     doc_infos(&store, id).map_err(err)
 }
 
@@ -1514,6 +1535,7 @@ pub fn run() {
             list_meetings,
             get_meeting,
             attach_confluence,
+            attach_jira,
             attach_meeting,
             remove_meeting_doc,
             set_notes,

@@ -41,13 +41,18 @@
     ['manual', 'Only when I press Enhance', 'Nothing is sent to the AI until you press Enhance.']
   ];
 
+  // Adding a Confluence page or a Jira ticket: both take a link (or an id / key) in the same field.
   let pageLink = $state('');
-  let addingPage = $state(false);
+  let adding = $state<'confluence' | 'jira' | null>(null);
   async function attach() {
-    if (await session.attachPage(pageLink)) {
+    if (adding && (await session.attachPage(pageLink, adding))) {
       pageLink = '';
-      addingPage = false;
+      adding = null;
     }
+  }
+  function cancelAdding() {
+    adding = null;
+    session.attachError = null;
   }
   const kb = (n: number) => (n < 1024 ? `${n} B` : `${Math.round(n / 1024)} KB`);
 
@@ -74,6 +79,7 @@
   const earlier = (d: MeetingDoc) => session.meetings.find((x) => String(x.id) === d.ref);
   function docTitle(d: MeetingDoc): string {
     if (d.source === 'meeting') return 'Earlier meeting. The AI notes and Ask read its notes, to follow up on what was decided and still open.';
+    if (d.source === 'jira') return `Jira ${d.ref}: its details, description and latest comments. The AI notes and Ask use it.`;
     const comments =
       d.comments == null ? "Its comments couldn't be read." : 'With its comments (inline, footer and resolved), where decisions often end up.';
     return `Confluence page ${d.ref}, read in full. ${comments} The AI notes and Ask use it.`;
@@ -162,11 +168,14 @@
   <div class="flex flex-wrap items-center gap-2 px-6 pb-3 text-[13px]">
     {#each session.docs as d (d.id)}
       <span class="flex max-w-xs items-center gap-1.5 rounded-full border border-line bg-paper py-1 pl-3 pr-1" title={docTitle(d)}>
-        <Icon name={d.source === 'meeting' ? 'history' : 'book'} size={14} />
+        <Icon name={d.source === 'meeting' ? 'history' : d.source === 'jira' ? 'ticket' : 'book'} size={14} />
+        {#if d.source === 'jira'}<span class="shrink-0 font-semibold">{d.ref}</span>{/if}
         <span class="truncate font-medium">{d.title}</span>
         {#if d.source === 'meeting'}
           {@const e = earlier(d)}
           <span class="shrink-0 text-xs text-faint">{e ? dayLabel(e.startedAt) : 'deleted'}</span>
+        {:else if d.source === 'jira'}
+          <span class="shrink-0 text-xs text-faint">{kb(d.bytes)}</span>
         {:else}
           <span class="shrink-0 text-xs text-faint">{kb(d.bytes)}{d.comments ? ` · ${d.comments} comment${d.comments === 1 ? '' : 's'}` : ''}</span>
         {/if}
@@ -175,30 +184,37 @@
         </button>
       </span>
     {/each}
-    {#if addingPage}
+    {#if adding}
       <form class="flex min-w-0 flex-1 items-center gap-2" onsubmit={(e) => (e.preventDefault(), attach())}>
         <!-- svelte-ignore a11y_autofocus -->
         <input
           class="min-w-0 max-w-md flex-1 rounded-full border border-line bg-card px-3.5 py-1.5 outline-none focus:border-ink"
-          placeholder="Paste a Confluence page link"
-          aria-label="Confluence page link"
+          placeholder={adding === 'jira' ? 'Jira ticket key (PAY-142) or link' : 'Paste a Confluence page link'}
+          aria-label={adding === 'jira' ? 'Jira ticket key or link' : 'Confluence page link'}
           bind:value={pageLink}
           autofocus
           disabled={session.attaching}
-          onkeydown={(e) => e.key === 'Escape' && ((addingPage = false), (session.attachError = null))}
+          onkeydown={(e) => e.key === 'Escape' && cancelAdding()}
         />
         <button class="rounded-full bg-ink px-3.5 py-1.5 font-semibold text-white disabled:opacity-60" disabled={session.attaching || !pageLink.trim()}>
-          {session.attaching ? 'Reading page…' : 'Add'}
+          {session.attaching ? (adding === 'jira' ? 'Reading ticket…' : 'Reading page…') : 'Add'}
         </button>
-        <button type="button" class="rounded-full px-2 py-1.5 text-muted hover:text-ink" onclick={() => ((addingPage = false), (session.attachError = null))}>Cancel</button>
+        <button type="button" class="rounded-full px-2 py-1.5 text-muted hover:text-ink" onclick={cancelAdding}>Cancel</button>
       </form>
     {:else}
       <button
         class="flex items-center gap-1.5 rounded-full border border-dashed border-line px-3 py-1 text-muted hover:border-ink hover:text-ink"
         title="Read a whole Confluence page (a PRD, a spec) and its comments so the AI notes and Ask know it during the meeting"
-        onclick={() => ((addingPage = true), (picking = false))}
+        onclick={() => ((adding = 'confluence'), (picking = false))}
       >
         <Icon name="plus" size={14} /> Confluence page
+      </button>
+      <button
+        class="flex items-center gap-1.5 rounded-full border border-dashed border-line px-3 py-1 text-muted hover:border-ink hover:text-ink"
+        title="Read a Jira ticket (its description, status and latest comments) so the AI notes and Ask know it during the meeting"
+        onclick={() => ((adding = 'jira'), (picking = false))}
+      >
+        <Icon name="plus" size={14} /> Jira ticket
       </button>
       <div class="relative">
         <button

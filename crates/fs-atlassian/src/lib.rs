@@ -150,6 +150,21 @@ pub fn page_id_from(s: &str) -> Option<String> {
     (!id.is_empty() && id.len() <= 20).then_some(id)
 }
 
+/// A Jira issue key from a key (`PAY-142`, any case) or an issue link (`.../browse/PAY-142`,
+/// `?selectedIssue=PAY-142`).
+pub fn issue_key_from(s: &str) -> Option<String> {
+    let s = s.trim();
+    let part = if let Some((_, rest)) = s.split_once("selectedIssue=") {
+        rest
+    } else if let Some((_, rest)) = s.split_once("/browse/") {
+        rest
+    } else {
+        s
+    };
+    let key = part.split(['?', '#', '&', '/']).next()?.trim().to_ascii_uppercase();
+    is_issue_key(&key).then_some(key)
+}
+
 /// Confluence page links mentioned in some text, as page ids, in order, without repeats.
 pub fn page_links_in(text: &str, max: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -450,6 +465,28 @@ pub fn read_page(page_id: &str) -> Result<Page, AtlassianError> {
     );
     let title = info.ok().as_deref().and_then(confluence::title_from_info);
     Ok(Page { id: page_id.to_string(), title, text })
+}
+
+/// A Jira work item, read for attaching to a meeting: its summary and the formatted ticket.
+#[derive(Debug, Clone)]
+pub struct Issue {
+    pub key: String,
+    pub summary: Option<String>,
+    pub text: String,
+}
+
+/// Read one work item (description, details and latest comments).
+pub fn read_issue(key: &str) -> Result<Issue, AtlassianError> {
+    let cmd = ReadCommand::JiraView { key: key.to_string() };
+    let raw = exec(Tool::Acli, &cmd.plan()?[0])?;
+    let v: Value =
+        serde_json::from_str(&raw).map_err(|_| AtlassianError::Failed(raw.trim().chars().take(300).collect()))?;
+    let summary = v.pointer("/fields/summary").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    Ok(Issue {
+        key: key.to_string(),
+        summary: summary.map(str::to_string),
+        text: cut(format_issue(&v), MAX_PAGE_BYTES, "ticket"),
+    })
 }
 
 /// How many comments a page read by [`read_page`] came with: `None` when they couldn't be read.
@@ -756,6 +793,18 @@ mod tests {
         assert_eq!(page_id_from("123456").as_deref(), Some("123456"));
         assert_eq!(page_id_from("https://x/wiki/pages/viewpage.action?pageId=777").as_deref(), Some("777"));
         assert_eq!(page_id_from("not a page"), None);
+        for link in [
+            "PAY-142",
+            " pay-142 ",
+            "https://x.atlassian.net/browse/PAY-142",
+            "https://x.atlassian.net/browse/PAY-142?focusedCommentId=9",
+            "https://x.atlassian.net/jira/software/projects/PAY/boards/3?selectedIssue=PAY-142&x=1",
+        ] {
+            assert_eq!(issue_key_from(link).as_deref(), Some("PAY-142"), "{link}");
+        }
+        for bad in ["", "PAY", "https://x.atlassian.net/browse/", "PAY-142; rm", "--help"] {
+            assert_eq!(issue_key_from(bad), None, "{bad}");
+        }
         assert_eq!(
             page_links_in(
                 "see (https://x.atlassian.net/wiki/spaces/ENG/pages/98765/Runbook), and 12345 isn't a link",
