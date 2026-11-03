@@ -34,7 +34,8 @@
     </button>
 
     <nav class="flex flex-col gap-0.5" aria-label="Main">
-      <button class="{nav} {session.view === 'home' ? 'bg-card font-semibold shadow-sm' : 'text-muted hover:bg-soft'}" aria-current={session.view === 'home' ? 'page' : undefined} onclick={() => session.go('home')}>
+      <!-- An open meeting is part of Meetings: it stays highlighted there, as the way back to the list. -->
+      <button class="{nav} {session.view === 'home' || session.view === 'meeting' ? 'bg-card font-semibold shadow-sm' : 'text-muted hover:bg-soft'}" aria-current={session.view === 'home' ? 'page' : undefined} onclick={() => session.go('home')}>
         <Icon name="home" size={19} /> Meetings
       </button>
       <button class="{nav} {session.view === 'knowledge' ? 'bg-card font-semibold shadow-sm' : 'text-muted hover:bg-soft'}" aria-current={session.view === 'knowledge' ? 'page' : undefined} onclick={() => session.go('knowledge')}>

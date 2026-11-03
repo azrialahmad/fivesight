@@ -104,6 +104,9 @@
 <section class="relative flex h-full min-w-0 flex-col">
   <header class="flex items-center gap-3 whitespace-nowrap px-6 pb-3 pt-5">
     <div class="min-w-0">
+      <button class="mb-0.5 flex items-center gap-1 px-1 text-xs font-medium text-muted hover:text-ink" onclick={() => session.go('home')}>
+        <span class="rotate-180"><Icon name="chevron" size={14} /></span> Meetings
+      </button>
       <input
         class="w-full min-w-0 max-w-md rounded-lg bg-transparent px-1 py-0.5 text-[22px] font-semibold tracking-tight outline-none hover:bg-paper focus:bg-paper"
         value={m.title}
