@@ -23,8 +23,8 @@ audio), so it works with any meeting app.
   notes and the transcript. Or let the AI take the notes on one page that you correct and add to
   as it goes; it keeps your edits. The live transcript stays in a drawer.
 - **Follow-up meetings.** Attach the earlier meeting a call continues, and the AI notes and Ask
-  pick up its open questions and action items. Attach a Confluence page to read it in full, with
-  its comment threads.
+  pick up its open questions and action items. Attach a Confluence page (read in full, with its
+  comment threads) or a Jira ticket (its details, description and latest comments) the same way.
 - **Ask.** Questions about the open meeting or all past meetings, answered with `[m:ss]`
   timestamp citations. Add an answer to your notes in one click; pasted text keeps its formatting.
 - **Your files.** Add Markdown, text and PDF files; Ask uses the passages that match a question
@@ -38,6 +38,9 @@ audio), so it works with any meeting app.
 - **Google Meet extension (optional).** Names who is speaking in the transcript and offers to
   start recording when you join a call. It never sends audio or video, shows nothing on the Meet
   page, and only talks to the app on `127.0.0.1`.
+- **For AI agents (optional).** `fivesight-mcp` lets Claude Code, Claude Desktop, Cursor or any
+  other MCP client read your meetings, notes, transcripts and files. Read-only: it can't record,
+  edit or delete anything.
 - **Bring your own model.** Any OpenAI-compatible endpoint: OpenRouter, OpenAI, Gemini, Groq,
   Together, a company gateway, or a local server such as Ollama or LM Studio. Keys are stored in
   Windows Credential Manager, one per server.
@@ -48,12 +51,15 @@ audio), so it works with any meeting app.
   local SQLite database.
 - Meeting text, matching file passages and ticket text go to the AI model you configure, only
   when you enhance notes or ask a question. Use a local model to keep everything on your PC.
+- If you connect an agent with `fivesight-mcp`, the meetings and files it reads go to that
+  agent's AI model.
 - **Tell people you're transcribing.** fivesight doesn't hide; please don't use it to.
 
 ## Requirements
 
 - Windows 10 or 11
-- An NVIDIA GPU with a recent driver (CUDA). About 2 GB of VRAM for `large-v3-turbo`.
+- An NVIDIA GPU with a recent driver (CUDA). About 2.3 GB of VRAM for the default speech model
+  (`large-v3-turbo`); the smaller ones need from about 600 MB.
 
 ## Building from source
 
@@ -68,13 +74,6 @@ Install:
 capability 12.0 (RTX 50 series); set `FS_CUDA_ARCH` for other cards, e.g. `86` for RTX 30 or
 `89` for RTX 40.
 
-Download the speech models into `%LOCALAPPDATA%\fivesight\models`:
-
-- `ggml-large-v3-turbo.bin` from
-  [ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main)
-- `silero_vad.onnx` from
-  [snakers4/silero-vad](https://github.com/snakers4/silero-vad/tree/master/src/silero_vad/data)
-
 Then run the app in development mode:
 
 ```
@@ -85,6 +84,14 @@ scripts\dev.bat
 ```
 
 The first build takes several minutes (whisper.cpp with CUDA).
+
+On first run, setup suggests a speech model that fits your graphics card and downloads it, along
+with the voice detector, into `%LOCALAPPDATA%\fivesight\models`. Each file is checked against a
+pinned SHA-256. To use files you already have, put them there (or point `FIVESIGHT_MODELS` at
+their folder): a Whisper model such as `ggml-large-v3-turbo.bin` from
+[ggerganov/whisper.cpp](https://huggingface.co/ggerganov/whisper.cpp/tree/main), and
+`silero_vad.onnx` from
+[snakers4/silero-vad](https://github.com/snakers4/silero-vad/tree/master/src/silero_vad/data).
 
 ### Meet extension
 
@@ -118,6 +125,32 @@ confluence init
 
 **Settings → Jira & Confluence** shows what fivesight can see.
 
+### AI agents (MCP)
+
+`fivesight-mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server over stdio.
+It opens fivesight's database read-only, so it works whether or not the app is running. Build it:
+
+```
+cargo build --release -p fivesight-mcp
+```
+
+Then add `target\release\fivesight-mcp.exe` to your agent as a stdio server. For Claude Code:
+
+```
+claude mcp add fivesight -- C:\path\to\fivesight\target\release\fivesight-mcp.exe
+```
+
+It reads `%LOCALAPPDATA%\dev.fivesight.app\fivesight.db`; pass `--db <path>` or set
+`FIVESIGHT_DB` to read another. Tools:
+
+| Tool | What it returns |
+|---|---|
+| `list_meetings` | Meetings, newest first, with ids, start times and transcript length |
+| `get_meeting` | Your notes, the AI notes, and attached documents |
+| `get_transcript` | `[m:ss] Speaker: text` lines, in pages for long meetings |
+| `search_transcripts` | Matching lines across all meetings, with meeting id and time |
+| `list_files`, `search_files` | Your files, and passages that match a question |
+
 ## Project layout
 
 | Path | What |
@@ -133,6 +166,7 @@ confluence init
 | `crates/fs-atlassian` | Read-only `acli` and `confluence-cli` wrappers and their allowlists |
 | `crates/fs-bridge` | Local endpoint for the Meet extension |
 | `extension/` | Chrome extension for Google Meet speaker names |
+| `mcp/` | Read-only MCP server so AI agents can read meetings and files |
 | `cli/` | Headless benchmark, recording replay and live-transcription tool for tuning |
 
 ## Contributing

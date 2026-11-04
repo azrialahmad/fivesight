@@ -23,7 +23,7 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Test
         # fs-pipeline, the app and the engine/silero features need CUDA and ONNX Runtime; they are built locally.
-        run: cargo test -p fs-store -p fs-kb -p fs-llm -p fs-atlassian -p fs-bridge -p fs-stt -p fs-vad -p fs-audio
+        run: cargo test -p fs-store -p fs-kb -p fs-llm -p fs-atlassian -p fs-bridge -p fs-stt -p fs-vad -p fs-audio -p fivesight-mcp
 
   web:
     name: UI and extension
