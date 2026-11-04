@@ -434,12 +434,15 @@ fn search_files(st: &Store, query: &str, limit: usize) -> Result<String, String>
 
 // ---------- formatting ----------
 
-/// Same labels the app gives the model: the user, a Meet participant, or "Others".
-fn speaker<'a>(s: &'a Segment, me: &'a str) -> &'a str {
+/// Same labels the app gives the model: the user, a Meet participant, or "Others". Messages from
+/// the call's chat are marked "(chat)"; the user's own carry no speaker, like their speech.
+fn speaker(s: &Segment, me: &str) -> String {
     match (s.source.as_str(), &s.speaker) {
-        ("mic", _) => me,
-        (_, Some(name)) => name,
-        _ => "Others",
+        ("mic", _) => me.into(),
+        ("chat", None) => format!("{me} (chat)"),
+        ("chat", Some(name)) => format!("{name} (chat)"),
+        (_, Some(name)) => name.clone(),
+        _ => "Others".into(),
     }
 }
 
@@ -590,6 +593,17 @@ mod tests {
         assert!(rest.contains("Agreed") && !rest.contains("More follows"), "{rest}");
         let (_, is_error) = f.call("get_transcript", json!({ "id": f.meeting, "offset": 3 }));
         assert!(is_error);
+    }
+
+    #[test]
+    fn chat_lines_are_marked() {
+        let f = Fixture::new("chat");
+        let st = Store::open(&f.server.db).unwrap();
+        st.add_segment_by(f.meeting, "chat", 4, 70_000, "https://jira/PAY-142", Some("Sari")).unwrap();
+        st.add_segment(f.meeting, "chat", 5, 80_000, "thanks").unwrap();
+        let (t, _) = f.call("get_transcript", json!({ "id": f.meeting }));
+        assert!(t.contains("[1:10] Sari (chat): https://jira/PAY-142"), "{t}");
+        assert!(t.contains("[1:20] User (chat): thanks"), "{t}");
     }
 
     #[test]
