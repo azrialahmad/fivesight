@@ -109,7 +109,34 @@
     };
   }
 
-  const api = { createSpeakingTracker, createCallTracker };
+  /**
+   * Picks out chat messages not reported yet. Meet redraws the whole history each time the chat
+   * panel opens, so messages are remembered by id. A message seen as it arrives is stamped now;
+   * one found later (the panel was closed) takes the minute Meet printed over it.
+   */
+  function createChatTracker(opts) {
+    const o = Object.assign({ liveMs: 2 * 60 * 1000, maxText: 2000, maxSeen: 5000 }, opts);
+    const seen = new Set();
+    return {
+      /** `messages` from FSSelectors.chatMessages, with `at` (parsed header time or null). */
+      fresh(now, messages) {
+        const out = [];
+        for (const m of messages) {
+          if (!m.id || seen.has(m.id)) continue;
+          seen.add(m.id);
+          const at = m.at != null && now - m.at > o.liveMs ? m.at : now;
+          out.push({ id: m.id, sender: m.sender, text: m.text.slice(0, o.maxText), at, me: !!m.me });
+        }
+        if (seen.size > o.maxSeen) seen.clear(); // a marathon call; the app also drops repeats
+        return out;
+      },
+      reset() {
+        seen.clear();
+      }
+    };
+  }
+
+  const api = { createSpeakingTracker, createCallTracker, createChatTracker };
   root.FSTracker = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof self !== 'undefined' ? self : globalThis);

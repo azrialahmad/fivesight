@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createSpeakingTracker, createCallTracker } = require('../src/tracker.js');
+const { createSpeakingTracker, createCallTracker, createChatTracker } = require('../src/tracker.js');
 
 /** Feed `n` activity events into a tile, evenly across the 200 ms before `now`. */
 function burst(t, id, now, n = 5) {
@@ -110,4 +110,31 @@ test('tile notices are not taken for names', () => {
   assert.equal(looksLikeName('Muhammad Quwwamul Haq Djunaid'), true);
   assert.equal(looksLikeName('Others might still see your full video.'), false);
   assert.equal(looksLikeName('You are presenting to everyone now, please stop'), false);
+});
+
+test('chat messages are reported once, even when Meet redraws the panel', () => {
+  const c = createChatTracker();
+  const m = (id, at = null) => ({ id, sender: 'Budi', text: 'link: https://x/' + id, at, me: false });
+  assert.deepEqual(
+    c.fresh(10_000_000, [m('a')]).map((e) => [e.id, e.at]),
+    [['a', 10_000_000]]
+  );
+  assert.deepEqual(c.fresh(10_001_000, [m('a'), m('b')]).map((e) => e.id), ['b']);
+  assert.deepEqual(c.fresh(10_002_000, [m('a'), m('b')]), []);
+  c.reset();
+  assert.equal(c.fresh(10_003_000, [m('a')]).length, 1, 'a new call starts over');
+});
+
+test('a chat message found late keeps the time Meet printed; a live one is stamped now', () => {
+  const c = createChatTracker();
+  const now = 10_000_000;
+  const [old, live, unknown] = c.fresh(now, [
+    { id: 'old', sender: 'Sari', text: 'hi', at: now - 10 * 60_000 },
+    { id: 'live', sender: 'Sari', text: 'yo', at: now - 30_000 },
+    { id: 'unknown', sender: null, text: 'hm', at: null }
+  ]);
+  assert.equal(old.at, now - 10 * 60_000);
+  assert.equal(live.at, now);
+  assert.equal(unknown.at, now);
+  assert.equal(c.fresh(now, [{ id: 'long', sender: 'S', text: 'x'.repeat(5000), at: null }])[0].text.length, 2000);
 });
