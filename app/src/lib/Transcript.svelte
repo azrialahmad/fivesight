@@ -25,7 +25,9 @@
 <div bind:this={scroller} onscroll={onScroll} class="h-full overflow-y-auto {compact ? 'px-4 py-3' : 'px-5 py-4'}">
   <ul class="flex flex-col {compact ? 'gap-4' : 'gap-5'}" aria-live="polite">
     {#each rows as r (r.key)}
-      {@const me = r.source === 'mic'}
+      {@const chat = r.source === 'chat'}
+      <!-- Your own chat messages carry no speaker, like your own speech. -->
+      {@const me = r.source === 'mic' || (chat && !r.speaker)}
       {@const who = me ? session.settings.userName.trim() || 'You' : (r.speaker ?? 'Others')}
       <li class="rise flex gap-3">
         <span
@@ -37,6 +39,7 @@
         <div class="min-w-0 flex-1">
           <div class="flex items-baseline gap-2">
             <span class="text-xs font-semibold">{who}</span>
+            {#if chat}<span class="rounded bg-soft px-1 text-[10px] font-medium text-muted" title="Typed in the Meet chat">chat</span>{/if}
             <span class="text-[11px] tabular-nums text-faint">{clock(r.startMs)}</span>
           </div>
           <p class="mt-0.5 {compact ? 'text-[13px]' : 'text-sm'} leading-relaxed {r.final ? 'text-ink' : 'text-muted'}">

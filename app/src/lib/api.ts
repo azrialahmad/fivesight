@@ -3,7 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
 
-export type Source = 'mic' | 'loopback';
+/** Who a transcript line came from: your mic, the call's audio, or the Meet chat. */
+export type Source = 'mic' | 'loopback' | 'chat';
 
 export interface Seg {
   key: string;

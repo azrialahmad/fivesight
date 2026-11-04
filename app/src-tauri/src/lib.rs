@@ -1,7 +1,7 @@
 //! fivesight desktop shell: owns the pipeline, the database and the LLM calls, and
 //! forwards everything to the UI as commands and events.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -178,6 +178,12 @@ struct Recording {
     names: Vec<String>,
     /// The prompt Whisper has now, so it's only replaced when it changes.
     prompt: Option<String>,
+    /// When the meeting was created; transcript times count from here.
+    started_at: i64,
+    /// Meet chat messages already saved, by Meet's message id.
+    chat_seen: HashSet<String>,
+    /// Id of the last chat line saved.
+    chat_seq: i64,
 }
 
 /// Whisper's prompt for a meeting: the user's word list, who's on the call, the title and
@@ -226,6 +232,7 @@ fn is_person(name: &str) -> bool {
     let n = name.trim();
     !n.is_empty()
         && !n.eq_ignore_ascii_case("you")
+        && !n.eq_ignore_ascii_case("others")
         && !n.to_lowercase().contains("presentation")
         && !n.ends_with(['.', '!', '?'])
         && n.split_whitespace().count() <= 6
@@ -405,6 +412,7 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     let mut call: Option<CallEvent> = None;
     let mut new_name: Option<String> = None;
     let mut takeover = false;
+    let mut chat = None;
     {
         let mut meet = lock(&st.meet);
         meet.last_seen = now;
@@ -425,6 +433,12 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
                 let at = if (at - now).abs() < 5_000 { at } else { now };
                 takeover = meet.speakers.apply(&name, speaking, at) && is_person(&name);
                 new_name = Some(name);
+            }
+            Incoming::Chat { id, sender, text, at, me } => {
+                if !me {
+                    new_name = sender.clone();
+                }
+                chat = Some((id, sender, text, at, me));
             }
             Incoming::Call { state, title, .. } => match state {
                 CallState::Joined => {
@@ -447,6 +461,9 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     if let Some(c) = call {
         let _ = app.emit("call", c);
     }
+    if let Some((id, sender, text, at, me)) = chat {
+        save_chat(app, &id, sender.as_deref(), &text, at, me, now);
+    }
     // Two people talking back to back with no pause would land in one line; cut it here.
     if takeover {
         if let Some(r) = lock(&st.recording).as_ref() {
@@ -466,6 +483,43 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
             refresh_hints(&st);
         }
     }
+}
+
+/// A Meet chat message, as the UI's transcript event.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatLine<'a> {
+    source: &'static str,
+    kind: &'static str,
+    segment_id: i64,
+    start_ms: i64,
+    text: &'a str,
+    meeting_id: i64,
+    speaker: Option<&'a str>,
+}
+
+/// Adds a Meet chat message to the transcript of the meeting being recorded, as a "chat" line.
+/// Your own messages have no speaker, like your own speech; someone unnamed is "Others".
+fn save_chat(app: &AppHandle, id: &str, sender: Option<&str>, text: &str, at: i64, me: bool, now: i64) {
+    let text = text.trim();
+    let st = app.state::<AppState>();
+    let mut rec = lock(&st.recording);
+    let Some(r) = rec.as_mut() else { return };
+    if text.is_empty() || !r.chat_seen.insert(id.to_string()) {
+        return;
+    }
+    // A browser clock far ahead of ours is wrong; one behind may be a message found late.
+    let at = if at > now + 5_000 { now } else { at };
+    let start_ms = (at - r.started_at).max(0);
+    r.chat_seq += 1;
+    let (mid, seg) = (r.meeting_id, r.chat_seq);
+    drop(rec);
+    let speaker = if me { None } else { Some(sender.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("Others")) };
+    if let Err(e) = lock(&st.store).add_segment_by(mid, "chat", seg, start_ms, text, speaker) {
+        tracing::error!("saving chat line: {e}");
+    }
+    let line = ChatLine { source: "chat", kind: "final", segment_id: seg, start_ms, text, meeting_id: mid, speaker };
+    let _ = app.emit("transcript", &line);
 }
 
 #[derive(Serialize)]
@@ -560,13 +614,16 @@ fn user_name(state: &AppState) -> Option<String> {
     Some(lock(&state.settings).user_name.trim().to_string()).filter(|n| !n.is_empty())
 }
 
-/// Transcript lines for the AI. The user's own lines carry their name (or "You").
+/// Transcript lines for the AI. The user's own lines carry their name (or "You"); chat
+/// messages are marked "(chat)".
 fn lines(transcript: &[Segment], me: Option<&str>) -> Vec<prompts::Line> {
     transcript
         .iter()
         .map(|s| prompts::Line {
             speaker: match (s.source.as_str(), &s.speaker) {
                 ("mic", _) => me.unwrap_or("You").into(),
+                ("chat", None) => format!("{} (chat)", me.unwrap_or("You")),
+                ("chat", Some(name)) => format!("{name} (chat)"),
                 (_, Some(name)) => name.clone(),
                 _ => "Others".into(),
             },
@@ -760,7 +817,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
 
     // Reuse the meeting or create one. Times in the transcript are measured from when the
     // meeting was created, and segment ids continue after any earlier recording in it.
-    let (mid, offset_ms, seg_base, language, names) = {
+    let (mid, started_at, seg_base, language, names) = {
         let st = lock(&state.store);
         let id = match meeting_id {
             Some(id) => {
@@ -779,8 +836,9 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
                 names.push(n);
             }
         }
-        (id, (now_ms() - meeting.started_at).max(0) as u64, base as u64, meeting.language, names)
+        (id, meeting.started_at, base as u64, meeting.language, names)
     };
+    let offset_ms = (now_ms() - started_at).max(0) as u64;
     tracing::info!("recording with {}", whisper_path.display());
     let mut cfg = PipelineConfig::new(whisper_path, vad_path);
     cfg.language = LangMode::parse(&language);
@@ -793,7 +851,16 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
     let language = cfg.language;
     let pipeline =
         tauri::async_runtime::spawn_blocking(move || Pipeline::start(cfg, tx)).await.map_err(err)?.map_err(err)?;
-    *lock(&state.recording) = Some(Recording { pipeline, meeting_id: mid, language, names, prompt });
+    *lock(&state.recording) = Some(Recording {
+        pipeline,
+        meeting_id: mid,
+        language,
+        names,
+        prompt,
+        started_at,
+        chat_seen: HashSet::new(),
+        chat_seq: seg_base as i64,
+    });
 
     let forward = app.clone();
     std::thread::spawn(move || {

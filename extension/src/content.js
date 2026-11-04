@@ -1,10 +1,13 @@
-// Runs on meet.google.com. Watches for a call and for who is speaking, and tells the background
-// worker, which forwards it to the fivesight app on this PC. It adds nothing to the page.
+// Runs on meet.google.com. Watches for a call, for who is speaking and for chat messages, and
+// tells the background worker, which forwards it to the fivesight app on this PC. It adds nothing
+// to the page.
 (function () {
   const S = self.FSSelectors;
   const T = self.FSTracker;
   const TICK_MS = 200;
   const HELLO_MS = 15000;
+  const CHAT_MS = 1000;
+  const CHAT_BATCH = 20;
 
   let debug = false;
   try {
@@ -15,6 +18,7 @@
 
   const speaking = T.createSpeakingTracker();
   const call = T.createCallTracker();
+  const chat = T.createChatTracker();
   let ownName = null;
   let timers = [];
   let dead = false;
@@ -60,6 +64,7 @@
       log('left');
       send([{ type: 'call', state: 'left' }]);
       send(speaking.reset(now).map(toEvent));
+      chat.reset();
     }
     if (!call.inCall) return;
 
@@ -79,7 +84,31 @@
 
   const toEvent = (e) => ({ type: 'speaking', name: e.name, speaking: e.speaking, at: e.at });
 
+  // Chat messages, while the chat panel is open (Meet doesn't draw them otherwise).
+  function readChat() {
+    if (!call.inCall) return;
+    const now = Date.now();
+    const found = S.chatMessages(document).map((m) => ({
+      ...m,
+      at: S.parseChatTime(m.time, now),
+      me: S.isOwnSender(m.sender, ownName)
+    }));
+    const fresh = chat.fresh(now, found);
+    if (!fresh.length) return;
+    log('chat', fresh);
+    const events = fresh.map((m) => ({
+      type: 'chat',
+      id: m.id,
+      sender: m.me ? ownName : m.sender,
+      text: m.text,
+      at: m.at,
+      me: m.me
+    }));
+    for (let i = 0; i < events.length; i += CHAT_BATCH) send(events.slice(i, i + CHAT_BATCH));
+  }
+
   timers.push(setInterval(tick, TICK_MS));
+  timers.push(setInterval(readChat, CHAT_MS));
   // Hellos carry your Meet name once it's known, so the app can suggest it as yours.
   const hello = () => send([{ type: 'hello', me: ownName }]);
   timers.push(setInterval(hello, HELLO_MS));

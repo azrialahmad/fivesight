@@ -1,8 +1,8 @@
 //! fs-bridge: a tiny local HTTP endpoint the Meet browser extension talks to.
 //!
-//! The extension only reports *who is speaking* and *whether a call is on*. It never sends audio or
-//! video. Requests must carry the pairing token and must not come from a web page: a page always
-//! sends its own `Origin`, an extension sends `chrome-extension://...`.
+//! The extension reports *who is speaking*, *whether a call is on* and *what is typed in the call's
+//! chat*. It never sends audio or video. Requests must carry the pairing token and must not come
+//! from a web page: a page always sends its own `Origin`, an extension sends `chrome-extension://...`.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
@@ -49,6 +49,19 @@ pub enum Incoming {
     },
     /// A participant started or stopped speaking. `at` is the browser's `Date.now()`.
     Speaking { name: String, speaking: bool, at: i64 },
+    /// A message in the call's chat. `id` is Meet's, so a message reported twice can be dropped.
+    /// `at` is the browser's `Date.now()` (or the minute Meet printed, for one found late).
+    Chat {
+        id: String,
+        /// Display name, when the extension could read it.
+        #[serde(default)]
+        sender: Option<String>,
+        text: String,
+        at: i64,
+        /// You sent it.
+        #[serde(default)]
+        me: bool,
+    },
     /// The user joined or left a call in this tab.
     Call {
         state: CallState,
@@ -326,6 +339,31 @@ mod tests {
                 title: Some("Payments sync".into()),
                 code: Some("abc-defg-hij".into())
             }
+        );
+        let c = route(
+            &post(
+                "/events",
+                Some("chrome-extension://abc"),
+                Some("Bearer s3cret-token"),
+                br#"{"events":[
+                    {"type":"chat","id":"m1","sender":"Budi","text":"PAY-142 is the one","at":2000},
+                    {"type":"chat","id":"m2","text":"hi","at":3000,"me":true}
+                ]}"#,
+            ),
+            TOKEN,
+        );
+        assert_eq!(
+            c.events,
+            vec![
+                Incoming::Chat {
+                    id: "m1".into(),
+                    sender: Some("Budi".into()),
+                    text: "PAY-142 is the one".into(),
+                    at: 2000,
+                    me: false
+                },
+                Incoming::Chat { id: "m2".into(), sender: None, text: "hi".into(), at: 3000, me: true },
+            ]
         );
     }
 
