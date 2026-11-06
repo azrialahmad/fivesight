@@ -1,4 +1,5 @@
 import { api, inTauri } from './api';
+import { defaultQuickPrompts, withPrompt } from './quick';
 import type { AskLookup, AskSources, CallEvent, ChatMsg, DownloadEvent, Hit, KbAddResult, KbDoc, Meeting, MeetingDoc, MeetingSummary, NotesMode, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
 export { inTauri };
@@ -15,6 +16,7 @@ const DEFAULT_SETTINGS: Settings = {
   setupDone: true,
   vocabulary: '',
   userName: '',
+  quickPrompts: defaultQuickPrompts,
   hasKey: false
 };
 
@@ -448,6 +450,27 @@ class Session {
       this.settings.notesMode = before;
       this.error = String(e);
     }
+  }
+
+  /** Change the one-click prompts over the Ask box; saved right away. */
+  private async setQuickPrompts(list: string[]) {
+    const before = this.settings.quickPrompts;
+    if (list === before) return;
+    this.settings.quickPrompts = list;
+    try {
+      await this.saveSettings({ ...this.settings, quickPrompts: list }, null);
+    } catch (e) {
+      this.settings.quickPrompts = before;
+      this.error = String(e);
+    }
+  }
+
+  addQuickPrompt(text: string) {
+    return this.setQuickPrompts(withPrompt(this.settings.quickPrompts, text));
+  }
+
+  removeQuickPrompt(text: string) {
+    return this.setQuickPrompts(this.settings.quickPrompts.filter((p) => p !== text));
   }
 
   /** Read a Confluence page in full, or a Jira ticket, and attach it to the open meeting. */

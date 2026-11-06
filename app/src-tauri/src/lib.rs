@@ -80,6 +80,9 @@ struct Settings {
     /// What the transcript and AI notes call the user, instead of "You". Also a Whisper hint.
     #[serde(default)]
     user_name: String,
+    /// The one-click questions over the Ask box. An empty list means the user removed them all.
+    #[serde(default = "default_quick_prompts")]
+    quick_prompts: Vec<String>,
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
@@ -92,6 +95,10 @@ struct Settings {
     custom_url: Option<String>,
     #[serde(default, skip_serializing, alias = "localModel")]
     custom_model: Option<String>,
+}
+
+fn default_quick_prompts() -> Vec<String> {
+    ["What did we decide?", "List the action items", "Summarize in 3 bullets"].map(String::from).to_vec()
 }
 
 impl Default for Settings {
@@ -108,6 +115,7 @@ impl Default for Settings {
             setup_done: false,
             vocabulary: String::new(),
             user_name: String::new(),
+            quick_prompts: default_quick_prompts(),
             has_key: false,
             provider: None,
             openrouter_model: None,
@@ -1653,6 +1661,12 @@ mod tests {
 
     fn parse(json: &str) -> Settings {
         serde_json::from_str(json).expect("settings json")
+    }
+
+    #[test]
+    fn quick_prompts_start_with_the_defaults_and_can_be_emptied() {
+        assert_eq!(parse(r#"{"baseUrl":"x"}"#).quick_prompts, default_quick_prompts());
+        assert!(parse(r#"{"baseUrl":"x","quickPrompts":[]}"#).quick_prompts.is_empty());
     }
 
     fn temp_settings(name: &str, contents: Option<&str>) -> PathBuf {

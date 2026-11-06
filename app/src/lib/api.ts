@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
+import { defaultQuickPrompts } from './quick';
 
 /** Who a transcript line came from: your mic, the call's audio, or the Meet chat. */
 export type Source = 'mic' | 'loopback' | 'chat';
@@ -74,6 +75,8 @@ export interface Settings {
   vocabulary: string;
   /** What the transcript and AI notes call you, instead of "You". */
   userName: string;
+  /** The one-click questions over the Ask box. */
+  quickPrompts: string[];
   /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
   hasKey: boolean;
 }
@@ -392,6 +395,7 @@ function createMockApi(): Api {
     setupDone: true,
     vocabulary: 'Playwright, Claude',
     userName: '',
+    quickPrompts: defaultQuickPrompts,
     hasKey: false
   };
   const speechModels: SpeechModelInfo[] = [
