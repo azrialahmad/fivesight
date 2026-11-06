@@ -8,7 +8,22 @@
   let open = $state(true);
   let thread: HTMLDivElement | undefined = $state();
 
-  const chips = ['What did we decide?', 'List the action items', 'Summarize in 3 bullets'];
+  /** The prompt being written, or null when the "Save a prompt" box is closed. */
+  let draft = $state<string | null>(null);
+  let draftInput: HTMLInputElement | undefined = $state();
+
+  /** Starts from whatever is in the Ask box, to keep a question you just typed. */
+  async function startDraft() {
+    draft = text;
+    await tick();
+    draftInput?.focus();
+  }
+
+  function saveDraft() {
+    if (draft?.trim()) session.addQuickPrompt(draft);
+    draft = null;
+  }
+
   const hasThread = $derived(session.chat.length > 0 || session.asking);
 
   /** Answer just added to the notes, to show "Added" on it for a moment. */
@@ -91,13 +106,50 @@
     </div>
   {/if}
 
-  {#if !hasThread}
-    <div class="mb-2.5 flex flex-wrap gap-2">
-      {#each chips as c}
-        <button class="rounded-full border border-line bg-paper px-3.5 py-1.5 text-[13px] hover:border-ink" onclick={() => submit(c)}>{c}</button>
-      {/each}
-    </div>
-  {/if}
+  <div class="mb-2.5 flex max-h-20 flex-wrap items-center gap-2 overflow-y-auto">
+    {#each session.settings.quickPrompts as c}
+      <span class="group flex max-w-full items-center rounded-full border border-line bg-paper hover:border-ink">
+        <button
+          class="min-w-0 truncate rounded-full py-1.5 pl-3.5 pr-1 text-[13px] disabled:opacity-40"
+          title={c}
+          disabled={session.asking}
+          onclick={() => submit(c)}>{c}</button
+        >
+        <button
+          class="mr-1.5 grid h-5 w-5 shrink-0 place-items-center rounded-full text-muted opacity-0 hover:bg-soft hover:text-ink focus:opacity-100 group-hover:opacity-100"
+          aria-label="Remove prompt: {c}"
+          title="Remove this prompt"
+          onclick={() => session.removeQuickPrompt(c)}
+        >
+          <Icon name="close" size={12} />
+        </button>
+      </span>
+    {/each}
+    {#if draft === null}
+      <button class="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] text-muted hover:bg-soft hover:text-ink" onclick={startDraft}>
+        <Icon name="plus" size={14} /> Save a prompt
+      </button>
+    {:else}
+      <form
+        class="flex min-w-0 flex-1 basis-64 items-center gap-1 rounded-full border border-ink bg-paper py-0.5 pl-3.5 pr-0.5"
+        onsubmit={(e) => {
+          e.preventDefault();
+          saveDraft();
+        }}
+      >
+        <input
+          bind:this={draftInput}
+          class="min-w-0 flex-1 bg-transparent py-1 text-[13px] outline-none placeholder:text-faint"
+          placeholder="A question you ask often…"
+          aria-label="New prompt"
+          bind:value={draft}
+          onkeydown={(e) => e.key === 'Escape' && (draft = null)}
+        />
+        <button class="rounded-full bg-ink px-3 py-1 text-xs font-medium text-white disabled:opacity-30" disabled={!draft.trim()}>Save</button>
+        <button type="button" class="rounded-full px-2 py-1 text-xs text-muted hover:bg-soft" onclick={() => (draft = null)}>Cancel</button>
+      </form>
+    {/if}
+  </div>
 
   <form
     class="flex items-center gap-2 rounded-full border border-line bg-paper py-1.5 pl-5 pr-1.5 focus-within:border-ink"
