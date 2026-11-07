@@ -42,8 +42,9 @@ audio), so it works with any meeting app.
   other MCP client read your meetings, notes, transcripts and files. Read-only: it can't record,
   edit or delete anything.
 - **Bring your own model.** Any OpenAI-compatible endpoint: OpenRouter, OpenAI, Gemini, Groq,
-  Together, a company gateway, or a local server such as Ollama or LM Studio. Keys are stored in
-  Windows Credential Manager, one per server.
+  Together, a company gateway, or a local server such as Ollama or LM Studio. Set up as many
+  provider profiles as you like and switch between them from the Ask box. Keys are stored in
+  Windows Credential Manager, one per profile.
 
 ## Privacy
 

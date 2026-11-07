@@ -1,14 +1,14 @@
 import { api, inTauri } from './api';
 import { defaultQuickPrompts, withPrompt } from './quick';
+import type { QuickPrompt } from './quick';
 import type { AskLookup, AskSources, CallEvent, ChatMsg, DownloadEvent, Hit, KbAddResult, KbDoc, Meeting, MeetingDoc, MeetingSummary, NotesMode, Seg, Settings, StoredSeg, StreamEvent, TranscriptEvent } from './api';
 
 export { inTauri };
 export type View = 'home' | 'meeting' | 'settings' | 'knowledge';
 
 const DEFAULT_SETTINGS: Settings = {
-  baseUrl: 'https://openrouter.ai/api/v1',
-  model: 'google/gemini-2.5-flash',
-  fallbackModel: '',
+  profiles: [{ id: 'default', name: 'openrouter.ai', baseUrl: 'https://openrouter.ai/api/v1', model: 'google/gemini-2.5-flash', fallbackModel: '' }],
+  activeProfile: 'default',
   language: 'auto',
   atlassian: true,
   notesMode: 'live',
@@ -453,7 +453,7 @@ class Session {
   }
 
   /** Change the one-click prompts over the Ask box; saved right away. */
-  private async setQuickPrompts(list: string[]) {
+  private async setQuickPrompts(list: QuickPrompt[]) {
     const before = this.settings.quickPrompts;
     if (list === before) return;
     this.settings.quickPrompts = list;
@@ -465,12 +465,26 @@ class Session {
     }
   }
 
-  addQuickPrompt(text: string) {
-    return this.setQuickPrompts(withPrompt(this.settings.quickPrompts, text));
+  /** Add a prompt, or replace the one at `index`. */
+  saveQuickPrompt(index: number | null, draft: QuickPrompt) {
+    return this.setQuickPrompts(withPrompt(this.settings.quickPrompts, index, draft));
   }
 
-  removeQuickPrompt(text: string) {
-    return this.setQuickPrompts(this.settings.quickPrompts.filter((p) => p !== text));
+  removeQuickPrompt(index: number) {
+    return this.setQuickPrompts(this.settings.quickPrompts.filter((_, i) => i !== index));
+  }
+
+  /** Switch AI provider; saved right away, and the next request uses it. */
+  async setActiveProfile(id: string) {
+    const before = this.settings.activeProfile;
+    if (before === id) return;
+    this.settings.activeProfile = id;
+    try {
+      await this.saveSettings({ ...this.settings, activeProfile: id }, null);
+    } catch (e) {
+      this.settings.activeProfile = before;
+      this.error = String(e);
+    }
   }
 
   /** Read a Confluence page in full, or a Jira ticket, and attach it to the open meeting. */
@@ -605,8 +619,8 @@ class Session {
     this.hits = q.trim().length < 2 ? [] : await api.search(q.trim());
   }
 
-  async saveSettings(s: Settings, apiKey: string | null) {
-    await api.saveSettings(s, apiKey);
+  async saveSettings(s: Settings, apiKeys: Record<string, string> | null) {
+    await api.saveSettings(s, apiKeys);
     this.settings = await api.getSettings();
   }
 
@@ -648,8 +662,8 @@ class Session {
   }
 
   /** Save what the setup chose and close it. Also used to skip it (with the current settings). */
-  async finishSetup(s: Settings, apiKey: string | null) {
-    await this.saveSettings({ ...s, setupDone: true }, apiKey);
+  async finishSetup(s: Settings, apiKeys: Record<string, string> | null) {
+    await this.saveSettings({ ...s, setupDone: true }, apiKeys);
     this.modelsDir = (await api.status()).modelsDir;
     this.setupOpen = false;
   }

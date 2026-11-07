@@ -2,7 +2,7 @@
   import Icon from './Icon.svelte';
   import { session, inTauri } from './session.svelte';
   import { api, looksLikeAddress } from './api';
-  import { presets, presetFor, isLocalUrl } from './providers';
+  import { activeProfile, isLocalUrl, newProfile, presets } from './providers';
   import type { AtlassianStatus, BridgeStatus, Settings } from './api';
   import { onMount } from 'svelte';
 
@@ -12,8 +12,10 @@
     ['manual', 'Only when I press Enhance', 'Nothing goes to the AI until you ask.']
   ];
 
-  let form = $state<Settings>({ ...session.settings });
-  let apiKey = $state('');
+  let form = $state<Settings>($state.snapshot(session.settings));
+  /** Keys typed but not saved yet, by profile id. */
+  let apiKeys = $state<Record<string, string>>({});
+  const profile = $derived(activeProfile(form));
   let saved = $state(false);
   let keySaved = $state(false);
   let testing = $state(false);
@@ -21,14 +23,14 @@
 
   $effect(() => {
     // Pick up settings that finish loading after this view mounts.
-    form = { ...session.settings };
+    form = $state.snapshot(session.settings);
   });
 
-  // Keys are stored per server, so ask again whenever the address changes.
+  // A key belongs to a profile and its server, so ask again whenever either changes.
   $effect(() => {
-    const url = form.baseUrl;
+    const { id, baseUrl } = profile;
     let stale = false;
-    api.keySaved(url).then((v) => {
+    api.keySaved(id, baseUrl).then((v) => {
       if (!stale) keySaved = v;
     });
     return () => (stale = true);
@@ -83,22 +85,29 @@
   };
   const speechLabel = $derived(speechLabels[session.settings.speechModel] ?? session.settings.speechModel);
 
-  const selected = $derived(presetFor(form.baseUrl));
-  const isLocal = $derived(isLocalUrl(form.baseUrl));
-  const insecure = $derived(/^http:\/\//i.test(form.baseUrl.trim()) && !isLocal);
+  const isLocal = $derived(isLocalUrl(profile.baseUrl));
+  const insecure = $derived(/^http:\/\//i.test(profile.baseUrl.trim()) && !isLocal);
 
   function pick(id: string) {
     test = null;
-    apiKey = '';
-    const p = presets.find((x) => x.id === id);
-    if (p) {
-      form.baseUrl = p.url;
-      form.model = p.model;
-    } else {
-      form.baseUrl = '';
-      form.model = '';
-    }
+    form.activeProfile = id;
   }
+
+  function addProfile() {
+    const p = newProfile();
+    form.profiles.push(p);
+    pick(p.id);
+  }
+
+  function removeProfile() {
+    delete apiKeys[profile.id];
+    form.profiles = form.profiles.filter((p) => p.id !== profile.id);
+    pick(form.profiles[0].id);
+  }
+
+  /** What Save would keep of the profiles, to compare. */
+  const profilesText = (s: Settings) =>
+    JSON.stringify(s.profiles.map((p) => [p.id, p.name.trim(), p.baseUrl.trim(), p.model.trim(), p.fallbackModel.trim()]));
 
   let notice = $state<string | null>(null);
   onMount(() => void api.settingsNotice().then((n) => (notice = n)).catch(() => {}));
@@ -107,32 +116,31 @@
   const dirty = $derived.by(() => {
     const s = session.settings;
     return (
-      form.baseUrl.trim() !== s.baseUrl.trim() ||
-      form.model.trim() !== s.model.trim() ||
-      form.fallbackModel.trim() !== s.fallbackModel.trim() ||
+      profilesText(form) !== profilesText(s) ||
+      form.activeProfile !== s.activeProfile ||
       form.language !== s.language ||
       form.atlassian !== s.atlassian ||
       form.notesMode !== s.notesMode ||
       form.vocabulary.trim() !== s.vocabulary.trim() ||
       form.userName.trim() !== s.userName.trim() ||
-      apiKey.trim() !== ''
+      Object.values(apiKeys).some((k) => k?.trim())
     );
   });
-  const modelIsAddress = $derived(looksLikeAddress(form.model));
-  const fallbackIsAddress = $derived(looksLikeAddress(form.fallbackModel));
+  const modelIsAddress = $derived(looksLikeAddress(profile.model));
+  const fallbackIsAddress = $derived(looksLikeAddress(profile.fallbackModel));
   let saveError = $state<string | null>(null);
 
   async function save() {
     saveError = null;
     try {
-      await session.saveSettings(form, apiKey.trim() || null);
+      await session.saveSettings(form, apiKeys);
     } catch (e) {
       saveError = String(e);
       return;
     }
-    apiKey = '';
+    apiKeys = {};
     notice = null;
-    keySaved = await api.keySaved(form.baseUrl);
+    keySaved = await api.keySaved(profile.id, profile.baseUrl);
     saved = true;
     setTimeout(() => (saved = false), 2000);
   }
@@ -141,7 +149,7 @@
     testing = true;
     test = null;
     try {
-      test = { ok: true, text: await api.testLlm(form, apiKey.trim() || null) };
+      test = { ok: true, text: await api.testLlm(form, apiKeys[profile.id]?.trim() || null) };
     } catch (e) {
       test = { ok: false, text: String(e) };
     } finally {
@@ -150,7 +158,7 @@
   }
 
   async function forget() {
-    await api.forgetKey(form.baseUrl);
+    await api.forgetKey(profile.id, profile.baseUrl);
     keySaved = false;
     test = null;
   }
@@ -212,29 +220,33 @@
         Bring your own key. Works with any service that speaks the OpenAI chat API. Audio is always transcribed on this PC.
       </p>
 
-      <div class="mt-3 flex flex-wrap gap-2" role="radiogroup" aria-label="AI provider">
-        {#each presets as p}
+      <div class="mt-3 flex flex-wrap gap-2" role="radiogroup" aria-label="AI profile">
+        {#each form.profiles as p (p.id)}
           <button
-            class="{chip} {selected === p.id ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}"
+            class="{chip} {form.activeProfile === p.id ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}"
             role="radio"
-            aria-checked={selected === p.id}
+            aria-checked={form.activeProfile === p.id}
             onclick={() => pick(p.id)}
           >
-            {p.label}
+            {p.name.trim() || 'New profile'}
           </button>
         {/each}
-        <button
-          class="{chip} {selected === 'custom' ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}"
-          role="radio"
-          aria-checked={selected === 'custom'}
-          onclick={() => pick('custom')}
-        >
-          Custom endpoint
+        <button class="{chip} flex items-center gap-1 border-dashed border-line text-muted hover:border-ink hover:text-ink" onclick={addProfile}>
+          <Icon name="plus" size={14} /> New profile
         </button>
       </div>
+      <p class="mt-1.5 text-xs text-muted">
+        Ask and the AI notes use the selected one. With two or more, you can also switch from the Ask box in a meeting.
+      </p>
 
-      <label class="mt-5 block text-sm font-medium" for="url">Server address</label>
-      <input id="url" class={field} placeholder="https://your-gateway.example.com/v1" spellcheck="false" bind:value={form.baseUrl} />
+      <label class="mt-5 block text-sm font-medium" for="pname">Profile name</label>
+      <input id="pname" class={field} placeholder="Work gateway" spellcheck="false" bind:value={profile.name} />
+
+      <label class="mt-4 block text-sm font-medium" for="url">Server address</label>
+      <input id="url" class={field} list="known-servers" placeholder="https://your-gateway.example.com/v1" spellcheck="false" bind:value={profile.baseUrl} />
+      <datalist id="known-servers">
+        {#each presets as p}<option value={p.url}>{p.label}</option>{/each}
+      </datalist>
       <p class="mt-1.5 text-xs text-muted">
         The base address, usually ending in /v1. Pasting the full /chat/completions address also works.
       </p>
@@ -243,7 +255,7 @@
       {/if}
 
       <label class="mt-4 block text-sm font-medium" for="model">Model</label>
-      <input id="model" class={field} placeholder="model name as the provider spells it" spellcheck="false" bind:value={form.model} />
+      <input id="model" class={field} placeholder="model name as the provider spells it" spellcheck="false" bind:value={profile.model} />
       {#if modelIsAddress}
         <p class="mt-1.5 text-xs font-medium text-rec">This is a server address. Put it in Server address above; this field takes a model name.</p>
       {/if}
@@ -256,18 +268,18 @@
         type="password"
         autocomplete="off"
         class={field}
-        placeholder={keySaved ? 'Saved for this server. Type to replace.' : isLocal ? 'Leave empty' : 'Paste your key'}
-        bind:value={apiKey}
+        placeholder={keySaved ? 'Saved for this profile. Type to replace.' : isLocal ? 'Leave empty' : 'Paste your key'}
+        bind:value={apiKeys[profile.id]}
       />
       <p class="mt-1.5 text-xs text-muted">
-        Stored in Windows Credential Manager, one per server, and only ever sent to that server.
+        Stored in Windows Credential Manager, one per profile, and only ever sent to this profile's server.
         {#if keySaved}
           <button class="ml-1 font-medium text-ink underline" onclick={forget}>Remove saved key</button>
         {/if}
       </p>
 
       <label class="mt-4 block text-sm font-medium" for="fb">Fallback model <span class="font-normal text-faint">(optional)</span></label>
-      <input id="fb" class={field} placeholder="Another model on the same server, tried if the main one fails" spellcheck="false" bind:value={form.fallbackModel} />
+      <input id="fb" class={field} placeholder="Another model on the same server, tried if the main one fails" spellcheck="false" bind:value={profile.fallbackModel} />
       {#if fallbackIsAddress}
         <p class="mt-1.5 text-xs font-medium text-rec">
           This is a server address. The fallback is another model name on the same server; put the address in Server address above.
@@ -277,7 +289,7 @@
       <div class="mt-4 flex flex-wrap items-center gap-3">
         <button
           class="rounded-full border border-line px-4 py-2 text-[13px] font-medium hover:border-ink disabled:opacity-50"
-          disabled={testing || !form.baseUrl.trim() || !form.model.trim()}
+          disabled={testing || !profile.baseUrl.trim() || !profile.model.trim()}
           onclick={runTest}
         >
           {testing ? 'Testing…' : 'Test connection'}
@@ -287,6 +299,9 @@
             {#if test.ok}<Icon name="check" size={18} />{/if}
             <span class="min-w-0 break-words">{test.text}</span>
           </span>
+        {/if}
+        {#if form.profiles.length > 1}
+          <button class="ml-auto text-[13px] font-medium text-rec underline" onclick={removeProfile}>Delete this profile</button>
         {/if}
       </div>
 

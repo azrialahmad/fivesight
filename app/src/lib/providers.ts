@@ -1,4 +1,6 @@
-/** One-click starting points for the AI model. All speak the OpenAI chat API; the address stays editable. */
+import type { Profile, Settings } from './api';
+
+/** Starting points for first-run setup and address suggestions. All speak the OpenAI chat API. */
 export const presets = [
   { id: 'openrouter', label: 'OpenRouter', url: 'https://openrouter.ai/api/v1', model: 'google/gemini-2.5-flash' },
   { id: 'openai', label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
@@ -8,6 +10,11 @@ export const presets = [
   { id: 'ollama', label: 'Ollama (local)', url: 'http://localhost:11434/v1', model: 'gemma3' },
   { id: 'lmstudio', label: 'LM Studio (local)', url: 'http://localhost:1234/v1', model: '' }
 ];
+
+/** The profile Ask and the AI notes use. */
+export const activeProfile = (s: Settings): Profile => s.profiles.find((p) => p.id === s.activeProfile) ?? s.profiles[0];
+
+export const newProfile = (): Profile => ({ id: crypto.randomUUID(), name: '', baseUrl: '', model: '', fallbackModel: '' });
 
 export const normUrl = (u: string) => u.trim().replace(/\/+$/, '').toLowerCase();
 

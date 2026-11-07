@@ -3,25 +3,35 @@
   import Icon from './Icon.svelte';
   import Markdown from './Markdown.svelte';
   import { session } from './session.svelte';
+  import { chipLabel } from './quick';
 
   let text = $state('');
   let open = $state(true);
   let thread: HTMLDivElement | undefined = $state();
 
-  /** The prompt being written, or null when the "Save a prompt" box is closed. */
-  let draft = $state<string | null>(null);
+  /** The prompt being added (`index` null) or edited, or null when the editor is closed. */
+  let draft = $state<{ index: number | null; label: string; prompt: string } | null>(null);
   let draftInput: HTMLInputElement | undefined = $state();
 
-  /** Starts from whatever is in the Ask box, to keep a question you just typed. */
-  async function startDraft() {
-    draft = text;
+  async function openDraft(index: number | null, label: string, prompt: string) {
+    draft = { index, label, prompt };
     await tick();
     draftInput?.focus();
   }
 
   function saveDraft() {
-    if (draft?.trim()) session.addQuickPrompt(draft);
+    if (draft?.prompt.trim()) session.saveQuickPrompt(draft.index, { label: draft.label, prompt: draft.prompt });
     draft = null;
+  }
+
+  function removeDraft() {
+    if (draft?.index != null) session.removeQuickPrompt(draft.index);
+    draft = null;
+  }
+
+  function draftKey(e: KeyboardEvent) {
+    if (e.key === 'Escape') draft = null;
+    else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) saveDraft();
   }
 
   const hasThread = $derived(session.chat.length > 0 || session.asking);
@@ -51,7 +61,7 @@
 </script>
 
 <div class="border-t border-line bg-card px-5 pb-4 pt-3">
-  {#if hasThread && open}
+  {#if hasThread && open && !draft}
     <div bind:this={thread} class="mb-3 max-h-[30vh] space-y-3 overflow-y-auto pr-1">
       {#each session.chat as m, i}
         {#if m.role === 'user'}
@@ -107,49 +117,67 @@
   {/if}
 
   <div class="mb-2.5 flex max-h-20 flex-wrap items-center gap-2 overflow-y-auto">
-    {#each session.settings.quickPrompts as c}
-      <span class="group flex max-w-full items-center rounded-full border border-line bg-paper hover:border-ink">
+    {#each session.settings.quickPrompts as c, i}
+      {@const name = chipLabel(c)}
+      <span class="group relative max-w-64 rounded-full border border-line bg-paper hover:border-ink">
         <button
-          class="min-w-0 truncate rounded-full py-1.5 pl-3.5 pr-1 text-[13px] disabled:opacity-40"
-          title={c}
+          class="block w-full truncate rounded-full px-3.5 py-1.5 text-[13px] disabled:opacity-40"
+          title={c.prompt}
           disabled={session.asking}
-          onclick={() => submit(c)}>{c}</button
+          onclick={() => submit(c.prompt)}>{name}</button
         >
+        <!-- Over the button's padding, so it takes no room until it's wanted. -->
         <button
-          class="mr-1.5 grid h-5 w-5 shrink-0 place-items-center rounded-full text-muted opacity-0 hover:bg-soft hover:text-ink focus:opacity-100 group-hover:opacity-100"
-          aria-label="Remove prompt: {c}"
-          title="Remove this prompt"
-          onclick={() => session.removeQuickPrompt(c)}
+          class="absolute right-1 top-1/2 grid h-5 w-5 -translate-y-1/2 place-items-center rounded-full bg-paper text-muted opacity-0 hover:bg-soft hover:text-ink focus:opacity-100 group-hover:opacity-100"
+          aria-label="Edit prompt: {name}"
+          title="Edit or remove this prompt"
+          onclick={() => openDraft(i, c.label, c.prompt)}
         >
-          <Icon name="close" size={12} />
+          <Icon name="edit" size={12} />
         </button>
       </span>
     {/each}
     {#if draft === null}
-      <button class="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] text-muted hover:bg-soft hover:text-ink" onclick={startDraft}>
+      <!-- Starts from whatever is in the Ask box, to keep a question you just typed. -->
+      <button class="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] text-muted hover:bg-soft hover:text-ink" onclick={() => openDraft(null, '', text)}>
         <Icon name="plus" size={14} /> Save a prompt
       </button>
-    {:else}
-      <form
-        class="flex min-w-0 flex-1 basis-64 items-center gap-1 rounded-full border border-ink bg-paper py-0.5 pl-3.5 pr-0.5"
-        onsubmit={(e) => {
-          e.preventDefault();
-          saveDraft();
-        }}
-      >
-        <input
-          bind:this={draftInput}
-          class="min-w-0 flex-1 bg-transparent py-1 text-[13px] outline-none placeholder:text-faint"
-          placeholder="A question you ask often…"
-          aria-label="New prompt"
-          bind:value={draft}
-          onkeydown={(e) => e.key === 'Escape' && (draft = null)}
-        />
-        <button class="rounded-full bg-ink px-3 py-1 text-xs font-medium text-white disabled:opacity-30" disabled={!draft.trim()}>Save</button>
-        <button type="button" class="rounded-full px-2 py-1 text-xs text-muted hover:bg-soft" onclick={() => (draft = null)}>Cancel</button>
-      </form>
     {/if}
   </div>
+
+  {#if draft}
+    <form
+      class="mb-2.5 rounded-2xl border border-ink bg-paper p-3"
+      onsubmit={(e) => {
+        e.preventDefault();
+        saveDraft();
+      }}
+    >
+      <input
+        bind:this={draftInput}
+        class="w-full bg-transparent text-[13px] font-medium outline-none placeholder:font-normal placeholder:text-faint"
+        placeholder="Button name, such as SP estimate"
+        aria-label="Button name"
+        bind:value={draft.label}
+        onkeydown={draftKey}
+      />
+      <textarea
+        class="mt-2 w-full resize-y border-t border-line bg-transparent pt-2 text-[13px] leading-relaxed outline-none placeholder:text-faint"
+        rows="3"
+        placeholder="The full prompt the AI gets when you click it"
+        aria-label="Prompt"
+        bind:value={draft.prompt}
+        onkeydown={draftKey}
+      ></textarea>
+      <div class="mt-1 flex items-center justify-end gap-1">
+        {#if draft.index !== null}
+          <button type="button" class="mr-auto rounded-full px-2.5 py-1 text-xs font-medium text-rec hover:bg-rec-soft" onclick={removeDraft}>Remove</button>
+        {/if}
+        <button type="button" class="rounded-full px-2.5 py-1 text-xs text-muted hover:bg-soft" onclick={() => (draft = null)}>Cancel</button>
+        <button class="rounded-full bg-ink px-3 py-1 text-xs font-medium text-white disabled:opacity-30" disabled={!draft.prompt.trim()}>Save</button>
+      </div>
+    </form>
+  {/if}
 
   <form
     class="flex items-center gap-2 rounded-full border border-line bg-paper py-1.5 pl-5 pr-1.5 focus-within:border-ink"
@@ -164,6 +192,17 @@
       aria-label="Ask about this meeting"
       bind:value={text}
     />
+    {#if session.settings.profiles.length > 1}
+      <select
+        class="max-w-36 truncate rounded-full bg-transparent py-1.5 pl-2 text-xs text-muted outline-none hover:bg-soft focus:bg-soft"
+        title="AI profile for Ask and the AI notes. Set them up in Settings."
+        aria-label="AI profile"
+        value={session.settings.activeProfile}
+        onchange={(e) => session.setActiveProfile(e.currentTarget.value)}
+      >
+        {#each session.settings.profiles as p}<option value={p.id}>{p.name || p.baseUrl || 'Untitled'}</option>{/each}
+      </select>
+    {/if}
     {#if hasThread}
       <button type="button" class="rounded-full px-3 py-1.5 text-xs text-muted hover:bg-soft" onclick={() => (open = !open)}>
         {open ? 'Hide' : 'Show'} answers
