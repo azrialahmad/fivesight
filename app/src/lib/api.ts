@@ -3,6 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { open } from '@tauri-apps/plugin-dialog';
 import { defaultQuickPrompts } from './quick';
+import type { QuickPrompt } from './quick';
+import { activeProfile } from './providers';
 
 /** Who a transcript line came from: your mic, the call's audio, or the Meet chat. */
 export type Source = 'mic' | 'loopback' | 'chat';
@@ -57,11 +59,20 @@ export interface Hit {
   snippet: string;
 }
 
-export interface Settings {
-  /** Any OpenAI-compatible server (OpenRouter, OpenAI, Groq, Ollama, a company gateway...). */
+/** An AI provider: any OpenAI-compatible server (OpenRouter, Groq, Ollama, a company gateway...). */
+export interface Profile {
+  id: string;
+  name: string;
   baseUrl: string;
   model: string;
   fallbackModel: string;
+}
+
+export interface Settings {
+  /** The AI providers set up. Never empty. */
+  profiles: Profile[];
+  /** The id of the one Ask and the AI notes use. */
+  activeProfile: string;
   language: string;
   /** Let Ask read Jira and Confluence through acli (read-only). */
   atlassian: boolean;
@@ -76,8 +87,8 @@ export interface Settings {
   /** What the transcript and AI notes call you, instead of "You". */
   userName: string;
   /** The one-click questions over the Ask box. */
-  quickPrompts: string[];
-  /** Whether a key is saved for `baseUrl`. Keys live in Windows Credential Manager, one per server. */
+  quickPrompts: QuickPrompt[];
+  /** Whether a key is saved for the active profile. Keys live in Windows Credential Manager, one per profile. */
   hasKey: boolean;
 }
 
@@ -272,11 +283,12 @@ export interface Api {
   ask(meetingId: number | null, question: string): Promise<void>;
   search(query: string): Promise<Hit[]>;
   getSettings(): Promise<Settings>;
-  saveSettings(s: Settings, apiKey: string | null): Promise<void>;
+  /** `apiKeys` maps profile ids to keys typed for them. */
+  saveSettings(s: Settings, apiKeys: Record<string, string> | null): Promise<void>;
   /** Why settings fell back to defaults at startup, if they did. */
   settingsNotice(): Promise<string | null>;
-  keySaved(baseUrl: string): Promise<boolean>;
-  forgetKey(baseUrl: string): Promise<void>;
+  keySaved(id: string, baseUrl: string): Promise<boolean>;
+  forgetKey(id: string, baseUrl: string): Promise<void>;
   /** Sends a one-word request with the form's values; resolves with a message or rejects with a fix. */
   testLlm(s: Settings, apiKey: string | null): Promise<string>;
   openLivePanel(): Promise<void>;
@@ -333,10 +345,10 @@ const tauriApi: Api = {
   ask: (meetingId, question) => invoke('ask', { meetingId, question }),
   search: (query) => invoke('search', { query }),
   getSettings: () => invoke('get_settings'),
-  saveSettings: (settings, apiKey) => invoke('save_settings', { settings, apiKey }),
+  saveSettings: (settings, apiKeys) => invoke('save_settings', { settings, apiKeys }),
   settingsNotice: () => invoke('settings_notice'),
-  keySaved: (baseUrl) => invoke('key_saved', { baseUrl }),
-  forgetKey: (baseUrl) => invoke('forget_key', { baseUrl }),
+  keySaved: (id, baseUrl) => invoke('key_saved', { id, baseUrl }),
+  forgetKey: (id, baseUrl) => invoke('forget_key', { id, baseUrl }),
   testLlm: (settings, apiKey) => invoke('test_llm', { settings, apiKey }),
   openLivePanel: () => invoke('open_live_panel'),
   getBridge: () => invoke('get_bridge'),
@@ -384,9 +396,11 @@ function createMockApi(): Api {
   let recording: number | null = null;
   let timer: ReturnType<typeof setInterval> | null = null;
   let settings: Settings = {
-    baseUrl: 'https://openrouter.ai/api/v1',
-    model: 'google/gemini-2.5-flash',
-    fallbackModel: '',
+    profiles: [
+      { id: 'default', name: 'OpenRouter', baseUrl: 'https://openrouter.ai/api/v1', model: 'google/gemini-2.5-flash', fallbackModel: '' },
+      { id: 'local', name: 'Ollama', baseUrl: 'http://localhost:11434/v1', model: 'gemma3', fallbackModel: '' }
+    ],
+    activeProfile: 'default',
     language: 'auto',
     atlassian: true,
     notesMode: 'live',
@@ -553,19 +567,23 @@ function createMockApi(): Api {
         segs.filter((s) => s.text.toLowerCase().includes(q.toLowerCase())).map((s) => ({ meetingId: Number(id), meetingTitle: get(Number(id)).title, startMs: s.startMs, snippet: s.text }))
       ),
     getSettings: async () => ({ ...settings }),
-    saveSettings: async (s, key) => {
-      for (const [field, value] of [['Model', s.model], ['Fallback model', s.fallbackModel]]) {
-        if (looksLikeAddress(value)) throw `${field} should be a model name, not a server address. Put the address in Server address.`;
+    saveSettings: async (s, typed) => {
+      for (const p of s.profiles) {
+        for (const [field, value] of [['Model', p.model], ['Fallback model', p.fallbackModel]]) {
+          if (looksLikeAddress(value)) throw `${field} in "${p.name}" should be a model name, not a server address. Put the address in Server address.`;
+        }
+        if (typed?.[p.id]) keys.add(p.id + p.baseUrl.trim());
       }
-      if (key) keys.add(s.baseUrl.trim());
-      settings = { ...s, hasKey: keys.has(s.baseUrl.trim()) };
+      const active = activeProfile(s);
+      settings = { ...s, hasKey: keys.has(active.id + active.baseUrl.trim()) };
     },
     settingsNotice: async () => null,
-    keySaved: async (baseUrl) => keys.has(baseUrl.trim()),
-    forgetKey: async (baseUrl) => void keys.delete(baseUrl.trim()),
+    keySaved: async (id, baseUrl) => keys.has(id + baseUrl.trim()),
+    forgetKey: async (id, baseUrl) => void keys.delete(id + baseUrl.trim()),
     testLlm: async (s, key) => {
-      if (!key && !keys.has(s.baseUrl.trim()) && !/localhost|127\.0\.0\.1/.test(s.baseUrl)) throw 'The server needs an API key. Paste yours and try again.';
-      return 'Connected. ' + s.model + ' replied: ok';
+      const p = activeProfile(s);
+      if (!key && !keys.has(p.id + p.baseUrl.trim()) && !/localhost|127\.0\.0\.1/.test(p.baseUrl)) throw 'The server needs an API key. Paste yours and try again.';
+      return 'Connected. ' + p.model + ' replied: ok';
     },
     setMeetingLanguage: async (id, language) => void (get(id).language = language),
     openLivePanel: async () => {},

@@ -40,18 +40,64 @@ fn err<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// An AI provider the user set up: any OpenAI-compatible server, the model to use on it, and
+/// (in Credential Manager, see [`profile_slot`]) its key.
+#[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct Profile {
+    id: String,
+    name: String,
+    base_url: String,
+    model: String,
+    fallback_model: String,
+}
+
+/// A one-click question over the Ask box: `label` on the button, `prompt` sent to the AI. Without
+/// a label the button shows the prompt. Files from before labels hold plain strings.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(from = "StoredPrompt")]
+struct QuickPrompt {
+    label: String,
+    prompt: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredPrompt {
+    Text(String),
+    Full {
+        #[serde(default)]
+        label: String,
+        prompt: String,
+    },
+}
+
+impl From<StoredPrompt> for QuickPrompt {
+    fn from(p: StoredPrompt) -> Self {
+        match p {
+            StoredPrompt::Text(prompt) => Self { label: String::new(), prompt },
+            StoredPrompt::Full { label, prompt } => Self { label, prompt },
+        }
+    }
+}
+
 /// Every field has a serde default, so a field missing from `settings.json` (older or
-/// hand-edited file) doesn't fail the whole file. `base_url` defaults to empty on purpose:
-/// that is how [`Settings::migrated`] spots a file from before the provider was generalised.
+/// hand-edited file) doesn't fail the whole file.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Settings {
-    /// Any OpenAI-compatible server: OpenRouter, OpenAI, Groq, Ollama, a company gateway...
+    /// The AI providers set up. [`Settings::migrated`] makes sure there is at least one.
     #[serde(default)]
+    profiles: Vec<Profile>,
+    /// The id of the profile Ask and the AI notes use.
+    #[serde(default)]
+    active_profile: String,
+    /// From before profiles: the one provider. Read once to migrate, never written back.
+    #[serde(default, skip_serializing)]
     base_url: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     fallback_model: String,
     /// Language given to new meetings: "auto", "id" or "en". Each meeting can override it.
     #[serde(default = "auto_language")]
@@ -82,7 +128,7 @@ struct Settings {
     user_name: String,
     /// The one-click questions over the Ask box. An empty list means the user removed them all.
     #[serde(default = "default_quick_prompts")]
-    quick_prompts: Vec<String>,
+    quick_prompts: Vec<QuickPrompt>,
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
@@ -97,13 +143,21 @@ struct Settings {
     custom_model: Option<String>,
 }
 
-fn default_quick_prompts() -> Vec<String> {
-    ["What did we decide?", "List the action items", "Summarize in 3 bullets"].map(String::from).to_vec()
+fn default_quick_prompts() -> Vec<QuickPrompt> {
+    [
+        ("Decisions", "What did we decide?"),
+        ("Action items", "List the action items"),
+        ("Summary", "Summarize in 3 bullets"),
+    ]
+    .map(|(label, prompt)| QuickPrompt { label: label.into(), prompt: prompt.into() })
+    .to_vec()
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            profiles: Vec::new(),
+            active_profile: String::new(),
             base_url: OPENROUTER_URL.into(),
             model: "google/gemini-2.5-flash".into(),
             fallback_model: String::new(),
@@ -126,11 +180,11 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Fold the old provider/openrouterModel/customUrl shape into `base_url` + `model`.
-    /// Returns the migrated settings and the legacy key slot that belonged to them, if any.
+    /// Fold older shapes (provider/openrouterModel/customUrl, then one `base_url` + `model`) into
+    /// a profile. Returns the migrated settings and the legacy key slot that belonged to them, if any.
     fn migrated(mut self) -> (Self, Option<&'static str>) {
         let mut legacy_slot = None;
-        if self.base_url.trim().is_empty() {
+        if self.profiles.is_empty() && self.base_url.trim().is_empty() {
             match self.provider.as_deref() {
                 Some("custom") | Some("local") => {
                     self.base_url = self.custom_url.clone().unwrap_or_default();
@@ -144,6 +198,18 @@ impl Settings {
                 }
             }
         }
+        if self.profiles.is_empty() {
+            self.profiles.push(Profile {
+                id: "default".into(),
+                name: server_name(&self.base_url),
+                base_url: self.base_url.clone(),
+                model: self.model.clone(),
+                fallback_model: self.fallback_model.clone(),
+            });
+        }
+        if !self.profiles.iter().any(|p| p.id == self.active_profile) {
+            self.active_profile = self.profiles[0].id.clone();
+        }
         if !matches!(self.notes_mode.as_str(), "live" | "end" | "manual") {
             self.notes_mode = if self.auto_notes { "live" } else { "manual" }.into();
         }
@@ -152,6 +218,11 @@ impl Settings {
         self.custom_url = None;
         self.custom_model = None;
         (self, legacy_slot)
+    }
+
+    /// The profile in use. Empty only for settings that never went through `migrated`.
+    fn active(&self) -> Profile {
+        self.profiles.iter().find(|p| p.id == self.active_profile).cloned().unwrap_or_default()
     }
 }
 
@@ -170,11 +241,33 @@ fn default_speech_model() -> String {
 /// The Credential Manager entry for a server: one key per host, so each provider keeps its own
 /// and a key is never sent to a server it wasn't saved for.
 fn key_slot(base_url: &str) -> String {
+    format!("key:{}", server_name(base_url))
+}
+
+/// The host part of a server address, lowercase.
+fn server_name(base_url: &str) -> String {
     let t = base_url.trim();
     let rest = t.split_once("://").map_or(t, |(_, r)| r);
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or(host);
-    format!("key:{}", host.to_ascii_lowercase())
+    host.rsplit('@').next().unwrap_or(host).to_ascii_lowercase()
+}
+
+/// The Credential Manager entry for a profile's key. The server is part of it, so changing a
+/// profile's address never sends its key to the new server.
+fn profile_slot(p: &Profile) -> String {
+    format!("{}#{}", key_slot(&p.base_url), p.id)
+}
+
+/// A profile's own key, or else one saved for its server before profiles existed.
+fn profile_key(p: &Profile) -> Option<String> {
+    stored_key(&profile_slot(p)).or_else(|| stored_key(&key_slot(&p.base_url)))
+}
+
+fn delete_key(slot: &str) -> Result<(), String> {
+    match keyring::Entry::new(KEYRING_SERVICE, slot).map_err(err)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Couldn't remove the key: {e}")),
+    }
 }
 
 struct Recording {
@@ -597,7 +690,7 @@ fn stored_key(user: &str) -> Option<String> {
     keyring::Entry::new(KEYRING_SERVICE, user).ok()?.get_password().ok().filter(|k| !k.trim().is_empty())
 }
 
-fn build_config(s: &Settings, key: Option<String>) -> Result<LlmConfig, String> {
+fn build_config(s: &Profile, key: Option<String>) -> Result<LlmConfig, String> {
     let url = s.base_url.trim();
     if url.is_empty() || s.model.trim().is_empty() {
         return Err("Set the server address and model name in Settings, under AI model.".into());
@@ -612,8 +705,8 @@ fn build_config(s: &Settings, key: Option<String>) -> Result<LlmConfig, String> 
 }
 
 fn llm_config(state: &AppState) -> Result<LlmConfig, String> {
-    let s = lock(&state.settings).clone();
-    let key = stored_key(&key_slot(&s.base_url));
+    let s = lock(&state.settings).active();
+    let key = profile_key(&s);
     build_config(&s, key)
 }
 
@@ -1220,51 +1313,77 @@ fn kb_remove(state: State<'_, AppState>, id: i64) -> Result<(), String> {
 #[tauri::command]
 fn get_settings(state: State<'_, AppState>) -> Settings {
     let mut s = lock(&state.settings).clone();
-    s.has_key = stored_key(&key_slot(&s.base_url)).is_some();
+    s.has_key = profile_key(&s.active()).is_some();
     s
 }
 
-/// Whether a key is saved for this server (the settings form asks while you type the address).
+/// A profile as the settings form has it right now, for looking up its key.
+fn typed_profile(id: String, base_url: String) -> Profile {
+    Profile { id, base_url, ..Profile::default() }
+}
+
+/// Whether a key is saved for this profile (the settings form asks while you type the address).
 #[tauri::command]
-fn key_saved(base_url: String) -> bool {
-    stored_key(&key_slot(&base_url)).is_some()
+fn key_saved(id: String, base_url: String) -> bool {
+    profile_key(&typed_profile(id, base_url)).is_some()
 }
 
 #[tauri::command]
-fn forget_key(base_url: String) -> Result<(), String> {
-    match keyring::Entry::new(KEYRING_SERVICE, &key_slot(&base_url)).map_err(err)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(format!("Couldn't remove the key: {e}")),
-    }
+fn forget_key(id: String, base_url: String) -> Result<(), String> {
+    delete_key(&profile_slot(&typed_profile(id, base_url.clone())))?;
+    delete_key(&key_slot(&base_url))
 }
 
-/// `api_key` is saved for the server address being saved; keys for other servers are kept.
+/// `api_keys` maps profile ids to keys typed for them. Keys of profiles that are gone, or that
+/// moved to another server, are removed from Credential Manager.
 #[tauri::command]
-fn save_settings(state: State<'_, AppState>, settings: Settings, api_key: Option<String>) -> Result<(), String> {
+fn save_settings(
+    state: State<'_, AppState>,
+    settings: Settings,
+    api_keys: Option<HashMap<String, String>>,
+) -> Result<(), String> {
     let (mut to_store, _) = settings.migrated();
-    to_store.base_url = to_store.base_url.trim().to_string();
-    to_store.model = to_store.model.trim().to_string();
-    to_store.fallback_model = to_store.fallback_model.trim().to_string();
+    for p in &mut to_store.profiles {
+        p.base_url = p.base_url.trim().to_string();
+        p.model = p.model.trim().to_string();
+        p.fallback_model = p.fallback_model.trim().to_string();
+        p.name = p.name.trim().to_string();
+        if p.name.is_empty() {
+            p.name = server_name(&p.base_url);
+        }
+    }
     to_store.user_name = to_store.user_name.trim().to_string();
     if models::speech_model(&to_store.speech_model).is_none() {
         return Err(format!("Unknown speech model \"{}\".", to_store.speech_model));
     }
-    for (field, value) in [("Model", &to_store.model), ("Fallback model", &to_store.fallback_model)] {
-        if looks_like_address(value) {
-            return Err(format!(
-                "{field} should be a model name, not a server address. Put the address in Server address."
-            ));
+    for p in &to_store.profiles {
+        for (field, value) in [("Model", &p.model), ("Fallback model", &p.fallback_model)] {
+            if looks_like_address(value) {
+                return Err(format!(
+                    "{field} in \"{}\" should be a model name, not a server address. Put the address in Server address.",
+                    p.name
+                ));
+            }
         }
     }
-    if let Some(key) = api_key.filter(|k| !k.trim().is_empty()) {
-        keyring::Entry::new(KEYRING_SERVICE, &key_slot(&to_store.base_url))
-            .and_then(|e| e.set_password(key.trim()))
-            .map_err(|e| format!("Couldn't save the key to Windows Credential Manager: {e}"))?;
+    let typed = api_keys.unwrap_or_default();
+    for p in &to_store.profiles {
+        if let Some(key) = typed.get(&p.id).filter(|k| !k.trim().is_empty()) {
+            keyring::Entry::new(KEYRING_SERVICE, &profile_slot(p))
+                .and_then(|e| e.set_password(key.trim()))
+                .map_err(|e| format!("Couldn't save the key to Windows Credential Manager: {e}"))?;
+        }
     }
     to_store.has_key = false;
     std::fs::write(&state.settings_path, serde_json::to_string_pretty(&to_store).map_err(err)?)
         .map_err(|e| format!("Couldn't save settings to {}: {e}", state.settings_path.display()))?;
-    *lock(&state.settings) = to_store;
+    let kept: HashSet<String> = to_store.profiles.iter().map(profile_slot).collect();
+    let before = std::mem::replace(&mut *lock(&state.settings), to_store);
+    for slot in before.profiles.iter().map(profile_slot).filter(|s| !kept.contains(s)) {
+        if let Err(e) = delete_key(&slot) {
+            tracing::warn!("{e}");
+        }
+    }
     *lock(&state.settings_notice) = None;
     tracing::info!("settings saved");
     refresh_hints(&state);
@@ -1315,9 +1434,9 @@ fn load_settings(path: &std::path::Path) -> (Option<Settings>, Option<String>) {
 /// Nothing is saved.
 #[tauri::command]
 async fn test_llm(settings: Settings, api_key: Option<String>) -> Result<String, String> {
-    let (s, _) = settings.migrated();
+    let s = settings.migrated().0.active();
     let typed = api_key.filter(|k| !k.trim().is_empty());
-    let key = typed.or_else(|| stored_key(&key_slot(&s.base_url)));
+    let key = typed.or_else(|| profile_key(&s));
     let key_sent = key.is_some();
     let mut cfg = build_config(&s, key)?;
     cfg.fallback_model = None;
@@ -1545,7 +1664,7 @@ pub fn run() {
                     let (settings, legacy_slot) = old.migrated();
                     if let Some(slot) = legacy_slot {
                         // Carry the old key over to the per-server slot, then rewrite the file in the new shape.
-                        let new_slot = key_slot(&settings.base_url);
+                        let new_slot = key_slot(&settings.active().base_url);
                         if stored_key(&new_slot).is_none() {
                             if let Some(k) = stored_key(slot) {
                                 let _ =
@@ -1558,7 +1677,7 @@ pub fn run() {
                     }
                     settings
                 }
-                None => Settings::default(),
+                None => Settings::default().migrated().0,
             };
             app.manage(AppState {
                 store: Mutex::new(store),
@@ -1669,6 +1788,54 @@ mod tests {
         assert!(parse(r#"{"baseUrl":"x","quickPrompts":[]}"#).quick_prompts.is_empty());
     }
 
+    #[test]
+    fn quick_prompts_saved_as_plain_text_keep_working() {
+        let s =
+            parse(r#"{"quickPrompts":["Long question?",{"label":"SP","prompt":"Estimate it"},{"prompt":"No name"}]}"#);
+        let want = [("", "Long question?"), ("SP", "Estimate it"), ("", "No name")]
+            .map(|(label, prompt)| QuickPrompt { label: label.into(), prompt: prompt.into() });
+        assert_eq!(s.quick_prompts, want);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#"{"label":"SP","prompt":"Estimate it"}"#), "{json}");
+        assert_eq!(parse(&json).quick_prompts, want, "reads back what it writes");
+    }
+
+    #[test]
+    fn the_one_provider_of_an_older_file_becomes_a_profile() {
+        let (s, slot) =
+            parse(r#"{"baseUrl":"https://nutaraline.co.uk/v1","model":"m","fallbackModel":"f"}"#).migrated();
+        assert_eq!(slot, None);
+        assert_eq!(
+            s.active(),
+            Profile {
+                id: "default".into(),
+                name: "nutaraline.co.uk".into(),
+                base_url: "https://nutaraline.co.uk/v1".into(),
+                model: "m".into(),
+                fallback_model: "f".into()
+            }
+        );
+        // Written in the new shape, which reads back the same.
+        let (again, slot) = parse(&serde_json::to_string(&s).unwrap()).migrated();
+        assert_eq!(slot, None);
+        assert_eq!(again.profiles, s.profiles);
+    }
+
+    #[test]
+    fn a_missing_active_profile_falls_back_to_the_first() {
+        let s = parse(r#"{"profiles":[{"id":"a"},{"id":"b"}],"activeProfile":"gone"}"#).migrated().0;
+        assert_eq!(s.active_profile, "a");
+        assert_eq!(parse(r#"{"profiles":[{"id":"a"},{"id":"b"}],"activeProfile":"b"}"#).migrated().0.active().id, "b");
+    }
+
+    #[test]
+    fn a_profile_key_is_tied_to_its_id_and_server() {
+        let p = |id: &str, url: &str| typed_profile(id.into(), url.into());
+        assert_eq!(profile_slot(&p("a", "https://gw.example.com/v1")), "key:gw.example.com#a");
+        assert_ne!(profile_slot(&p("a", "https://x.example/v1")), profile_slot(&p("b", "https://x.example/v1")));
+        assert_ne!(profile_slot(&p("a", "https://x.example/v1")), profile_slot(&p("a", "https://y.example/v1")));
+    }
+
     fn temp_settings(name: &str, contents: Option<&str>) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("fivesight-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1740,8 +1907,8 @@ mod tests {
             r#"{"provider":"openrouter","openrouterModel":"anthropic/claude-sonnet-4.5","fallbackModel":"","customUrl":"http://x/v1","customModel":"m","language":"id"}"#,
         );
         let (s, slot) = old.migrated();
-        assert_eq!(s.base_url, OPENROUTER_URL);
-        assert_eq!(s.model, "anthropic/claude-sonnet-4.5");
+        assert_eq!(s.active().base_url, OPENROUTER_URL);
+        assert_eq!(s.active().model, "anthropic/claude-sonnet-4.5");
         assert_eq!(s.language, "id");
         assert_eq!(slot, Some(LEGACY_KEY_OPENROUTER));
     }
@@ -1753,9 +1920,9 @@ mod tests {
                 r#"{{"provider":"{provider}","openrouterModel":"a","fallbackModel":"f","localUrl":"https://gw.example.com/v1","localModel":"gpt-x","language":"auto"}}"#
             );
             let (s, slot) = parse(&json).migrated();
-            assert_eq!(s.base_url, "https://gw.example.com/v1");
-            assert_eq!(s.model, "gpt-x");
-            assert_eq!(s.fallback_model, "f");
+            assert_eq!(s.active().base_url, "https://gw.example.com/v1");
+            assert_eq!(s.active().model, "gpt-x");
+            assert_eq!(s.active().fallback_model, "f");
             assert_eq!(slot, Some(LEGACY_KEY_CUSTOM));
         }
     }
@@ -1766,17 +1933,17 @@ mod tests {
             parse(r#"{"baseUrl":"https://api.groq.com/openai/v1","model":"llama","fallbackModel":"","language":"en"}"#)
                 .migrated();
         assert_eq!(slot, None);
-        assert_eq!(s.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(s.active().base_url, "https://api.groq.com/openai/v1");
         let out = serde_json::to_string(&s).unwrap();
         assert!(!out.contains("provider") && !out.contains("customUrl") && !out.contains("openrouterModel"));
     }
 
     #[test]
     fn build_config_validates_and_keeps_the_key_for_that_server() {
-        let mut s = Settings {
+        let mut s = Profile {
             base_url: "https://api.openai.com/v1/chat/completions".into(),
             model: "gpt-4o-mini".into(),
-            ..Settings::default()
+            ..Profile::default()
         };
         let cfg = build_config(&s, Some("sk-test".into())).unwrap();
         assert_eq!(cfg.base_url, "https://api.openai.com/v1");

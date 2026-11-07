@@ -1,11 +1,28 @@
 // The saved one-click questions above the Ask box. Kept in Settings, so they apply to every meeting.
 
-/** What a new install starts with. They can be removed like any other. */
-export const defaultQuickPrompts = ['What did we decide?', 'List the action items', 'Summarize in 3 bullets'];
+export interface QuickPrompt {
+  /** What the button says. Empty: it shows the prompt. */
+  label: string;
+  /** What the AI gets when you click it. */
+  prompt: string;
+}
 
-/** The list with `text` added at the end. Blank text or a prompt already there changes nothing. */
-export function withPrompt(list: string[], text: string): string[] {
-  const t = text.trim().replace(/\s+/g, ' ');
-  if (!t || list.some((p) => p.toLowerCase() === t.toLowerCase())) return list;
-  return [...list, t];
+/** What a new install starts with. They can be edited and removed like any other. */
+export const defaultQuickPrompts: QuickPrompt[] = [
+  { label: 'Decisions', prompt: 'What did we decide?' },
+  { label: 'Action items', prompt: 'List the action items' },
+  { label: 'Summary', prompt: 'Summarize in 3 bullets' }
+];
+
+export const chipLabel = (p: QuickPrompt) => p.label.trim() || p.prompt;
+
+/**
+ * The list with `draft` added at the end, or replacing the prompt at `index`. A blank prompt, or
+ * one another entry already has, changes nothing.
+ */
+export function withPrompt(list: QuickPrompt[], index: number | null, draft: QuickPrompt): QuickPrompt[] {
+  const next = { label: draft.label.trim(), prompt: draft.prompt.trim() };
+  const taken = list.some((p, i) => i !== index && p.prompt.toLowerCase() === next.prompt.toLowerCase());
+  if (!next.prompt || taken) return list;
+  return index === null ? [...list, next] : list.map((p, i) => (i === index ? next : p));
 }

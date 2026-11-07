@@ -2,7 +2,7 @@
   import Icon from './Icon.svelte';
   import { session } from './session.svelte';
   import { api } from './api';
-  import { presets, presetFor, isLocalUrl } from './providers';
+  import { activeProfile, presets, presetFor, isLocalUrl } from './providers';
   import { holdsSetup, missingModels, startsDownload } from './downloads';
   import type { AtlassianStatus, BridgeStatus, DownloadEvent, LocalServer, Settings, SetupInfo } from './api';
   import { onMount, untrack } from 'svelte';
@@ -15,7 +15,9 @@
     scroller?.scrollTo(0, 0);
   });
 
-  let form = $state<Settings>({ ...session.settings });
+  let form = $state<Settings>($state.snapshot(session.settings));
+  /** Setup only fills in the profile in use; Settings is where more are added. */
+  const profile = $derived(activeProfile(form));
   let apiKey = $state('');
 
   let info = $state<SetupInfo | null>(null);
@@ -97,16 +99,17 @@
 
   // ---------- AI model ----------
 
-  const selected = $derived(presetFor(form.baseUrl));
-  const isLocal = $derived(isLocalUrl(form.baseUrl));
+  const selected = $derived(presetFor(profile.baseUrl));
+  const isLocal = $derived(isLocalUrl(profile.baseUrl));
   let testing = $state(false);
   let test = $state<{ ok: boolean; text: string } | null>(null);
 
-  function pick(url: string, model: string) {
+  function pick(name: string, url: string, model: string) {
     test = null;
     apiKey = '';
-    form.baseUrl = url;
-    form.model = model;
+    profile.name = name;
+    profile.baseUrl = url;
+    profile.model = model;
   }
 
   async function runTest() {
@@ -151,7 +154,7 @@
     finishError = null;
     try {
       if (skip) await session.finishSetup(session.settings, null);
-      else await session.finishSetup({ ...form, speechModel: active }, apiKey.trim() || null);
+      else await session.finishSetup({ ...form, speechModel: active }, { [profile.id]: apiKey });
     } catch (e) {
       finishError = String(e);
     } finally {
@@ -346,8 +349,8 @@
             <div class="mt-2 flex flex-wrap items-center gap-2">
               <span class="text-[13px] text-muted">{l.name}:</span>
               {#each l.models as m}
-                {@const on = form.baseUrl === l.baseUrl && form.model === m}
-                <button class="{chip} {on ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}" onclick={() => pick(l.baseUrl, m)}>{m}</button>
+                {@const on = profile.baseUrl === l.baseUrl && profile.model === m}
+                <button class="{chip} {on ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}" onclick={() => pick(l.name, l.baseUrl, m)}>{m}</button>
               {:else}
                 <span class="text-[13px] text-faint">no models pulled yet</span>
               {/each}
@@ -358,15 +361,15 @@
         <h2 class="mt-5 text-sm font-semibold">Services</h2>
         <div class="mt-2 flex flex-wrap gap-2">
           {#each presets as p}
-            <button class="{chip} {selected === p.id ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}" onclick={() => pick(p.url, p.model)}>{p.label}</button>
+            <button class="{chip} {selected === p.id ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}" onclick={() => pick(p.label, p.url, p.model)}>{p.label}</button>
           {/each}
-          <button class="{chip} {selected === 'custom' ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}" onclick={() => pick('', '')}>Custom endpoint</button>
+          <button class="{chip} {selected === 'custom' ? 'border-ink bg-ink text-white' : 'border-line hover:border-ink'}" onclick={() => pick('', '', '')}>Custom endpoint</button>
         </div>
 
         <label class="mt-5 block text-sm font-medium" for="su-url">Server address</label>
-        <input id="su-url" class={field} placeholder="https://your-gateway.example.com/v1" spellcheck="false" bind:value={form.baseUrl} />
+        <input id="su-url" class={field} placeholder="https://your-gateway.example.com/v1" spellcheck="false" bind:value={profile.baseUrl} />
         <label class="mt-4 block text-sm font-medium" for="su-model">Model</label>
-        <input id="su-model" class={field} placeholder="model name as the provider spells it" spellcheck="false" bind:value={form.model} />
+        <input id="su-model" class={field} placeholder="model name as the provider spells it" spellcheck="false" bind:value={profile.model} />
         <label class="mt-4 block text-sm font-medium" for="su-key">
           API key {#if isLocal}<span class="font-normal text-faint">(not needed for a local server)</span>{/if}
         </label>
@@ -374,7 +377,7 @@
         <p class="mt-1.5 text-xs text-muted">Stored in Windows Credential Manager and only sent to this server.</p>
 
         <div class="mt-4 flex flex-wrap items-center gap-3">
-          <button class={secondary} disabled={testing || !form.baseUrl.trim() || !form.model.trim()} onclick={runTest}>
+          <button class={secondary} disabled={testing || !profile.baseUrl.trim() || !profile.model.trim()} onclick={runTest}>
             {testing ? 'Testing…' : 'Test connection'}
           </button>
           {#if test}
