@@ -148,6 +148,15 @@
 .prose-notes code { background: var(--soft); border-radius: 4px; padding: 1px 5px; font-size: 0.9em; }
 .prose-notes blockquote { border-left: 2px solid var(--line); margin: 0.6em 0; padding-left: 0.9em; color: var(--muted); }
 .prose-notes a { text-decoration: underline; text-underline-offset: 2px; }
+.prose-notes h4, .prose-notes h5, .prose-notes h6 { font-weight: 600; font-size: 1em; margin: 1em 0 0.3em; }
+.prose-notes hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+.prose-notes pre { background: var(--soft); border-radius: 8px; padding: 0.7em 0.9em; margin: 0.6em 0; overflow-x: auto; font-size: 0.9em; }
+.prose-notes pre code { background: none; padding: 0; font-size: 1em; }
+/* A wide table scrolls by itself instead of pushing the page sideways. */
+.prose-notes table { display: block; max-width: 100%; width: fit-content; overflow-x: auto; border-collapse: collapse; margin: 0.75em 0; font-size: 0.93em; line-height: 1.45; }
+.prose-notes th, .prose-notes td { border: 1px solid var(--line); padding: 0.4em 0.7em; vertical-align: top; min-width: 5em; }
+.prose-notes th { background: var(--soft); font-weight: 600; }
+.prose-notes th:not([align]) { text-align: left; }
 /* AI notes built on the user's notes: their own lines in ink, what the AI added in grey. */
 .prose-notes.has-mine { color: var(--muted); }
 .prose-notes.has-mine .mine { color: var(--ink); font-weight: 500; }
