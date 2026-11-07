@@ -6,6 +6,33 @@ import type { AskLookup, AskSources, CallEvent, ChatMsg, DownloadEvent, Hit, KbA
 export { inTauri };
 export type View = 'home' | 'meeting' | 'settings' | 'knowledge';
 
+/**
+ * Gathers pieces of a streamed reply and applies them together. Each piece re-renders the whole
+ * Markdown so far, which models can send faster than a long answer can be drawn.
+ */
+function batched(apply: (text: string) => void, ms = 50) {
+  let held = '';
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const flush = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+    if (held) apply(held);
+    held = '';
+  };
+  return {
+    push(text: string) {
+      held += text;
+      timer ??= setTimeout(flush, ms);
+    },
+    flush,
+    clear() {
+      if (timer) clearTimeout(timer);
+      timer = null;
+      held = '';
+    }
+  };
+}
+
 const DEFAULT_SETTINGS: Settings = {
   profiles: [{ id: 'default', name: 'openrouter.ai', baseUrl: 'https://openrouter.ai/api/v1', model: 'google/gemini-2.5-flash', fallbackModel: '' }],
   activeProfile: 'default',
@@ -39,6 +66,12 @@ class Session {
   current = $state<Meeting | null>(null);
   segs = $state<Seg[]>([]);
   chat = $state<ChatMsg[]>([]);
+  /** What's typed in the Ask box. Stopping or rewinding puts a question back here. */
+  askText = $state('');
+  /** The meeting the answer being written belongs to. */
+  private askMeetingId: number | null = null;
+  private answerPieces = batched((t) => (this.answerLive += t));
+  private notesPieces = batched((t) => (this.enhancedLive += t));
   /** Pages attached to the open meeting. */
   docs = $state<MeetingDoc[]>([]);
   attaching = $state(false);
@@ -164,7 +197,14 @@ class Session {
     this.chat = chat;
     this.docs = docs;
     this.attachError = null;
-    this.answerLive = '';
+    // Leaving mid-answer: it still finishes and is saved, and shows when you come back to it.
+    if (this.asking && id !== this.askMeetingId) this.asking = false;
+    if (!this.asking) {
+      this.answerPieces.clear();
+      this.answerLive = '';
+      this.askText = '';
+    }
+    this.notesPieces.clear();
     this.enhancedLive = '';
     this.drawer = false;
     this.error = null;
@@ -354,6 +394,7 @@ class Session {
     if (this.current?.id === id) await this.flushNotes();
     this.enhancingId = id;
     this.enhancingAuto = auto;
+    this.notesPieces.clear();
     this.enhancedLive = '';
     this.editedDuringPass = false;
     try {
@@ -368,14 +409,17 @@ class Session {
     if (this.enhancingAuto) this.autoError = message;
     else this.error = message;
     this.enhancingId = null;
+    this.notesPieces.clear();
     this.enhancedLive = '';
   }
 
   private onEnhance(e: StreamEvent) {
     if (e.meetingId === null || e.meetingId !== this.enhancingId) return;
     if (e.error) {
+      this.notesPieces.clear();
       this.enhanceFailed(e.error);
     } else if (e.done) {
+      this.notesPieces.flush();
       // Your edits made while it was written win over the pass; the next one builds on them.
       const here = this.current?.id === e.meetingId;
       if (this.editedDuringPass) {
@@ -388,9 +432,10 @@ class Session {
       this.editedDuringPass = false;
       if (this.enhancingAuto) this.autoError = null;
       this.enhancingId = null;
+      this.notesPieces.clear();
       this.enhancedLive = '';
       this.autoTick();
-    } else this.enhancedLive += e.delta;
+    } else this.notesPieces.push(e.delta);
   }
 
   private recordingStarted() {
@@ -541,10 +586,12 @@ class Session {
     this.answerSources = [];
     this.lookups = [];
     this.asking = true;
+    this.askMeetingId = this.current?.id ?? null;
+    this.answerPieces.clear();
     this.answerLive = '';
     this.error = null;
     try {
-      await api.ask(this.current?.id ?? null, q);
+      await api.ask(this.askMeetingId, q);
     } catch (e) {
       this.asking = false;
       this.error = String(e);
@@ -552,15 +599,53 @@ class Session {
   }
 
   private onAsk(e: StreamEvent) {
-    if (e.meetingId !== (this.current?.id ?? null)) return;
+    if (!this.asking || e.meetingId !== this.askMeetingId) return;
     if (e.error) {
+      this.answerPieces.flush();
       this.asking = false;
       this.error = e.error;
     } else if (e.done) {
+      this.answerPieces.flush();
       this.asking = false;
       this.chat.push({ role: 'assistant', content: this.answerLive });
       this.answerLive = '';
-    } else this.answerLive += e.delta;
+    } else this.answerPieces.push(e.delta);
+  }
+
+  /** Stop the answer. What's written so far stays; with nothing written, the question goes back in the box. */
+  async stopAsk() {
+    if (!this.asking) return;
+    this.answerPieces.clear();
+    this.asking = false;
+    this.answerLive = '';
+    try {
+      const kept = await api.stopAsk(this.askMeetingId);
+      if (kept !== null) this.chat.push({ role: 'assistant', content: kept });
+      else this.takeBack(this.chat.length - 1);
+    } catch (e) {
+      this.error = String(e);
+    }
+  }
+
+  /** Take a question and everything after it off the screen, and put it back in the box. */
+  private takeBack(index: number) {
+    const question = this.chat[index];
+    this.chat = this.chat.slice(0, index);
+    if (question?.role === 'user' && !this.askText.trim()) this.askText = question.content;
+    this.answerSources = [];
+    this.lookups = [];
+  }
+
+  /** Go back to before the question at `index`, to ask it again or differently. */
+  async rewindTo(index: number) {
+    if (this.asking) return;
+    try {
+      await api.rewindChat(this.current?.id ?? null, index);
+      this.askText = '';
+      this.takeBack(index);
+    } catch (e) {
+      this.error = String(e);
+    }
   }
 
   private onAskSources(e: AskSources) {

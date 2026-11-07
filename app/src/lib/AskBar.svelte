@@ -5,8 +5,9 @@
   import { session } from './session.svelte';
   import { chipLabel } from './quick';
 
-  let text = $state('');
   let open = $state(true);
+  /** The question whose Rewind was pressed, waiting for a yes. */
+  let rewinding = $state<number | null>(null);
   let thread: HTMLDivElement | undefined = $state();
 
   /** The prompt being added (`index` null) or edited, or null when the editor is closed. */
@@ -46,11 +47,12 @@
     addedTimer = setTimeout(() => (added = null), 2000);
   }
 
-  function submit(q: string = text) {
+  function submit(q: string = session.askText, fromBox = true) {
     if (!q.trim() || session.asking) return;
     session.ask(q);
-    text = '';
+    if (fromBox) session.askText = '';
     open = true;
+    rewinding = null;
   }
 
   $effect(() => {
@@ -65,8 +67,23 @@
     <div bind:this={thread} class="mb-3 max-h-[30vh] space-y-3 overflow-y-auto pr-1">
       {#each session.chat as m, i}
         {#if m.role === 'user'}
-          <div class="rise flex justify-end">
-            <p class="max-w-[80%] rounded-2xl rounded-br-md bg-ink px-4 py-2 text-sm text-white">{m.content}</p>
+          <div class="rise group flex flex-col items-end">
+            <p class="max-w-[80%] whitespace-pre-wrap break-words rounded-2xl rounded-br-md bg-ink px-4 py-2 text-sm text-white">{m.content}</p>
+            {#if rewinding === i}
+              <p class="mt-1 flex flex-wrap items-center justify-end gap-1 text-[11px] text-muted">
+                {session.chat.length - i > 1 ? `Remove this and the ${session.chat.length - i - 1} after it?` : 'Remove this question?'}
+                <button class="rounded-full bg-ink px-2 py-0.5 font-medium text-white" onclick={() => { session.rewindTo(i); rewinding = null; }}>Rewind</button>
+                <button class="rounded-full px-2 py-0.5 hover:bg-soft" onclick={() => (rewinding = null)}>Cancel</button>
+              </p>
+            {:else if !session.asking}
+              <button
+                class="mt-1 rounded-full px-2 py-0.5 text-[11px] font-medium text-muted opacity-0 hover:bg-soft hover:text-ink focus:opacity-100 group-hover:opacity-100"
+                title="Go back to before this question, to ask it again or differently"
+                onclick={() => (rewinding = i)}
+              >
+                Rewind to here
+              </button>
+            {/if}
           </div>
         {:else}
           <div class="rise max-w-[92%]">
@@ -124,7 +141,7 @@
           class="block w-full truncate rounded-full px-3.5 py-1.5 text-[13px] disabled:opacity-40"
           title={c.prompt}
           disabled={session.asking}
-          onclick={() => submit(c.prompt)}>{name}</button
+          onclick={() => submit(c.prompt, false)}>{name}</button
         >
         <!-- Over the button's padding, so it takes no room until it's wanted. -->
         <button
@@ -139,7 +156,7 @@
     {/each}
     {#if draft === null}
       <!-- Starts from whatever is in the Ask box, to keep a question you just typed. -->
-      <button class="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] text-muted hover:bg-soft hover:text-ink" onclick={() => openDraft(null, '', text)}>
+      <button class="flex items-center gap-1 rounded-full px-2.5 py-1.5 text-[13px] text-muted hover:bg-soft hover:text-ink" onclick={() => openDraft(null, '', session.askText)}>
         <Icon name="plus" size={14} /> Save a prompt
       </button>
     {/if}
@@ -190,7 +207,7 @@
       class="min-w-0 flex-1 bg-transparent py-1.5 text-sm outline-none placeholder:text-faint"
       placeholder={session.kb.length ? 'Ask about this meeting or your files…' : 'Ask about this meeting…'}
       aria-label="Ask about this meeting"
-      bind:value={text}
+      bind:value={session.askText}
     />
     {#if session.settings.profiles.length > 1}
       <select
@@ -208,13 +225,25 @@
         {open ? 'Hide' : 'Show'} answers
       </button>
     {/if}
-    <button
-      type="submit"
-      class="grid h-9 w-9 place-items-center rounded-full bg-ink text-white transition-opacity disabled:opacity-30"
-      disabled={!text.trim() || session.asking}
-      aria-label="Ask"
-    >
-      <Icon name="send" size={18} />
-    </button>
+    {#if session.asking}
+      <button
+        type="button"
+        class="grid h-9 w-9 place-items-center rounded-full bg-ink text-white"
+        aria-label="Stop the answer"
+        title="Stop the answer"
+        onclick={() => session.stopAsk()}
+      >
+        <Icon name="stop" size={18} />
+      </button>
+    {:else}
+      <button
+        type="submit"
+        class="grid h-9 w-9 place-items-center rounded-full bg-ink text-white transition-opacity disabled:opacity-30"
+        disabled={!session.askText.trim()}
+        aria-label="Ask"
+      >
+        <Icon name="send" size={18} />
+      </button>
+    {/if}
   </form>
 </div>

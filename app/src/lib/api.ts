@@ -281,6 +281,10 @@ export interface Api {
   /** `update` builds on the last AI notes (automatic passes) instead of starting over. */
   enhance(id: number, update: boolean): Promise<void>;
   ask(meetingId: number | null, question: string): Promise<void>;
+  /** Stop the answer being written. Returns the part kept as the answer; null if there was none. */
+  stopAsk(meetingId: number | null): Promise<string | null>;
+  /** Keep only the first `keep` messages of a chat. */
+  rewindChat(meetingId: number | null, keep: number): Promise<void>;
   search(query: string): Promise<Hit[]>;
   getSettings(): Promise<Settings>;
   /** `apiKeys` maps profile ids to keys typed for them. */
@@ -343,6 +347,8 @@ const tauriApi: Api = {
   deleteMeeting: (id) => invoke('delete_meeting', { id }),
   enhance: (id, update) => invoke('enhance_notes', { id, update }),
   ask: (meetingId, question) => invoke('ask', { meetingId, question }),
+  stopAsk: (meetingId) => invoke('stop_ask', { meetingId }),
+  rewindChat: (meetingId, keep) => invoke('rewind_chat', { meetingId, keep }),
   search: (query) => invoke('search', { query }),
   getSettings: () => invoke('get_settings'),
   saveSettings: (settings, apiKeys) => invoke('save_settings', { settings, apiKeys }),
@@ -443,6 +449,8 @@ function createMockApi(): Api {
   const chats: Record<number, ChatMsg[]> = {};
   const get = (id: number) => meetings.find((m) => m.id === id)!;
 
+  let askRun = 0;
+  let askLive: { meetingId: number | null; text: string } | null = null;
   const stream = async (name: string, meetingId: number | null, text: string, stale = () => false) => {
     for (const w of text.split(/(?<= )/)) {
       await new Promise((r) => setTimeout(r, 35));
@@ -551,7 +559,11 @@ function createMockApi(): Api {
       if (m.enhanced === base) m.enhanced = md;
     },
     ask: async (meetingId, question) => {
-      const a = `Based on the transcript, the checkout timeout comes from the retry logic waiting thirty seconds before failing [0:07]. Budi was asked to ship a fix by Friday [0:15].`;
+      const a = /table/i.test(question)
+        ? 'Here is what was agreed so far, with who owns it:\n\n```markdown\n| Task | Owner | Due | Notes that run on for a while so the column has to wrap or scroll |\n|---|---|\n\n| Ship the fix | Budi | Friday | The retry logic waits thirty seconds before failing [0:07] |\n| Update Confluence | You | Friday | Add the root cause to the page [0:15] |\n```\n\nThat covers it.'
+        : `Based on the transcript, the checkout timeout comes from the retry logic waiting thirty seconds before failing [0:07]. Budi was asked to ship a fix by Friday [0:15].`;
+      const run = ++askRun;
+      askLive = { meetingId, text: '' };
       if (meetingId !== null) (chats[meetingId] ??= []).push({ role: 'user', content: question });
       emit<AskSources>('ask-sources', { meetingId, files: kb.length ? [kb[0].title] : [] });
       if (settings.atlassian && /PAY-\d+|ticket|jira/i.test(question)) {
@@ -559,8 +571,29 @@ function createMockApi(): Api {
         await new Promise((r) => setTimeout(r, 600));
         emit<AskLookup>('ask-lookup', { meetingId, id: 'm1', label: 'Read PAY-142', state: 'done', error: null });
       }
-      await stream('ask-delta', meetingId, a);
+      // Slower than real answers usually are, to leave time to press Stop in the preview.
+      for (const w of a.split(/(?<= )/)) {
+        await new Promise((r) => setTimeout(r, 90));
+        if (run !== askRun) return;
+        askLive.text += w;
+        emit<StreamEvent>('ask-delta', { meetingId, delta: w, done: false, error: null });
+      }
+      askLive = null;
       if (meetingId !== null) chats[meetingId].push({ role: 'assistant', content: a });
+      emit<StreamEvent>('ask-delta', { meetingId, delta: '', done: true, error: null });
+    },
+    stopAsk: async () => {
+      if (!askLive) return null;
+      askRun++;
+      const { meetingId, text } = askLive;
+      askLive = null;
+      if (meetingId === null) return text || null;
+      if (text) chats[meetingId].push({ role: 'assistant', content: text });
+      else chats[meetingId].pop();
+      return text || null;
+    },
+    rewindChat: async (meetingId, keep) => {
+      if (meetingId !== null) chats[meetingId] = (chats[meetingId] ?? []).slice(0, keep);
     },
     search: async (q) =>
       Object.entries(transcripts).flatMap(([id, segs]) =>
