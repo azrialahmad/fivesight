@@ -188,22 +188,26 @@ impl Endpointer {
     /// Cut the active segment where someone else takes over (the caller knows, from outside
     /// the audio, that the speaker changed), and keep listening: the rest becomes a new segment.
     ///
-    /// The cut goes at the quietest frame among the last `lookback` frames, since the change is
-    /// reported a little after it happens and people rarely talk over each other exactly. Both
-    /// parts keep at least `min_part` frames, so a split never makes slivers.
-    pub fn split(&mut self, lookback: usize, min_part: usize) -> Vec<Event> {
+    /// The change happened about `ago` frames back (the caller corrects for how late it heard of
+    /// it). Within `window` frames of that, the cut goes at a pause if there is one, the one
+    /// nearest the change. When there is none, people were talking over each other, and the cut
+    /// goes at the change itself rather than at whichever frame happens to be a little quieter.
+    /// Both parts keep at least `min_part` frames, so a split never makes slivers.
+    pub fn split(&mut self, ago: usize, window: usize, min_part: usize) -> Vec<Event> {
         let n = self.probs.len();
         let min_part = min_part.max(1);
         if self.state != State::Speaking || n < 2 * min_part {
             return Vec::new();
         }
-        let from = n.saturating_sub(lookback).max(min_part);
         let to = n - min_part;
-        if from > to {
-            return Vec::new();
-        }
-        // Quietest frame; on ties the latest, so the first speaker keeps their last word.
-        let cut = (from..=to).rev().min_by(|&a, &b| self.probs[a].total_cmp(&self.probs[b])).unwrap_or(to);
+        let target = n.saturating_sub(ago).clamp(min_part, to);
+        let from = target.saturating_sub(window).max(min_part);
+        let quiet = self.cfg.threshold - self.cfg.hysteresis;
+        // Nearest pause to the change; on ties the later one, so the first speaker keeps their last word.
+        let cut = (from..=(target + window).min(to))
+            .filter(|&i| self.probs[i] < quiet)
+            .min_by_key(|&i| (i.abs_diff(target), std::cmp::Reverse(i)))
+            .unwrap_or(target);
 
         let audio: Vec<f32> = self.buf.drain(..cut * FRAME).collect();
         let head: Vec<f32> = self.probs.drain(..cut).collect();
@@ -366,7 +370,7 @@ mod tests {
         // Speaker A for 2 s, a 96 ms dip, speaker B for 0.6 s: the change is reported now.
         run(&mut ep, &[(62, 0.9), (3, 0.2), (19, 0.9)]);
         let total = ep.current_audio().len();
-        let ev = ep.split(40, 8);
+        let ev = ep.split(20, 12, 8);
         let [Event::End { start_sample, audio, forced: true, tail_frames }, Event::Start { at_sample }] = ev.as_slice()
         else {
             panic!("{ev:?}")
@@ -385,11 +389,33 @@ mod tests {
     }
 
     #[test]
+    fn talking_over_each_other_cuts_where_the_change_was() {
+        let mut ep = Endpointer::new(cfg());
+        // A talks for 2 s, B cuts in without a pause; the probability only wobbles a little.
+        run(&mut ep, &[(30, 0.95), (2, 0.6), (30, 0.95), (25, 0.9)]);
+        // B started 25 frames ago. The slightly quieter frames at 30-31 are not a pause.
+        let ev = ep.split(25, 12, 8);
+        let [Event::End { audio, .. }, Event::Start { at_sample }] = ev.as_slice() else { panic!("{ev:?}") };
+        assert_eq!(audio.len(), 62 * FRAME);
+        assert_eq!(*at_sample, 62 * FRAME as u64);
+    }
+
+    #[test]
+    fn a_pause_far_from_the_change_is_not_used() {
+        let mut ep = Endpointer::new(cfg());
+        // A breathes early on, long before B takes over.
+        run(&mut ep, &[(20, 0.9), (2, 0.1), (60, 0.9)]);
+        let ev = ep.split(15, 10, 8);
+        let [Event::End { audio, .. }, ..] = ev.as_slice() else { panic!("{ev:?}") };
+        assert_eq!(audio.len(), (82 - 15) * FRAME);
+    }
+
+    #[test]
     fn split_leaves_short_or_idle_segments_alone() {
         let mut ep = Endpointer::new(cfg());
-        assert!(ep.split(40, 8).is_empty());
+        assert!(ep.split(20, 12, 8).is_empty());
         run(&mut ep, &[(10, 0.9)]);
-        assert!(ep.split(40, 8).is_empty(), "under 2 x min_part");
+        assert!(ep.split(20, 12, 8).is_empty(), "under 2 x min_part");
     }
 
     #[test]
@@ -397,7 +423,7 @@ mod tests {
         let mut ep = Endpointer::new(cfg());
         // Pre-roll, a short start, a mumble, then a long stretch of the next speaker.
         run(&mut ep, &[(9, 0.0), (3, 0.9), (4, 0.3), (30, 0.9)]);
-        let ev = ep.split(40, 8);
+        let ev = ep.split(20, 12, 8);
         assert!(matches!(ev.as_slice(), [Event::Dropped, Event::Start { .. }]), "{ev:?}");
         assert!(ep.is_speaking());
     }

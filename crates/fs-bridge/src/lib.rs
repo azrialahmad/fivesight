@@ -95,29 +95,46 @@ pub struct SpeakerLog {
 
 /// Someone starting to talk this soon after another person stopped is taking over from them.
 const TAKEOVER_MS: i64 = 1_500;
+/// How late a start is reported: Meet's indicator, then the extension wants a few changes over
+/// two ticks before it believes it (see `createSpeakingTracker`).
+const START_LAG_MS: i64 = 500;
+/// How late a stop is reported: the extension waits five quiet ticks (a second) first.
+const END_LAG_MS: i64 = 1_000;
+/// When two people both covered a line, someone who covered at least this share of what the
+/// other did counts as close; the one who started later then gets it, since they cut in.
+const CLOSE_SHARE: f32 = 0.7;
 
 impl SpeakerLog {
-    /// Record a change. Returns true when this is a different person taking over: someone else
-    /// is still talking or just stopped, so a transcript line running across it should be cut.
-    pub fn apply(&mut self, name: &str, speaking: bool, at: i64) -> bool {
+    /// Record a change reported at `at`. Returns when the line on the call should be cut (epoch
+    /// ms, corrected for the report's delay), if this change is one: someone starts while
+    /// someone else is talking or just stopped (a takeover), or someone who cut in stops while
+    /// the person they interrupted is still talking (who then has the floor back).
+    pub fn apply(&mut self, name: &str, speaking: bool, at: i64) -> Option<i64> {
         let name = name.trim();
         if name.is_empty() {
-            return false;
+            return None;
         }
-        let mut takeover = false;
+        let mut cut = None;
         if speaking {
             if !self.open.contains_key(name) {
-                takeover = self.open.keys().any(|n| n != name)
-                    || self.closed.back().is_some_and(|i| i.name != name && at - i.end <= TAKEOVER_MS);
-                self.open.insert(name.to_string(), at);
+                let start = at - START_LAG_MS;
+                let takeover = self.open.keys().any(|n| n != name)
+                    || self.closed.back().is_some_and(|i| i.name != name && start - i.end <= TAKEOVER_MS);
+                cut = takeover.then_some(start);
+                self.open.insert(name.to_string(), start);
             }
         } else if let Some(start) = self.open.remove(name) {
-            self.closed.push_back(Interval { name: name.to_string(), start, end: at.max(start) });
+            let end = (at - END_LAG_MS).max(start);
+            // Still talking, and was already when this person came in: they were interrupted.
+            if self.open.values().any(|&s| s < start) {
+                cut = Some(end);
+            }
+            self.closed.push_back(Interval { name: name.to_string(), start, end });
         }
         while self.closed.front().is_some_and(|i| i.end < at - KEEP_MS) {
             self.closed.pop_front();
         }
-        takeover
+        cut
     }
 
     /// Everyone's indicators go dark (the call ended or the tab closed).
@@ -128,29 +145,36 @@ impl SpeakerLog {
         }
     }
 
-    /// Who spoke the most between `start` and `end` (epoch ms), if anyone clearly did.
+    /// Who spoke between `start` and `end` (epoch ms), if anyone clearly did: whoever spoke the
+    /// most, except that when two covered it about as much (one was cutting in on the other),
+    /// the one who started later, since the interrupted person's indicator stays lit over it.
     pub fn speaker_for(&self, start: i64, end: i64) -> Option<String> {
         let end = end.max(start);
         let (from, to) = (start - SLACK_MS, end + SLACK_MS);
-        let mut total: HashMap<String, i64> = HashMap::new();
-        for i in &self.closed {
-            let overlap = i.end.min(to) - i.start.max(from);
+        // name -> (time covered, latest start of a turn that covered it)
+        let mut total: HashMap<String, (i64, i64)> = HashMap::new();
+        let mut add = |name: &str, s: i64, e: i64| {
+            let overlap = e.min(to) - s.max(from);
             if overlap > 0 {
-                *total.entry(i.name.clone()).or_default() += overlap;
+                let t = total.entry(name.to_string()).or_insert((0, s));
+                t.0 += overlap;
+                t.1 = t.1.max(s);
             }
+        };
+        for i in &self.closed {
+            add(&i.name, i.start, i.end);
         }
         // Someone still talking counts up to the end of the window.
-        for (name, s) in &self.open {
-            let overlap = to - (*s).max(from);
-            if overlap > 0 {
-                *total.entry(name.clone()).or_default() += overlap;
-            }
+        for (name, &s) in &self.open {
+            add(name, s, to);
         }
         let need = ((end - start) / 3).clamp(150, 400);
+        let most = total.values().map(|t| t.0).max().filter(|&ms| ms >= need)?;
+        let close = (most as f32 * CLOSE_SHARE) as i64;
         total
             .into_iter()
-            .filter(|(_, ms)| *ms >= need)
-            .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            .filter(|(_, (ms, _))| *ms >= close.max(need))
+            .max_by(|a, b| a.1 .1.cmp(&b.1 .1).then(a.1 .0.cmp(&b.1 .0)).then_with(|| b.0.cmp(&a.0)))
             .map(|(n, _)| n)
     }
 }
@@ -382,17 +406,43 @@ mod tests {
     #[test]
     fn says_when_someone_else_takes_over() {
         let mut log = SpeakerLog::default();
-        assert!(!log.apply("Budi", true, 1_000), "first speaker");
-        assert!(!log.apply("Budi", true, 1_200), "still Budi");
-        assert!(log.apply("Sari", true, 3_000), "over Budi");
-        log.apply("Budi", false, 3_100);
+        assert_eq!(log.apply("Budi", true, 1_000), None, "first speaker");
+        assert_eq!(log.apply("Budi", true, 1_200), None, "still Budi");
+        // Cut where Sari really started: half a second before it was reported.
+        assert_eq!(log.apply("Sari", true, 3_000), Some(2_500), "over Budi");
+        assert_eq!(log.apply("Budi", false, 3_100), None, "Budi was there first: no hand-back");
         log.apply("Sari", false, 5_000);
-        assert!(!log.apply("Sari", true, 5_500), "Sari again after a breath");
+        assert_eq!(log.apply("Sari", true, 5_500), None, "Sari again after a breath");
         log.apply("Sari", false, 6_000);
-        assert!(log.apply("Budi", true, 7_000), "right after Sari stopped");
+        assert_eq!(log.apply("Budi", true, 7_000), Some(6_500), "right after Sari stopped");
         log.apply("Budi", false, 8_000);
-        assert!(!log.apply("Sari", true, 20_000), "after a long silence, nothing to cut");
-        assert!(!log.apply("  ", true, 20_100));
+        assert_eq!(log.apply("Sari", true, 20_000), None, "after a long silence, nothing to cut");
+        assert_eq!(log.apply("  ", true, 20_100), None);
+    }
+
+    #[test]
+    fn the_floor_goes_back_after_an_interruption() {
+        let mut log = SpeakerLog::default();
+        log.apply("Budi", true, 1_000);
+        assert_eq!(log.apply("Sari", true, 5_000), Some(4_500), "Sari cuts in");
+        // Sari stops while Budi carries on: cut there too, a second before it was reported.
+        assert_eq!(log.apply("Sari", false, 8_000), Some(7_000));
+        // The lines on either side go to the right people, though Budi's light never went out.
+        assert_eq!(log.speaker_for(1_000, 4_400).as_deref(), Some("Budi"));
+        assert_eq!(log.speaker_for(4_500, 7_000).as_deref(), Some("Sari"));
+        assert_eq!(log.speaker_for(7_000, 10_000).as_deref(), Some("Budi"));
+    }
+
+    #[test]
+    fn a_quick_reply_is_not_named_after_the_last_speaker() {
+        let mut log = SpeakerLog::default();
+        // Budi stops at 10.0 s, Sari answers "iya, bisa" from 10.4 to 11.4 s. The extension
+        // reports each a little late: Budi's stop at 11.0, Sari's start at 10.9 and stop at 12.4.
+        log.apply("Budi", true, 2_500);
+        log.apply("Budi", false, 11_000);
+        log.apply("Sari", true, 10_900);
+        log.apply("Sari", false, 12_400);
+        assert_eq!(log.speaker_for(10_400, 11_400).as_deref(), Some("Sari"));
     }
 
     #[test]
