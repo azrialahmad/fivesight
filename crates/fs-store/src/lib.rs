@@ -654,6 +654,16 @@ impl Store {
         Ok(())
     }
 
+    /// Keep only the first `keep` messages of a chat, for going back to an earlier point in it.
+    pub fn rewind_chat(&self, meeting_id: Option<i64>, keep: usize) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM chat WHERE meeting_id IS ?1 AND id NOT IN
+               (SELECT id FROM chat WHERE meeting_id IS ?1 ORDER BY id LIMIT ?2)",
+            params![meeting_id, keep as i64],
+        )?;
+        Ok(())
+    }
+
     /// Chat for one meeting, or the global chat when `meeting_id` is `None`. Oldest first.
     pub fn chat_history(&self, meeting_id: Option<i64>) -> Result<Vec<ChatMessage>> {
         let mut st = self.conn.prepare("SELECT role, content FROM chat WHERE meeting_id IS ?1 ORDER BY id")?;
@@ -879,6 +889,10 @@ mod tests {
         s.add_chat(Some(id), "assistant", "a1", 2).unwrap();
         s.add_chat(None, "user", "global", 3).unwrap();
         assert_eq!(s.chat_history(Some(id)).unwrap().len(), 2);
+        s.rewind_chat(Some(id), 1).unwrap();
+        assert_eq!(s.chat_history(Some(id)).unwrap(), vec![ChatMessage { role: "user".into(), content: "q1".into() }]);
+        assert_eq!(s.chat_history(None).unwrap().len(), 1, "other chats are left alone");
+        s.add_chat(Some(id), "assistant", "a1", 2).unwrap();
         assert_eq!(s.chat_history(None).unwrap(), vec![ChatMessage { role: "user".into(), content: "global".into() }]);
     }
 

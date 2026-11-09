@@ -19,18 +19,23 @@ pub enum LlmError {
     Empty,
 }
 
-/// How long to wait for a complete non-streamed reply, and for the next piece of a streamed one.
-/// Without these a stalled server leaves the app "thinking" forever.
-const REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long to wait for the next piece of a reply. Without this a stalled server leaves the app
+/// "thinking" forever.
 const STREAM_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn client(total: Option<std::time::Duration>) -> reqwest::Client {
-    let b = reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(15));
-    let b = match total {
-        Some(t) => b.timeout(t),
-        None => b.read_timeout(STREAM_IDLE_TIMEOUT),
-    };
-    b.build().unwrap_or_default()
+/// One client for the whole app: it keeps connections open, so a question doesn't pay for a new
+/// TCP and TLS handshake every time.
+fn client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .read_timeout(STREAM_IDLE_TIMEOUT)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    })
 }
 
 impl LlmError {
@@ -164,56 +169,34 @@ pub struct Reply {
     pub tool_calls: Vec<ToolCall>,
 }
 
-/// One non-streamed request offering `tools` (OpenAI function-calling format).
-/// Servers or models without tool support usually answer 400/404/422; callers can then
-/// fall back to a plain [`chat_stream`].
-pub async fn chat_with_tools(
-    cfg: &LlmConfig,
-    messages: &[Message],
-    tools: &serde_json::Value,
-) -> Result<Reply, LlmError> {
-    let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let mut req = client(Some(REPLY_TIMEOUT)).post(url).json(&serde_json::json!({
-        "model": cfg.model,
-        "messages": messages,
-        "tools": tools,
-        "tool_choice": "auto",
-        "stream": false,
-    }));
-    if let Some(k) = &cfg.api_key {
-        req = req.bearer_auth(k);
-    }
-    let resp = req.send().await?;
-    let status = resp.status();
-    let body = resp.text().await?;
-    if !status.is_success() {
-        return Err(LlmError::Api { status: status.as_u16(), body: body.chars().take(400).collect() });
-    }
-    let v: serde_json::Value =
-        serde_json::from_str(&body).map_err(|e| LlmError::Stream(format!("unreadable reply: {e}")))?;
-    if let Some(err) = v.get("error") {
-        return Err(LlmError::Stream(
-            err.get("message").and_then(|m| m.as_str()).unwrap_or("unknown error").to_string(),
-        ));
-    }
-    let msg = &v["choices"][0]["message"];
-    let content = msg["content"].as_str().unwrap_or("").to_string();
-    let tool_calls: Vec<ToolCall> =
-        msg.get("tool_calls").and_then(|t| serde_json::from_value(t.clone()).ok()).unwrap_or_default();
-    Ok(Reply { content, tool_calls })
+/// Whether to mark what can be cached. Most servers cache prompt prefixes on their own; Anthropic's
+/// models only do when asked, and only some gateways pass the marks along.
+fn wants_cache_marks(cfg: &LlmConfig, model: &str) -> bool {
+    let url = cfg.base_url.to_ascii_lowercase();
+    model.to_ascii_lowercase().contains("claude") && (url.contains("openrouter.ai") || url.contains("anthropic.com"))
 }
 
-async fn stream_once(
-    client: &reqwest::Client,
-    cfg: &LlmConfig,
-    model: &str,
-    messages: &[Message],
-    on_delta: &mut (impl FnMut(&str) + Send),
-) -> Result<String, LlmError> {
-    use futures_util::StreamExt;
+/// The messages as sent. With cache marks: the rules, the meeting material, and the newest turn.
+fn wire_messages(cfg: &LlmConfig, model: &str, messages: &[Message]) -> serde_json::Value {
+    let mut wire = serde_json::to_value(messages).unwrap_or_default();
+    if !wants_cache_marks(cfg, model) {
+        return wire;
+    }
+    let last = messages.len().saturating_sub(1);
+    for (i, m) in wire.as_array_mut().into_iter().flatten().enumerate() {
+        let markable = matches!(m["role"].as_str(), Some("system" | "user"));
+        if (i < 2 || i == last) && markable {
+            let text = m["content"].take();
+            m["content"] =
+                serde_json::json!([{ "type": "text", "text": text, "cache_control": { "type": "ephemeral" } }]);
+        }
+    }
+    wire
+}
 
+async fn post(cfg: &LlmConfig, body: &serde_json::Value) -> Result<reqwest::Response, LlmError> {
     let url = format!("{}/chat/completions", cfg.base_url.trim_end_matches('/'));
-    let mut req = client.post(url).json(&serde_json::json!({ "model": model, "messages": messages, "stream": true }));
+    let mut req = client().post(url).json(body);
     if let Some(k) = &cfg.api_key {
         req = req.bearer_auth(k);
     }
@@ -223,26 +206,106 @@ async fn stream_once(
         let body = resp.text().await.unwrap_or_default();
         return Err(LlmError::Api { status: status.as_u16(), body: body.chars().take(400).collect() });
     }
+    Ok(resp)
+}
+
+/// What to offer the model besides answering: the tools, and "auto" or "none".
+#[derive(Clone, Copy)]
+struct Offer<'a> {
+    tools: &'a serde_json::Value,
+    choice: &'a str,
+}
+
+async fn stream_once(
+    cfg: &LlmConfig,
+    model: &str,
+    messages: &[Message],
+    offer: Option<Offer<'_>>,
+    on_delta: &mut (impl FnMut(&str) + Send),
+) -> Result<Reply, LlmError> {
+    use futures_util::StreamExt;
+
+    let started = std::time::Instant::now();
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": wire_messages(cfg, model, messages),
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+    if let Some(o) = offer {
+        body["tools"] = o.tools.clone();
+        body["tool_choice"] = o.choice.into();
+    }
+    let resp = match post(cfg, &body).await {
+        // A strict server may not know this option; the usage numbers aren't worth failing over.
+        Err(LlmError::Api { status: 400 | 422, body: why }) if why.contains("stream_options") => {
+            body.as_object_mut().map(|b| b.remove("stream_options"));
+            post(cfg, &body).await?
+        }
+        other => other?,
+    };
 
     let mut decoder = sse::SseDecoder::default();
-    let mut full = String::new();
+    let mut reply = Reply::default();
+    let mut first_text = None;
+    let mut usage = None;
     let mut bytes = resp.bytes_stream();
-    while let Some(chunk) = bytes.next().await {
+    'read: while let Some(chunk) = bytes.next().await {
         for ev in decoder.push(&chunk?) {
             match ev {
                 sse::SseEvent::Delta(d) => {
+                    first_text.get_or_insert_with(|| started.elapsed());
                     on_delta(&d);
-                    full.push_str(&d);
+                    reply.content.push_str(&d);
                 }
+                sse::SseEvent::ToolCall { index, id, name, arguments } => {
+                    while reply.tool_calls.len() <= index {
+                        reply.tool_calls.push(ToolCall {
+                            id: String::new(),
+                            kind: function_kind(),
+                            function: FunctionCall { name: String::new(), arguments: String::new() },
+                        });
+                    }
+                    let call = &mut reply.tool_calls[index];
+                    if let Some(id) = id {
+                        call.id = id;
+                    }
+                    if let Some(name) = name {
+                        call.function.name = name;
+                    }
+                    call.function.arguments.push_str(&arguments);
+                }
+                sse::SseEvent::Usage { prompt_tokens, cached_tokens } => usage = Some((prompt_tokens, cached_tokens)),
                 sse::SseEvent::Error(e) => return Err(LlmError::Stream(e)),
-                sse::SseEvent::Done => break,
+                sse::SseEvent::Done => break 'read,
             }
         }
     }
-    if full.trim().is_empty() {
+    let (prompt, cached) = usage.unwrap_or_default();
+    tracing::info!(
+        "{model}: first text after {} ms, done after {} ms, {prompt} prompt tokens, {cached} cached ({}%)",
+        first_text.map_or(0, |t| t.as_millis()),
+        started.elapsed().as_millis(),
+        (cached * 100).checked_div(prompt).unwrap_or(0),
+    );
+    if reply.content.trim().is_empty() && reply.tool_calls.is_empty() {
         return Err(LlmError::Empty);
     }
-    Ok(full)
+    Ok(reply)
+}
+
+/// Stream a reply that may ask for `tools` (OpenAI function-calling format), calling `on_delta`
+/// for each piece of text as it arrives. `choice` is "auto", or "none" to make the model answer
+/// while keeping the same tools in the prompt. Servers or models without tool support usually
+/// answer 400/404/422; callers can then fall back to a plain [`chat_stream`].
+pub async fn chat_stream_tools(
+    cfg: &LlmConfig,
+    messages: &[Message],
+    tools: &serde_json::Value,
+    choice: &str,
+    mut on_delta: impl FnMut(&str) + Send,
+) -> Result<Reply, LlmError> {
+    stream_once(cfg, &cfg.model, messages, Some(Offer { tools, choice }), &mut on_delta).await
 }
 
 /// Stream a chat completion, calling `on_delta` for each piece of text. Returns the full text,
@@ -253,24 +316,27 @@ pub async fn chat_stream(
     messages: &[Message],
     mut on_delta: impl FnMut(&str) + Send,
 ) -> Result<String, LlmError> {
-    let client = client(None);
     let mut produced = false;
     let mut tracked = |d: &str| {
         // Whitespace alone isn't an answer yet; the fallback can still take over.
         produced |= !d.trim().is_empty();
         on_delta(d);
     };
-    match stream_once(&client, cfg, &cfg.model, messages, &mut tracked).await {
-        Ok(t) => Ok(t),
+    let reply = match stream_once(cfg, &cfg.model, messages, None, &mut tracked).await {
+        Ok(r) => Ok(r),
         Err(e) if !produced => match &cfg.fallback_model {
             Some(fb) => {
                 tracing::warn!("primary model failed ({e}); trying fallback {fb}");
-                stream_once(&client, cfg, fb, messages, &mut on_delta).await
+                stream_once(cfg, fb, messages, None, &mut on_delta).await
             }
             None => Err(e),
         },
         Err(e) => Err(e),
+    }?;
+    if reply.content.trim().is_empty() {
+        return Err(LlmError::Empty);
     }
+    Ok(reply.content)
 }
 
 #[cfg(test)]
@@ -407,38 +473,92 @@ mod tests {
         assert_eq!(seen, ["Hel", "lo ", "world"]);
     }
 
+    /// One SSE chunk per tool-call piece, as servers stream them.
+    fn tool_sse() -> String {
+        let mut s = String::new();
+        for delta in [
+            r#"{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"jira_view","arguments":""}}]}"#,
+            r#"{"tool_calls":[{"index":0,"function":{"arguments":"{\"key\":"}}]}"#,
+            r#"{"tool_calls":[{"index":0,"function":{"arguments":"\"PAY-142\"}"}}]}"#,
+        ] {
+            s.push_str(&format!("data: {{\"choices\":[{{\"delta\":{delta}}}]}}\n\n"));
+        }
+        s.push_str("data: [DONE]\n\n");
+        s
+    }
+
     #[tokio::test]
-    async fn tool_calls_are_requested_and_parsed() {
-        let reply = r#"{"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[
-            {"id":"call_1","type":"function","function":{"name":"jira_view","arguments":"{\"key\":\"PAY-142\"}"}}]}}]}"#;
-        let (url, seen) = fake_seq(vec![("200 OK", reply.into())]).await;
+    async fn tool_calls_are_requested_and_put_together() {
+        let (url, seen) = fake_seq(vec![("200 OK", tool_sse())]).await;
         let cfg = LlmConfig::local(&url, "m");
         let tools = serde_json::json!([{"type": "function", "function": {"name": "jira_view", "parameters": {}}}]);
-        let r = chat_with_tools(&cfg, &[Message::user("what is PAY-142?")], &tools).await.unwrap();
+        let r = chat_stream_tools(&cfg, &[Message::user("what is PAY-142?")], &tools, "auto", |_| {}).await.unwrap();
         assert_eq!(r.content, "");
         assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0].id, "call_1");
         assert_eq!(r.tool_calls[0].function.name, "jira_view");
         assert_eq!(r.tool_calls[0].function.arguments, r#"{"key":"PAY-142"}"#);
         assert_eq!(seen.lock().unwrap().as_slice(), ["m+tools"]);
     }
 
     #[tokio::test]
-    async fn a_plain_answer_comes_back_as_content() {
-        let reply = r#"{"choices":[{"message":{"role":"assistant","content":"No lookup needed."}}]}"#;
-        let url = fake("200 OK", reply.into()).await;
-        let r = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([]))
-            .await
-            .unwrap();
+    async fn a_plain_answer_with_tools_on_offer_streams_as_it_comes() {
+        let url = fake("200 OK", sse(&["No lookup ", "needed."])).await;
+        let mut seen = Vec::new();
+        let r = chat_stream_tools(
+            &LlmConfig::local(&url, "m"),
+            &[Message::user("hi")],
+            &serde_json::json!([]),
+            "auto",
+            |d| seen.push(d.to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(r, Reply { content: "No lookup needed.".into(), tool_calls: vec![] });
+        assert_eq!(seen, ["No lookup ", "needed."]);
     }
 
     #[tokio::test]
     async fn tool_support_errors_surface_for_fallback() {
         let url = fake("400 Bad Request", r#"{"error":{"message":"tools not supported"}}"#.into()).await;
-        let err = chat_with_tools(&LlmConfig::local(&url, "m"), &[Message::user("hi")], &serde_json::json!([]))
-            .await
-            .unwrap_err();
+        let err = chat_stream_tools(
+            &LlmConfig::local(&url, "m"),
+            &[Message::user("hi")],
+            &serde_json::json!([]),
+            "auto",
+            |_| {},
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, LlmError::Api { status: 400, .. }), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_rejects_usage_reporting_is_asked_again_without_it() {
+        let refused = (r#"400 Bad Request"#, r#"{"error":{"message":"unknown field stream_options"}}"#.to_string());
+        let (url, seen) = fake_seq(vec![refused, ("200 OK", sse(&["ok"]))]).await;
+        let full = chat_stream(&LlmConfig::local(&url, "m"), &[Message::user("hi")], |_| {}).await.unwrap();
+        assert_eq!(full, "ok");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn only_claude_through_a_gateway_that_takes_them_gets_cache_marks() {
+        let msgs = [Message::system("rules"), Message::user("material"), Message::assistant("ok"), Message::user("q")];
+        let marked = wire_messages(
+            &LlmConfig::custom("https://openrouter.ai/api/v1", None, "x"),
+            "anthropic/claude-sonnet-4.5",
+            &msgs,
+        );
+        for i in [0, 1, 3] {
+            assert_eq!(marked[i]["content"][0]["cache_control"]["type"], "ephemeral", "message {i}");
+        }
+        assert_eq!(marked[0]["content"][0]["text"], "rules");
+        assert_eq!(marked[2]["content"], "ok", "only rules, material and the newest turn");
+
+        let plain = |url: &str, model: &str| wire_messages(&LlmConfig::custom(url, None, model), model, &msgs);
+        assert_eq!(plain("https://openrouter.ai/api/v1", "deepseek/deepseek-chat")[0]["content"], "rules");
+        assert_eq!(plain("https://gateway.example.com/v1", "claude-sonnet-4.5")[0]["content"], "rules");
     }
 
     #[test]

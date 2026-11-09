@@ -6,9 +6,12 @@
 //!
 //! Results go into the prompt as data in `<context>` tags, like the user's files. If the AI server
 //! or model doesn't support tool calls, Ask still works: it just answers with what was read up front.
+//!
+//! Answers stream as they are written, and each round only adds to the end of the prompt, so the
+//! server's prompt cache covers the rounds before it.
 
 use fs_atlassian::{from_tool_call, keys_in, page_links_in, run, tool_specs, ReadCommand};
-use fs_llm::{chat_with_tools, LlmConfig, LlmError, Message};
+use fs_llm::{chat_stream_tools, LlmConfig, LlmError, Message};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
 
@@ -64,8 +67,28 @@ async fn lookup(app: &AppHandle, meeting_id: Option<i64>, id: String, cmd: ReadC
     }
 }
 
-/// Do the lookups for one question. Adds what was read to `msgs` (as context) and returns the
-/// finished answer if the AI already wrote one while using tools; `None` means "stream an answer now".
+/// How a question's lookups ended.
+pub enum Outcome {
+    /// The AI answered with tools on offer. The text has already gone out through `on_delta`.
+    Answered(String),
+    /// No answer, and nothing shown yet: ask again without tools.
+    Plain,
+    /// It failed after part of an answer was shown, so starting over would repeat it.
+    Failed(LlmError),
+}
+
+/// What was read for this question goes in front of it. The earlier turns stay as they were, so
+/// the server's prompt cache still covers them.
+fn add_to_question(msgs: &mut [Message], read: &str) {
+    if let Some(question) = msgs.last_mut().filter(|_| !read.is_empty()) {
+        question.content = format!("{}\n\n{}", read.trim_start(), question.content);
+    }
+}
+
+/// Do the lookups for one question, streaming any answer through `on_delta`. What was read up
+/// front is added to `msgs`, and on [`Outcome::Plain`] what the tools read is too. `msgs` ends
+/// with the question.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_lookups(
     app: &AppHandle,
     meeting_id: Option<i64>,
@@ -74,9 +97,8 @@ pub async fn run_lookups(
     question: &str,
     jira: bool,
     confluence: bool,
-) -> Option<String> {
-    // msgs is [system, user(material), assistant(ack), ...history, user(question)];
-    // anything read goes into the material turn so the question stays last.
+    on_delta: &mut (impl FnMut(&str) + Send),
+) -> Outcome {
     let mut gathered = String::new();
 
     let mut upfront: Vec<ReadCommand> = Vec::new();
@@ -94,9 +116,7 @@ pub async fn run_lookups(
     for (title, text) in futures_util::future::join_all(reads).await {
         gathered.push_str(&context_block(&title, &text));
     }
-    if let Some(material) = msgs.get_mut(1) {
-        material.content.push_str(&gathered);
-    }
+    add_to_question(msgs, &gathered);
 
     let tools = tool_specs(jira, confluence);
     let mut convo: Vec<Message> = msgs.to_vec();
@@ -104,10 +124,25 @@ pub async fn run_lookups(
         system.content.push_str(TOOLS_NOTE);
     }
     let mut tool_results = String::new();
+    let mut shown = String::new();
 
-    for round in 0..MAX_ROUNDS {
-        let reply = match chat_with_tools(cfg, &convo, &tools).await {
+    // The last round keeps the tools in the prompt, so it's still cached, but must answer.
+    for round in 0..=MAX_ROUNDS {
+        let choice = if round < MAX_ROUNDS { "auto" } else { "none" };
+        let mut after_earlier_text = !shown.trim().is_empty();
+        let result = chat_stream_tools(cfg, &convo, &tools, choice, |d: &str| {
+            if after_earlier_text {
+                after_earlier_text = false;
+                shown.push_str("\n\n");
+                on_delta("\n\n");
+            }
+            shown.push_str(d);
+            on_delta(d);
+        })
+        .await;
+        let reply = match result {
             Ok(r) => r,
+            Err(e) if !shown.trim().is_empty() => return Outcome::Failed(e),
             Err(e) => {
                 // Usually "this model can't use tools". Fall back to a plain answer either way;
                 // a real problem (bad key, server down) will surface from that request instead.
@@ -125,11 +160,11 @@ pub async fn run_lookups(
             reply.tool_calls.len(),
             reply.content.trim().len()
         );
+        if reply.tool_calls.is_empty() && reply.content.trim().is_empty() && shown.trim().is_empty() {
+            break; // An empty reply: try once more without tools.
+        }
         if reply.tool_calls.is_empty() {
-            if let Some(material) = msgs.get_mut(1) {
-                material.content.push_str(&tool_results);
-            }
-            return Some(reply.content).filter(|c| !c.trim().is_empty());
+            return Outcome::Answered(shown);
         }
 
         convo.push(Message::assistant_calls(reply.content.clone(), reply.tool_calls.clone()));
@@ -151,10 +186,11 @@ pub async fn run_lookups(
         }
     }
 
-    // Out of rounds or no tool support: answer from what was gathered.
+    // No tool support, or it never settled on an answer: answer from what was gathered.
     tracing::debug!("lookups done without an answer; streaming one from what was read");
-    if let Some(material) = msgs.get_mut(1) {
-        material.content.push_str(&tool_results);
+    if !shown.trim().is_empty() {
+        return Outcome::Answered(shown);
     }
-    None
+    add_to_question(msgs, &tool_results);
+    Outcome::Plain
 }

@@ -349,6 +349,7 @@ struct AppState {
     /// A model download is running, and the flag that stops it.
     downloading: std::sync::atomic::AtomicBool,
     download_cancel: std::sync::atomic::AtomicBool,
+    ask_run: Mutex<Option<AskRun>>,
     /// What the Meet extension reports: who is speaking, and whether a call is on.
     meet: Mutex<MeetState>,
     /// Last known acli login state; refreshed when Settings opens.
@@ -1114,6 +1115,71 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
     Ok(())
 }
 
+/// The Ask answer being written, so it can be stopped.
+struct AskRun {
+    id: u64,
+    meeting_id: Option<i64>,
+    task: tauri::async_runtime::JoinHandle<()>,
+    /// What has been shown so far.
+    partial: std::sync::Arc<Mutex<String>>,
+}
+
+/// Stop the running answer, if any. What was written so far is kept as the answer and returned.
+/// With nothing written, the question is taken back out of the chat.
+fn stop_run(state: &AppState) -> Result<Option<String>, String> {
+    let Some(run) = lock(&state.ask_run).take() else { return Ok(None) };
+    run.task.abort();
+    let text = lock(&run.partial).clone();
+    let store = lock(&state.store);
+    if text.trim().is_empty() {
+        let len = store.chat_history(run.meeting_id).map_err(err)?.len();
+        store.rewind_chat(run.meeting_id, len.saturating_sub(1)).map_err(err)?;
+        return Ok(None);
+    }
+    store.add_chat(run.meeting_id, "assistant", &text, now_ms()).map_err(err)?;
+    Ok(Some(text))
+}
+
+#[tauri::command]
+fn stop_ask(state: State<'_, AppState>, meeting_id: Option<i64>) -> Result<Option<String>, String> {
+    if lock(&state.ask_run).is_some() {
+        return stop_run(&state);
+    }
+    // It ended just before Stop was pressed, so go by how the chat stands: the screen stopped
+    // listening and needs the answer from here, or to drop a question that failed.
+    let store = lock(&state.store);
+    let chat = store.chat_history(meeting_id).map_err(err)?;
+    match chat.last() {
+        Some(m) if m.role == "assistant" => Ok(Some(m.content.clone())),
+        Some(_) => {
+            store.rewind_chat(meeting_id, chat.len() - 1).map_err(err)?;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
+}
+
+/// Go back to an earlier point in a chat: everything after the first `keep` messages is removed.
+#[tauri::command]
+fn rewind_chat(state: State<'_, AppState>, meeting_id: Option<i64>, keep: usize) -> Result<(), String> {
+    if lock(&state.ask_run).as_ref().is_some_and(|r| r.meeting_id == meeting_id) {
+        return Err("Stop the answer first.".into());
+    }
+    lock(&state.store).rewind_chat(meeting_id, keep).map_err(err)
+}
+
+/// Earlier turns for the prompt, without questions that never got an answer (it failed): some
+/// servers refuse two user turns in a row.
+fn answered_turns(chat: Vec<ChatMessage>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(chat.len());
+    for (i, m) in chat.iter().enumerate() {
+        if m.role != "user" || chat.get(i + 1).is_some_and(|next| next.role != "user") {
+            out.push(Message { role: m.role.clone(), content: m.content.clone(), ..Default::default() });
+        }
+    }
+    out
+}
+
 #[tauri::command]
 async fn ask(
     app: AppHandle,
@@ -1122,6 +1188,8 @@ async fn ask(
     question: String,
 ) -> Result<(), String> {
     let cfg = llm_config(&state)?;
+    // One answer at a time. The screen only allows this when you left a meeting mid-answer.
+    stop_run(&state)?;
     let now = now_ms();
     let key_sent = cfg.api_key.is_some();
     let sources: Vec<String>;
@@ -1129,25 +1197,17 @@ async fn ask(
     let me = me.as_deref();
     let msgs = {
         let st = lock(&state.store);
-        let history: Vec<Message> = st
-            .chat_history(meeting_id)
-            .map_err(err)?
-            .into_iter()
-            .map(|m| Message { role: m.role, content: m.content, ..Default::default() })
-            .collect();
+        let history = answered_turns(st.chat_history(meeting_id).map_err(err)?);
         st.add_chat(meeting_id, "user", &question, now).map_err(err)?;
-        let (mut docs, used) = file_context(&st, &question).map_err(err)?;
+        let (mut passages, used) = file_context(&st, &question).map_err(err)?;
         sources = used;
         match meeting_id {
             Some(id) => {
-                // Pages attached to the meeting come before passages from files.
-                let mut attached = meeting_context(&st, id, me).map_err(err)?;
-                attached.append(&mut docs);
-                let docs = attached;
+                let docs = meeting_context(&st, id, me).map_err(err)?;
                 let m = st.get_meeting(id).map_err(err)?;
                 let t = st.transcript(id).map_err(err)?;
                 let transcript = prompts::format_transcript(&lines(&t, me), 60_000);
-                prompts::ask(&question, &m.notes, &transcript, &docs, &history, me)
+                prompts::ask(&question, &m.notes, &transcript, &docs, &passages, &history, me)
             }
             None => {
                 // No meeting open: ground the answer in the best-matching transcript lines too.
@@ -1160,8 +1220,8 @@ async fn ask(
                         text: h.snippet,
                     })
                     .collect();
-                found.append(&mut docs);
-                prompts::ask(&question, "", "", &found, &history, me)
+                found.append(&mut passages);
+                prompts::ask(&question, "", "", &[], &found, &history, me)
             }
         }
     };
@@ -1171,35 +1231,51 @@ async fn ask(
     let jira = enabled && fs_atlassian::find_acli().is_some();
     let confluence = enabled && lock(&state.atlassian).confluence;
 
-    tauri::async_runtime::spawn(async move {
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let run_id = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let partial = std::sync::Arc::new(Mutex::new(String::new()));
+    let written = partial.clone();
+    // Held across the spawn, so the task can't finish and look for its run before it's there.
+    let mut slot = lock(&state.ask_run);
+    let task = tauri::async_runtime::spawn(async move {
         let mut msgs = msgs;
-        if jira || confluence {
-            let answered = lookups::run_lookups(&app, meeting_id, &cfg, &mut msgs, &question, jira, confluence).await;
-            if let Some(text) = answered {
-                // The AI finished while using tools; show it as one piece.
-                emit_stream(&app, "ask-delta", meeting_id, &text, false, None);
-                let st = app.state::<AppState>();
-                let saved = lock(&st.store).add_chat(meeting_id, "assistant", &text, now_ms());
-                if let Err(e) = saved {
-                    tracing::error!("saving answer: {e}");
-                }
-                emit_stream(&app, "ask-delta", meeting_id, "", true, None);
+        let emitter = app.clone();
+        let mut on_delta = move |d: &str| {
+            lock(&written).push_str(d);
+            emit_stream(&emitter, "ask-delta", meeting_id, d, false, None);
+        };
+        let outcome = if jira || confluence {
+            lookups::run_lookups(&app, meeting_id, &cfg, &mut msgs, &question, jira, confluence, &mut on_delta).await
+        } else {
+            lookups::Outcome::Plain
+        };
+        let result = match outcome {
+            lookups::Outcome::Answered(text) => Ok(text),
+            lookups::Outcome::Failed(e) => Err(e),
+            lookups::Outcome::Plain => chat_stream(&cfg, &msgs, &mut on_delta).await,
+        };
+        let st = app.state::<AppState>();
+        // Whoever takes the run owns the ending: if Stop got here first, it saved what there was.
+        // Held while saving, so Stop can't look at the chat between the two.
+        {
+            let mut run = lock(&st.ask_run);
+            if run.as_ref().map(|r| r.id) != Some(run_id) {
                 return;
             }
-        }
-        let result = chat_stream(&cfg, &msgs, |d| emit_stream(&app, "ask-delta", meeting_id, d, false, None)).await;
-        match result {
-            Ok(full) => {
-                let st = app.state::<AppState>();
-                let saved = lock(&st.store).add_chat(meeting_id, "assistant", &full, now_ms());
+            *run = None;
+            if let Ok(full) = &result {
+                let saved = lock(&st.store).add_chat(meeting_id, "assistant", full, now_ms());
                 if let Err(e) = saved {
                     tracing::error!("saving answer: {e}");
                 }
-                emit_stream(&app, "ask-delta", meeting_id, "", true, None);
             }
+        }
+        match result {
+            Ok(_) => emit_stream(&app, "ask-delta", meeting_id, "", true, None),
             Err(e) => emit_stream(&app, "ask-delta", meeting_id, "", false, Some(e.user_message(key_sent))),
         }
     });
+    *slot = Some(AskRun { id: run_id, meeting_id, task, partial });
     Ok(())
 }
 
@@ -1687,6 +1763,7 @@ pub fn run() {
                 settings_notice: Mutex::new(settings_notice),
                 downloading: Default::default(),
                 download_cancel: Default::default(),
+                ask_run: Mutex::new(None),
                 meet: Mutex::new(MeetState::default()),
                 atlassian: Mutex::new(fs_atlassian::Status::default()),
                 notes_upto: Mutex::new(HashMap::new()),
@@ -1749,6 +1826,8 @@ pub fn run() {
             detect_local_llms,
             download_models,
             cancel_download,
+            stop_ask,
+            rewind_chat,
             get_bridge,
             open_extension_folder,
             atlassian_status,
@@ -1845,6 +1924,19 @@ mod tests {
             std::fs::write(&path, c).unwrap();
         }
         path
+    }
+
+    #[test]
+    fn unanswered_questions_stay_out_of_the_prompt() {
+        let chat = |role: &str, content: &str| ChatMessage { role: role.into(), content: content.into() };
+        let kept = answered_turns(vec![
+            chat("user", "failed"),
+            chat("user", "q1"),
+            chat("assistant", "a1"),
+            chat("user", "failed too"),
+        ]);
+        let text: Vec<&str> = kept.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(text, ["q1", "a1"]);
     }
 
     #[test]
