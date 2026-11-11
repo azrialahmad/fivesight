@@ -14,7 +14,7 @@ pub mod echo;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -104,9 +104,8 @@ fn unix_ms() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// How far back a speaker change may be placed: Meet's indicator, the extension's smoothing
-/// and the trip to the app put the report up to about a second after the actual change.
-const SPLIT_LOOKBACK_FRAMES: usize = 1_200 * SAMPLE_RATE / 1000 / FRAME;
+/// How far either side of a reported speaker change a pause may be used to cut at instead.
+const SPLIT_WINDOW_FRAMES: usize = 400 * SAMPLE_RATE / 1000 / FRAME;
 /// Neither side of a split is shorter than this.
 const SPLIT_MIN_FRAMES: usize = 400 * SAMPLE_RATE / 1000 / FRAME;
 
@@ -135,7 +134,7 @@ pub struct Pipeline {
     captures: Vec<Capture>,
     threads: Vec<JoinHandle<()>>,
     prompt: Arc<Mutex<Option<String>>>,
-    split_others: Arc<AtomicBool>,
+    split_others: Arc<AtomicI64>,
 }
 
 impl Pipeline {
@@ -148,7 +147,7 @@ impl Pipeline {
         let barge = Arc::new(AtomicBool::new(false));
         let other = Arc::new(OtherSide::default());
         let prompt = Arc::new(Mutex::new(cfg.initial_prompt.clone()));
-        let split_others = Arc::new(AtomicBool::new(false));
+        let split_others = Arc::new(AtomicI64::new(0));
 
         // Whisper worker owns the engine; load it here and report errors synchronously.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -212,10 +211,11 @@ impl Pipeline {
         Ok(Self { captures, threads, prompt, split_others })
     }
 
-    /// Someone else started talking on the call (the Meet extension says so): end the other
-    /// side's current line there and start a new one, even if there was no pause between them.
-    pub fn split_others(&self) {
-        self.split_others.store(true, Ordering::Relaxed);
+    /// The speaker on the call changed at `at` (Unix ms; the Meet extension says so, corrected
+    /// for how late it notices): end the other side's current line there and start a new one,
+    /// even if there was no pause between them.
+    pub fn split_others(&self, at: i64) {
+        self.split_others.store(at.max(1), Ordering::Relaxed);
     }
 
     /// Replace Whisper's initial prompt; the next utterance uses it.
@@ -246,8 +246,9 @@ struct StreamCtx {
     min_rms: f32,
     inflight: Arc<AtomicBool>,
     barge: Arc<AtomicBool>,
-    /// Loopback only: the speaker changed, cut the segment (see `Pipeline::split_others`).
-    split: Arc<AtomicBool>,
+    /// Loopback only: when the speaker changed (Unix ms, 0 for none); cut the segment there
+    /// (see `Pipeline::split_others`).
+    split: Arc<AtomicI64>,
     other: Arc<OtherSide>,
     jobs: SyncSender<Job>,
 }
@@ -299,8 +300,11 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
         debug_assert_eq!(frame.len(), FRAME);
         let mut events = ep.push(&frame, prob);
         // Someone else took over on the call: cut there, even without a pause.
-        if ctx.split.swap(false, Ordering::Relaxed) {
-            events.extend(ep.split(SPLIT_LOOKBACK_FRAMES, SPLIT_MIN_FRAMES));
+        let split_at = ctx.split.swap(0, Ordering::Relaxed);
+        if split_at > 0 {
+            // This frame was captured just now, so the change was this many frames back.
+            let ago = (unix_ms() - split_at).max(0) as usize * SAMPLE_RATE / 1000 / FRAME;
+            events.extend(ep.split(ago, SPLIT_WINDOW_FRAMES, SPLIT_MIN_FRAMES));
         }
         for ev in events {
             match ev {
@@ -388,6 +392,7 @@ fn worker_loop(
     let mut echo = cfg.echo.clone().map(EchoGuard::new);
     let mut other_finals_done = 0u64;
     let mut barged_seg = 0u64; // mic utterance that already closed the other side's segment
+    let mut recent = Recent::default();
 
     loop {
         // Wake up regularly even without jobs: held mic lines wait on the other side.
@@ -450,10 +455,18 @@ fn worker_loop(
             duration_ms: job.audio.len() as u64 * 1000 / SAMPLE_RATE as u64,
         };
 
-        let prompt = shared.prompt.lock().ok().and_then(|p| p.clone());
+        let meeting_prompt = shared.prompt.lock().ok().and_then(|p| p.clone());
+        let base = cfg.language.base_prompt();
+        let context = recent.text();
+        let short = secs < SHORT_SECS;
+        let prompt = utterance_prompt(meeting_prompt.as_deref(), base, context.as_deref(), short);
+        // What a second try leaves out: the conversation when it was used, else the example sentence.
+        let strip = if context.is_some() && prompt != meeting_prompt { context.as_deref() } else { base };
+        // A short utterance is cheap to search harder, and needs it most.
+        let beam = if short { cfg.final_beam.max(SHORT_BEAM) } else { cfg.final_beam };
         let result = match job.kind {
             Kind::Partial => engine.transcribe(&job.audio, lang, 1, prompt.as_deref()),
-            Kind::Final => engine.transcribe(&job.audio, lang, cfg.final_beam, prompt.as_deref()),
+            Kind::Final => engine.transcribe(&job.audio, lang, beam, prompt.as_deref()),
         };
         if job.kind == Kind::Partial {
             match job.source {
@@ -477,10 +490,7 @@ fn worker_loop(
         let (mut text, rejected) = judge_all(&segments, &cfg.filter);
         let mut parroted = !text.is_empty() && prompt.as_deref().is_some_and(|p| echoes_prompt(&text, p));
         if parroted && job.kind == Kind::Final && level >= min_rms {
-            let base = cfg.language.base_prompt();
-            if let Some(again) =
-                listen_again(&engine, &job.audio, lang, cfg.final_beam, prompt.as_deref(), base, &cfg.filter)
-            {
+            if let Some(again) = listen_again(&engine, &job.audio, lang, beam, prompt.as_deref(), strip, &cfg.filter) {
                 tracing::debug!("prompt echo \"{text}\" heard again without it: {again}");
                 text = again;
                 parroted = false;
@@ -527,6 +537,9 @@ fn worker_loop(
         }
 
         for ev in out {
+            if ev.kind == Kind::Final && ev.dropped.is_none() {
+                recent.push(&ev.text);
+            }
             if events.send(ev).is_err() {
                 return;
             }
@@ -540,6 +553,74 @@ fn worker_loop(
             let _ = events.send(ev);
         }
     }
+}
+
+/// Utterances shorter than this (seconds) are prompted with the conversation only, and
+/// searched with a wider beam.
+const SHORT_SECS: f32 = 2.5;
+const SHORT_BEAM: i32 = 5;
+/// How much of what was just said goes into Whisper's prompt. With the glossary it stays
+/// within the 224 tokens Whisper reads.
+const CONTEXT_CHARS: usize = 160;
+
+/// The last lines said on the call (either side), for Whisper's prompt.
+#[derive(Default)]
+struct Recent {
+    lines: std::collections::VecDeque<String>,
+}
+
+impl Recent {
+    fn push(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        self.lines.push_back(text.to_string());
+        while self.lines.len() > 1 && self.lines.iter().map(|l| l.len() + 1).sum::<usize>() > CONTEXT_CHARS {
+            self.lines.pop_front();
+        }
+    }
+
+    /// The newest `CONTEXT_CHARS` or so of it, starting at a word.
+    fn text(&self) -> Option<String> {
+        let all = self.lines.iter().map(String::as_str).collect::<Vec<_>>().join(" ");
+        if all.is_empty() {
+            return None;
+        }
+        let words: Vec<&str> = all.split_whitespace().collect();
+        let mut len = 0;
+        let keep = words.iter().rev().take_while(|w| {
+            len += w.len() + 1;
+            len <= CONTEXT_CHARS
+        });
+        let n = keep.count().max(1);
+        Some(words[words.len() - n..].join(" "))
+    }
+}
+
+/// Whisper's prompt for one utterance. Whisper was trained to read its prompt as the text that
+/// came just before, so what was said last helps it most, above all on a short utterance with
+/// little sound to go on; that takes the place of `base`, the example sentence that otherwise
+/// sets the language style. A short utterance gets only the conversation: given a long list of
+/// names and jargon and a second of audio, that list is what Whisper ends up "hearing".
+pub fn utterance_prompt(
+    meeting: Option<&str>,
+    base: Option<&str>,
+    context: Option<&str>,
+    short: bool,
+) -> Option<String> {
+    let Some(context) = context.map(str::trim).filter(|c| !c.is_empty()) else {
+        return meeting.map(str::to_string);
+    };
+    if short {
+        return Some(context.to_string());
+    }
+    let meeting = meeting.unwrap_or("").trim();
+    let glossary = match base.map(str::trim).filter(|b| !b.is_empty()) {
+        Some(b) => meeting.strip_suffix(b).unwrap_or(meeting).trim(),
+        None => meeting,
+    };
+    Some(if glossary.is_empty() { context.to_string() } else { format!("{glossary} {context}") })
 }
 
 /// Second try at an utterance whose text only repeated `prompt`: the same audio with the
@@ -609,7 +690,47 @@ fn release_held(
 
 #[cfg(test)]
 mod tests {
-    use super::trim_ellipsis;
+    use super::{trim_ellipsis, utterance_prompt, Recent, CONTEXT_CHARS};
+
+    const BASE: &str = "Jadi PR-nya udah di-review.";
+    const MEETING: &str = "Glossary: Goldplus, MamiAds. People: Nuki Pratama. Jadi PR-nya udah di-review.";
+
+    #[test]
+    fn the_last_thing_said_takes_the_example_sentences_place() {
+        let ctx = Some("AC 8 jadi satu SP ya, Mas Nuki?");
+        assert_eq!(
+            utterance_prompt(Some(MEETING), Some(BASE), ctx, false).as_deref(),
+            Some("Glossary: Goldplus, MamiAds. People: Nuki Pratama. AC 8 jadi satu SP ya, Mas Nuki?")
+        );
+        // A short line gets only the conversation, not the long list of names.
+        assert_eq!(utterance_prompt(Some(MEETING), Some(BASE), ctx, true).as_deref(), ctx);
+        // Nothing said yet: the meeting's prompt as it is.
+        assert_eq!(utterance_prompt(Some(MEETING), Some(BASE), None, true).as_deref(), Some(MEETING));
+        // English meetings have no example sentence; the glossary stays whole.
+        assert_eq!(
+            utterance_prompt(Some("People: Nuki."), None, ctx, false).as_deref(),
+            Some("People: Nuki. AC 8 jadi satu SP ya, Mas Nuki?")
+        );
+        assert_eq!(utterance_prompt(None, Some(BASE), ctx, false).as_deref(), ctx);
+    }
+
+    #[test]
+    fn recent_keeps_the_newest_words() {
+        let mut r = Recent::default();
+        assert_eq!(r.text(), None);
+        r.push("  ");
+        assert_eq!(r.text(), None);
+        r.push("Oke, lanjut ke Rama.");
+        r.push("Kemarin open MR yang AC8.");
+        assert_eq!(r.text().as_deref(), Some("Oke, lanjut ke Rama. Kemarin open MR yang AC8."));
+        for i in 0..20 {
+            r.push(&format!("baris nomor {i} dari rapat"));
+        }
+        let t = r.text().unwrap();
+        assert!(t.len() <= CONTEXT_CHARS, "{t}");
+        assert!(t.ends_with("baris nomor 19 dari rapat"), "{t}");
+        assert!(t.starts_with("baris"), "starts at a word: {t}");
+    }
 
     #[test]
     fn trims_cut_off_ellipses_only() {

@@ -357,6 +357,10 @@ struct AppState {
     /// Per meeting: the start (ms) of the newest transcript line the saved AI notes were written
     /// from. Live updates send only the lines after it (plus a little overlap).
     notes_upto: Mutex<HashMap<i64, i64>>,
+    /// Per meeting: the AI notes exactly as the last pass wrote them. Comparing the notes now
+    /// against these shows which lines the person wrote or corrected, so only those are locked
+    /// and the AI can tidy up its own. Not kept across restarts: then every line is locked.
+    notes_ai: Mutex<HashMap<i64, String>>,
 }
 
 /// Live notes updates re-send this much of the transcript before the last pass, so a line that
@@ -513,7 +517,7 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     let now = now_ms();
     let mut call: Option<CallEvent> = None;
     let mut new_name: Option<String> = None;
-    let mut takeover = false;
+    let mut cut_at: Option<i64> = None;
     let mut chat = None;
     {
         let mut meet = lock(&st.meet);
@@ -533,7 +537,7 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
             Incoming::Speaking { name, speaking, at } => {
                 // Trust the browser's clock only if it agrees with ours; otherwise use ours.
                 let at = if (at - now).abs() < 5_000 { at } else { now };
-                takeover = meet.speakers.apply(&name, speaking, at) && is_person(&name);
+                cut_at = meet.speakers.apply(&name, speaking, at).filter(|_| is_person(&name));
                 new_name = Some(name);
             }
             Incoming::Chat { id, sender, text, at, me } => {
@@ -566,10 +570,11 @@ fn handle_meet_event(app: &AppHandle, ev: Incoming) {
     if let Some((id, sender, text, at, me)) = chat {
         save_chat(app, &id, sender.as_deref(), &text, at, me, now);
     }
-    // Two people talking back to back with no pause would land in one line; cut it here.
-    if takeover {
+    // Two people talking back to back with no pause, or one cutting in on the other, would land
+    // in one line; cut it where the speaker changed.
+    if let Some(at) = cut_at {
         if let Some(r) = lock(&st.recording).as_ref() {
-            r.pipeline.split_others();
+            r.pipeline.split_others(at);
         }
     }
     // Someone new on the call: add their name to the hints.
@@ -1070,11 +1075,23 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
         }
         _ => None,
     };
+    let edits = match (editable, previous) {
+        (true, Some(prev)) => lock(&state.notes_ai).get(&id).map(|ai| prompts::edited_lines(prev, ai)),
+        _ => None,
+    };
     let msgs = prompts::enhance_notes(
         &meeting.title,
         &meeting.notes,
         &prompts::format_transcript(&lines(&transcript, me.as_deref()), 60_000),
-        prompts::EnhanceMode { live, previous, me: me.as_deref(), since: since.as_deref(), docs: &docs, editable },
+        prompts::EnhanceMode {
+            live,
+            previous,
+            me: me.as_deref(),
+            since: since.as_deref(),
+            docs: &docs,
+            editable,
+            edits: edits.as_deref(),
+        },
     );
     tracing::debug!(
         "enhancing meeting {id} (live: {live}, update: {}, from: {}, {} lines, {} docs)",
@@ -1104,6 +1121,7 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
                     Ok(()) if stale => tracing::debug!("meeting {id}: notes edited during the pass; kept the edits"),
                     Ok(()) => {
                         lock(&st.notes_upto).insert(id, newest);
+                        lock(&st.notes_ai).insert(id, full.clone());
                     }
                 }
                 let done = StreamPayload { meeting_id: Some(id), delta: String::new(), done: true, error: None, stale };
@@ -1767,6 +1785,7 @@ pub fn run() {
                 meet: Mutex::new(MeetState::default()),
                 atlassian: Mutex::new(fs_atlassian::Status::default()),
                 notes_upto: Mutex::new(HashMap::new()),
+                notes_ai: Mutex::new(HashMap::new()),
             });
             // Asking acli who is logged in takes a second or two; don't hold up startup.
             let handle = app.handle().clone();
