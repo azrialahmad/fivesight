@@ -1071,6 +1071,7 @@ dependencies = [
  "fs-store",
  "rusqlite",
  "serde_json",
+ "tiny_http",
 ]
 
 [[package]]

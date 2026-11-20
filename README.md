@@ -152,6 +152,27 @@ It reads `%LOCALAPPDATA%\dev.fivesight.app\fivesight.db`; pass `--db <path>` or 
 | `search_transcripts` | Matching lines across all meetings, with meeting id and time |
 | `list_files`, `search_files` | Your files, and passages that match a question |
 
+#### On a home server
+
+To reach your meetings from other devices while this PC is off, run `fivesight-mcp --http` on a
+server you own (a homelab on your LAN or Tailscale; keep it off the public internet). The app
+uploads a copy of its database there from **Settings → Sync to your server**, on demand or after
+each meeting. Each sync replaces the server's copy; nothing comes back.
+
+[`mcp/compose.yaml`](mcp/compose.yaml) runs it with Docker: put this repository in `./src` next to
+it, an empty `data` folder made by your own user (`mkdir data`; the container runs as uid 1000
+and can't write to a folder Docker creates as root) and two random tokens in `.env`
+(`openssl rand -hex 32` each):
+
+- `FIVESIGHT_MCP_TOKEN`: agents send it to read.
+- `FIVESIGHT_SYNC_TOKEN`: the app sends it to upload. Paste it into Settings.
+
+Then point an agent at it, e.g. Claude Code:
+
+```
+claude mcp add --transport http fivesight http://your-server:8787/mcp --header "Authorization: Bearer <FIVESIGHT_MCP_TOKEN>"
+```
+
 ## Project layout
 
 | Path | What |

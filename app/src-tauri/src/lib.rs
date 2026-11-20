@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder
 mod logging;
 mod lookups;
 mod models;
+mod sync;
 mod system;
 
 const KEYRING_SERVICE: &str = "fivesight";
@@ -132,6 +133,15 @@ struct Settings {
     /// Filled in on read; never persisted (keys live in Windows Credential Manager, one per server).
     #[serde(default)]
     has_key: bool,
+    /// A `fivesight-mcp --http` server to copy the database to (Sync now). Empty: sync is off.
+    #[serde(default)]
+    sync_url: String,
+    /// Also sync on its own a little after a meeting ends and its notes are written.
+    #[serde(default)]
+    sync_after_meetings: bool,
+    /// Filled in on read, like `has_key`: whether the server's sync token is saved.
+    #[serde(default)]
+    has_sync_token: bool,
     // Fields from before the provider was generalised. Read once to migrate, never written back.
     #[serde(default, skip_serializing)]
     provider: Option<String>,
@@ -171,6 +181,9 @@ impl Default for Settings {
             user_name: String::new(),
             quick_prompts: default_quick_prompts(),
             has_key: false,
+            sync_url: String::new(),
+            sync_after_meetings: false,
+            has_sync_token: false,
             provider: None,
             openrouter_model: None,
             custom_url: None,
@@ -361,6 +374,10 @@ struct AppState {
     /// against these shows which lines the person wrote or corrected, so only those are locked
     /// and the AI can tidy up its own. Not kept across restarts: then every line is locked.
     notes_ai: Mutex<HashMap<i64, String>>,
+    /// A sync upload is running.
+    syncing: std::sync::atomic::AtomicBool,
+    /// Bumped by every automatic sync request, so a burst of them ends in one upload.
+    sync_generation: std::sync::atomic::AtomicU64,
 }
 
 /// Live notes updates re-send this much of the transcript before the last pass, so a line that
@@ -1039,6 +1056,7 @@ async fn stop_recording(app: AppHandle, state: State<'_, AppState>) -> Result<()
         // Dropping joins the audio and worker threads; the last transcript lines flush first.
         tauri::async_runtime::spawn_blocking(move || drop(rec)).await.map_err(err)?;
         lock(&state.store).end_meeting(mid, now_ms()).map_err(err)?;
+        sync_soon(&app);
     }
     let _ = app.emit("recording", false);
     Ok(())
@@ -1140,6 +1158,7 @@ async fn enhance_notes(app: AppHandle, state: State<'_, AppState>, id: i64, upda
                     Ok(()) => {
                         lock(&st.notes_upto).insert(id, newest);
                         lock(&st.notes_ai).insert(id, full.clone());
+                        sync_soon(&app);
                     }
                 }
                 let done = StreamPayload { meeting_id: Some(id), delta: String::new(), done: true, error: None, stale };
@@ -1426,6 +1445,7 @@ fn kb_remove(state: State<'_, AppState>, id: i64) -> Result<(), String> {
 fn get_settings(state: State<'_, AppState>) -> Settings {
     let mut s = lock(&state.settings).clone();
     s.has_key = profile_key(&s.active()).is_some();
+    s.has_sync_token = stored_key(sync::TOKEN_SLOT).is_some();
     s
 }
 
@@ -1453,8 +1473,16 @@ fn save_settings(
     state: State<'_, AppState>,
     settings: Settings,
     api_keys: Option<HashMap<String, String>>,
+    sync_token: Option<String>,
 ) -> Result<(), String> {
     let (mut to_store, _) = settings.migrated();
+    to_store.sync_url =
+        if to_store.sync_url.trim().is_empty() { String::new() } else { sync::base_url(&to_store.sync_url) };
+    if let Some(token) = sync_token.filter(|t| !t.trim().is_empty()) {
+        keyring::Entry::new(KEYRING_SERVICE, sync::TOKEN_SLOT)
+            .and_then(|e| e.set_password(token.trim()))
+            .map_err(|e| format!("Couldn't save the sync token to Windows Credential Manager: {e}"))?;
+    }
     for p in &mut to_store.profiles {
         p.base_url = p.base_url.trim().to_string();
         p.model = p.model.trim().to_string();
@@ -1487,6 +1515,7 @@ fn save_settings(
         }
     }
     to_store.has_key = false;
+    to_store.has_sync_token = false;
     std::fs::write(&state.settings_path, serde_json::to_string_pretty(&to_store).map_err(err)?)
         .map_err(|e| format!("Couldn't save settings to {}: {e}", state.settings_path.display()))?;
     let kept: HashSet<String> = to_store.profiles.iter().map(profile_slot).collect();
@@ -1500,6 +1529,102 @@ fn save_settings(
     tracing::info!("settings saved");
     refresh_hints(&state);
     Ok(())
+}
+
+// ---------- sync to your own server ----------
+
+/// Wait this long after the last change before an automatic sync, so stopping a meeting and the
+/// AI notes written right after it go up as one upload.
+const SYNC_DELAY: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Copy the database and upload it to the sync server. The "sync" event reports the outcome, so
+/// Settings shows automatic syncs too.
+async fn sync_database(app: &AppHandle) -> Result<sync::SyncStatus, String> {
+    use std::sync::atomic::Ordering;
+    let st = app.state::<AppState>();
+    let url = lock(&st.settings).sync_url.clone();
+    if url.trim().is_empty() {
+        return Err("Add your server's address in Settings first.".into());
+    }
+    let token = stored_key(sync::TOKEN_SLOT).ok_or("Add the server's sync token in Settings first.")?;
+    if st.syncing.swap(true, Ordering::SeqCst) {
+        return Err("A sync is already running.".into());
+    }
+    let copy = st.settings_path.with_file_name("sync-upload.db");
+    let result = async {
+        let bytes = {
+            let started = std::time::Instant::now();
+            lock(&st.store).snapshot(&copy).map_err(|e| format!("Couldn't copy the database: {e}"))?;
+            tracing::debug!("sync: database copied in {:?}", started.elapsed());
+            let bytes = std::fs::read(&copy).map_err(err);
+            let _ = std::fs::remove_file(&copy);
+            bytes?
+        };
+        sync::upload(&url, &token, user_name(&st).as_deref(), bytes).await
+    }
+    .await;
+    st.syncing.store(false, Ordering::SeqCst);
+    match &result {
+        Ok(s) => tracing::info!("synced {} meetings ({} bytes) to {url}", s.meetings, s.bytes),
+        Err(e) => tracing::warn!("sync to {url}: {e}"),
+    }
+    let _ = app.emit("sync", SyncEvent { status: result.clone().ok(), error: result.clone().err() });
+    result
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct SyncEvent {
+    status: Option<sync::SyncStatus>,
+    error: Option<String>,
+}
+
+/// With "sync after meetings" on, sync once things settle: not while recording, and only after the
+/// last of several quick changes.
+fn sync_soon(app: &AppHandle) {
+    use std::sync::atomic::Ordering;
+    let st = app.state::<AppState>();
+    {
+        let s = lock(&st.settings);
+        if !s.sync_after_meetings || s.sync_url.trim().is_empty() {
+            return;
+        }
+    }
+    let generation = st.sync_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(SYNC_DELAY);
+        let st = app.state::<AppState>();
+        // An upload still running copied the database before this change: wait for it to finish
+        // rather than skip, or the change would stay off the server until the next meeting.
+        while st.syncing.load(Ordering::SeqCst) && st.sync_generation.load(Ordering::SeqCst) == generation {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        if st.sync_generation.load(Ordering::SeqCst) != generation || lock(&st.recording).is_some() {
+            return;
+        }
+        let _ = tauri::async_runtime::block_on(sync_database(&app));
+    });
+}
+
+#[tauri::command]
+async fn sync_now(app: AppHandle) -> Result<sync::SyncStatus, String> {
+    sync_database(&app).await
+}
+
+/// What the server has. Uses the token typed in Settings if there is one, else the saved one.
+#[tauri::command]
+async fn sync_status(url: String, token: Option<String>) -> Result<sync::SyncStatus, String> {
+    let token = token
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| stored_key(sync::TOKEN_SLOT))
+        .ok_or("Paste the server's sync token first.")?;
+    sync::status(&url, &token).await
+}
+
+#[tauri::command]
+fn forget_sync_token() -> Result<(), String> {
+    delete_key(sync::TOKEN_SLOT)
 }
 
 /// Why settings were reset to defaults at startup, if they were.
@@ -1811,6 +1936,8 @@ pub fn run() {
                 atlassian: Mutex::new(fs_atlassian::Status::default()),
                 notes_upto: Mutex::new(HashMap::new()),
                 notes_ai: Mutex::new(HashMap::new()),
+                syncing: Default::default(),
+                sync_generation: Default::default(),
             });
             // Asking acli who is logged in takes a second or two; don't hold up startup.
             let handle = app.handle().clone();
@@ -1882,6 +2009,9 @@ pub fn run() {
             key_saved,
             forget_key,
             test_llm,
+            sync_now,
+            sync_status,
+            forget_sync_token,
             open_live_panel
         ])
         .run(tauri::generate_context!())

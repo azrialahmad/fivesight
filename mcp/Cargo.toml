@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 fs-store = { path = "../crates/fs-store" }
 serde_json.workspace = true
+tiny_http = "0.12"
 
 [dev-dependencies]
 rusqlite = { version = "0.40.2", features = ["bundled"] }

@@ -36,25 +36,49 @@
     dead = true;
     timers.forEach(clearInterval);
     observer.disconnect();
+    pipObserver.disconnect();
   }
+
+  // The document whose tiles count: the tab, or Meet's picture-in-picture window while it is open
+  // and showing tiles. Changes in the other one are ignored (the tab's grid goes stale under PiP).
+  let tileDoc = document;
+  let pipDoc = null;
 
   // Count changes inside each participant tile. A speaker's tile animates its audio indicator;
   // the video itself never touches the DOM, so quiet tiles stay quiet.
-  const observer = new MutationObserver((records) => {
+  function onMutations(records) {
     const now = Date.now();
     for (const r of records) {
       if (r.type !== 'attributes') continue;
       const el = r.target;
-      if (!(el instanceof Element) || el.closest('video')) continue;
+      // nodeType, not instanceof: nodes in the PiP window come from another window's Element.
+      if (!el || el.nodeType !== 1 || el.ownerDocument !== tileDoc || el.closest('video')) continue;
       const tile = el.closest('[data-participant-id]');
       if (tile) speaking.note(S.tileId(tile), now);
     }
-  });
+  }
+  const observer = new MutationObserver(onMutations);
   observer.observe(document.documentElement, { subtree: true, attributes: true });
+  const pipObserver = new MutationObserver(onMutations);
+
+  /** Follow Meet's picture-in-picture window as it opens and closes. */
+  function followPip() {
+    const doc = S.pipDocument(self);
+    if (doc === pipDoc) return;
+    pipObserver.disconnect();
+    pipDoc = doc;
+    if (doc && doc.documentElement) pipObserver.observe(doc.documentElement, { subtree: true, attributes: true });
+    log(doc ? 'picture-in-picture opened' : 'picture-in-picture closed');
+  }
 
   function tick() {
     const now = Date.now();
-    const inCall = S.inCall(document, location.pathname);
+    followPip();
+    const nextDoc = S.tileDocument(document, pipDoc);
+    if (nextDoc !== tileDoc) log('reading tiles from', nextDoc === document ? 'the tab' : 'picture-in-picture');
+    tileDoc = nextDoc;
+    const inCall =
+      S.inCall(document, location.pathname) || (!!pipDoc && !!S.meetCode(location.pathname) && S.hasLeaveButton(pipDoc));
     const change = call.tick(inCall);
     if (change === 'joined') {
       const ev = { type: 'call', state: 'joined', title: S.callTitle(document), code: S.meetCode(location.pathname) };
@@ -68,9 +92,9 @@
     }
     if (!call.inCall) return;
 
-    ownName = S.ownName(document) || ownName;
+    ownName = S.ownName(document) || (pipDoc && S.ownName(pipDoc)) || ownName;
     const present = new Map();
-    for (const tile of S.tiles(document)) {
+    for (const tile of S.tiles(tileDoc)) {
       const name = S.tileName(tile);
       if (!name || name === ownName || tile.querySelector('[data-self-name]')) continue; // your own voice is the mic stream
       present.set(S.tileId(tile), name);
