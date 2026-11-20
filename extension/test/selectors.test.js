@@ -30,3 +30,25 @@ test('isOwnSender knows "You" and your Meet name', () => {
   assert.ok(!isOwnSender('Budi', 'Azrial'));
   assert.ok(!isOwnSender(null, null));
 });
+
+test('pipDocument finds an open picture-in-picture window and ignores a closed one', () => {
+  const { pipDocument } = require('../src/selectors.js');
+  const doc = { id: 'pip' };
+  assert.equal(pipDocument({ documentPictureInPicture: { window: { closed: false, document: doc } } }), doc);
+  assert.equal(pipDocument({ documentPictureInPicture: { window: { closed: true, document: doc } } }), null);
+  assert.equal(pipDocument({ documentPictureInPicture: { window: null } }), null);
+  assert.equal(pipDocument({}), null); // a browser without Document Picture-in-Picture
+  const throws = { get documentPictureInPicture() { throw new Error('blocked'); } };
+  assert.equal(pipDocument(throws), null);
+});
+
+test('tileDocument reads tiles from picture-in-picture only while it shows some', () => {
+  const { tileDocument } = require('../src/selectors.js');
+  const docWith = (n) => ({ querySelectorAll: () => Array.from({ length: n }, () => ({})) });
+  const tab = docWith(5);
+  const pip = docWith(2);
+  assert.equal(tileDocument(tab, null), tab);
+  assert.equal(tileDocument(tab, pip), pip);
+  // PiP still loading, or showing only a placeholder: stay on the tab.
+  assert.equal(tileDocument(tab, docWith(0)), tab);
+});
