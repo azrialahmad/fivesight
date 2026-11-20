@@ -404,6 +404,7 @@ def run_llamacpp(items: list[dict], hints: dict, cpu: bool, quant: str = "Q8_0")
     mmproj = hf_hub_download(repo, f"mmproj-Qwen3-ASR-1.7B-{quant}.gguf")
     cmd = [str(LLAMA_SERVER), "-m", model, "--mmproj", mmproj, "--port", str(LLAMA_PORT), "-c", "8192",
            "-ngl", "0" if cpu else "99", "--no-webui"]
+    (HERE / ".work").mkdir(exist_ok=True)
     log = open(HERE / ".work" / "llama-server.log", "w", encoding="utf-8")
     server = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
     base = f"http://127.0.0.1:{LLAMA_PORT}"
@@ -417,6 +418,8 @@ def run_llamacpp(items: list[dict], hints: dict, cpu: bool, quant: str = "Q8_0")
                 if server.poll() is not None:
                     sys.exit("llama-server exited; see .work/llama-server.log")
                 time.sleep(0.5)
+        else:
+            sys.exit("llama-server didn't load the model in 2 minutes; see .work/llama-server.log")
         out = {}
         for it in items:
             audio = base64.b64encode(Path(it["path"]).read_bytes()).decode()
