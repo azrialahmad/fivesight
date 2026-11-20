@@ -12,6 +12,8 @@ pub enum StoreError {
     Db(#[from] rusqlite::Error),
     #[error("meeting {0} not found")]
     NotFound(i64),
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -670,11 +672,58 @@ impl Store {
         let rows = st.query_map(params![meeting_id], |r| Ok(ChatMessage { role: r.get(0)?, content: r.get(1)? }))?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
+
+    /// Write a consistent copy of the whole database to `to` (replacing it), safe while recording.
+    /// The copy is a single self-contained file (no -wal), ready to send elsewhere.
+    pub fn snapshot(&self, to: &Path) -> Result<()> {
+        match std::fs::remove_file(to) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        self.conn.execute("VACUUM INTO ?1", params![to.to_string_lossy()])?;
+        Connection::open(to)?.query_row("PRAGMA journal_mode = DELETE", [], |_| Ok(()))?;
+        Ok(())
+    }
+}
+
+/// Whether `path` holds a fivesight database this version can read: SQLite, with its tables.
+pub fn looks_like_fivesight_db(path: &Path) -> std::result::Result<usize, String> {
+    let mut head = [0u8; 16];
+    std::io::Read::read_exact(&mut std::fs::File::open(path).map_err(|e| e.to_string())?, &mut head)
+        .map_err(|_| "the file is too short to be a database".to_string())?;
+    if &head != b"SQLite format 3\0" {
+        return Err("the file isn't an SQLite database".into());
+    }
+    let st = Store::open_read_only(path).map_err(|e| e.to_string())?;
+    let ok: String = st.conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(|e| e.to_string())?;
+    if ok != "ok" {
+        return Err(format!("the database is damaged ({ok})"));
+    }
+    st.list_meetings().map(|m| m.len()).map_err(|e| format!("it isn't a fivesight database ({e})"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_is_a_standalone_readable_copy() {
+        let dir = std::env::temp_dir().join(format!("fs-store-snap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = Store::open(&dir.join("live.db")).unwrap();
+        let m = s.create_meeting("Standup", 1).unwrap();
+        s.add_segment(m, "mic", 1, 0, "hello").unwrap();
+        let copy = dir.join("copy.db");
+        std::fs::write(&copy, b"old junk").unwrap();
+        s.snapshot(&copy).unwrap();
+        assert_eq!(looks_like_fivesight_db(&copy).unwrap(), 1);
+        assert_eq!(Store::open_read_only(&copy).unwrap().transcript(m).unwrap().len(), 1);
+        let junk = dir.join("junk.db");
+        std::fs::write(&junk, b"definitely not sqlite, just text").unwrap();
+        assert!(looks_like_fivesight_db(&junk).unwrap_err().contains("isn't an SQLite"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn store() -> Store {
         Store::open_memory().unwrap()
