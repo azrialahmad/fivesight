@@ -44,7 +44,10 @@ const DEFAULT_SETTINGS: Settings = {
   vocabulary: '',
   userName: '',
   quickPrompts: defaultQuickPrompts,
-  hasKey: false
+  hasKey: false,
+  syncUrl: '',
+  syncAfterMeetings: false,
+  hasSyncToken: false
 };
 
 /**
@@ -704,8 +707,8 @@ class Session {
     this.hits = q.trim().length < 2 ? [] : await api.search(q.trim());
   }
 
-  async saveSettings(s: Settings, apiKeys: Record<string, string> | null) {
-    await api.saveSettings(s, apiKeys);
+  async saveSettings(s: Settings, apiKeys: Record<string, string> | null, syncToken?: string | null) {
+    await api.saveSettings(s, apiKeys, syncToken);
     this.settings = await api.getSettings();
   }
 

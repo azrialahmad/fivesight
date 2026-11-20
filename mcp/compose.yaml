@@ -1,0 +1,23 @@
+# fivesight-mcp on a home server. Put the repository (or just its tracked files) in ./src, and the
+# tokens in .env next to this file:
+#   FIVESIGHT_MCP_TOKEN=<random>   agents send this to read
+#   FIVESIGHT_SYNC_TOKEN=<random>  the app sends this to upload (Settings → Sync to your server)
+# Generate each with: openssl rand -hex 32
+# Run `mkdir data` here first: the container runs as 1000:1000 and can't write to a ./data
+# that Docker creates as root.
+#
+# Reach it at http://<server>:8787/mcp. Keep the port off the public internet (LAN or Tailscale only).
+services:
+  fivesight-mcp:
+    build:
+      context: ./src
+      dockerfile: mcp/Dockerfile
+    image: fivesight-mcp:local
+    container_name: fivesight-mcp
+    restart: unless-stopped
+    user: "1000:1000"
+    env_file: .env
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/data

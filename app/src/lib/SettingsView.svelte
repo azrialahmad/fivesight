@@ -3,7 +3,8 @@
   import { session, inTauri } from './session.svelte';
   import { api, looksLikeAddress } from './api';
   import { activeProfile, isLocalUrl, newProfile, presets } from './providers';
-  import type { AtlassianStatus, BridgeStatus, Settings } from './api';
+  import type { AtlassianStatus, BridgeStatus, Settings, SyncStatus } from './api';
+  import { dayLabel, timeOfDay } from './format';
   import { onMount } from 'svelte';
 
   const notesModes: [Settings['notesMode'], string, string][] = [
@@ -112,6 +113,58 @@
   let notice = $state<string | null>(null);
   onMount(() => void api.settingsNotice().then((n) => (notice = n)).catch(() => {}));
 
+  // ---- sync to your own server ----
+  let syncToken = $state('');
+  let tokenSaved = $state(session.settings.hasSyncToken);
+  $effect(() => {
+    tokenSaved = session.settings.hasSyncToken;
+  });
+  let syncBusy = $state<'sync' | 'check' | null>(null);
+  let syncInfo = $state<SyncStatus | null>(null);
+  let syncError = $state<string | null>(null);
+  /** The saved address and token are what Sync now uses, so it waits for Save after a change. */
+  const syncChanged = $derived(form.syncUrl.trim() !== session.settings.syncUrl.trim() || !!syncToken.trim());
+  const syncReady = $derived(!!session.settings.syncUrl.trim() && tokenSaved && !syncChanged);
+
+  function showSync(p: Promise<SyncStatus>) {
+    syncError = null;
+    return p.then((s) => (syncInfo = s)).catch((e) => ((syncInfo = null), (syncError = String(e))));
+  }
+
+  onMount(() => {
+    const s = session.settings;
+    if (s.syncUrl && s.hasSyncToken) void showSync(api.syncStatus(s.syncUrl, null));
+    // Automatic syncs after a meeting report here too.
+    const off = api.onSync((e) => {
+      syncInfo = e.status;
+      syncError = e.error;
+    });
+    return () => void off.then((f) => f());
+  });
+
+  async function syncNow() {
+    syncBusy = 'sync';
+    await showSync(api.syncNow());
+    syncBusy = null;
+  }
+
+  async function checkSync() {
+    syncBusy = 'check';
+    await showSync(api.syncStatus(form.syncUrl, syncToken.trim() || null));
+    syncBusy = null;
+  }
+
+  async function forgetSyncToken() {
+    await api.forgetSyncToken();
+    tokenSaved = false;
+    syncInfo = null;
+  }
+
+  const syncedLabel = (s: SyncStatus) =>
+    s.syncedAt === null
+      ? 'Connected. Nothing synced yet.'
+      : `Last synced ${dayLabel(s.syncedAt).toLowerCase()} at ${timeOfDay(s.syncedAt)} · ${s.meetings} meeting${s.meetings === 1 ? '' : 's'} · ${(s.bytes / 1_048_576).toFixed(1)} MB`;
+
   // Nothing is kept until Save, so say when the form differs from what's saved.
   const dirty = $derived.by(() => {
     const s = session.settings;
@@ -123,6 +176,8 @@
       form.notesMode !== s.notesMode ||
       form.vocabulary.trim() !== s.vocabulary.trim() ||
       form.userName.trim() !== s.userName.trim() ||
+      form.syncAfterMeetings !== s.syncAfterMeetings ||
+      syncChanged ||
       Object.values(apiKeys).some((k) => k?.trim())
     );
   });
@@ -133,12 +188,16 @@
   async function save() {
     saveError = null;
     try {
-      await session.saveSettings(form, apiKeys);
+      await session.saveSettings(form, apiKeys, syncToken.trim() || null);
     } catch (e) {
       saveError = String(e);
       return;
     }
     apiKeys = {};
+    if (syncToken.trim() || syncError) {
+      syncToken = '';
+      if (session.settings.syncUrl && session.settings.hasSyncToken) void showSync(api.syncStatus(session.settings.syncUrl, null));
+    }
     notice = null;
     keySaved = await api.keySaved(profile.id, profile.baseUrl);
     saved = true;
@@ -407,6 +466,66 @@
         </button>
       </div>
       <p class="mt-1.5 text-xs text-muted">Only your browser extension can use this code. It stays on this PC.</p>
+    </section>
+
+    <section>
+      <div class="flex items-center gap-3">
+        <h2 class="font-semibold">Sync to your server</h2>
+        <span class="rounded-full bg-soft px-2.5 py-0.5 text-[11px] font-semibold tracking-wide">OPTIONAL</span>
+      </div>
+      <p class="mt-0.5 text-sm text-muted">
+        Copy your meetings and files to a fivesight MCP server you run, such as a homelab, so AI agents on your other
+        devices can read them while this PC is off. It only uploads: each sync replaces the server's copy with this PC's.
+      </p>
+
+      <label class="mt-4 block text-sm font-medium" for="sync-url">Server address</label>
+      <input id="sync-url" class={field} placeholder="http://your-server:8787" spellcheck="false" bind:value={form.syncUrl} />
+
+      <label class="mt-4 block text-sm font-medium" for="sync-token">Sync token</label>
+      <input
+        id="sync-token"
+        type="password"
+        autocomplete="off"
+        class={field}
+        placeholder={tokenSaved ? 'Saved. Type to replace.' : "The server's FIVESIGHT_SYNC_TOKEN"}
+        bind:value={syncToken}
+      />
+      <p class="mt-1.5 text-xs text-muted">
+        Stored in Windows Credential Manager and only sent to this server. It can upload but not read; agents use the server's other token.
+        {#if tokenSaved}
+          <button class="ml-1 font-medium text-ink underline" onclick={forgetSyncToken}>Remove saved token</button>
+        {/if}
+      </p>
+
+      <label class="mt-4 flex cursor-pointer items-center gap-2.5 text-sm">
+        <input type="checkbox" class="h-4 w-4 accent-ink" bind:checked={form.syncAfterMeetings} />
+        Sync on its own after each meeting, once the AI notes are written
+      </label>
+
+      <div class="mt-4 flex flex-wrap items-center gap-3">
+        <button
+          class="rounded-full bg-ink px-4 py-2 text-[13px] font-semibold text-white disabled:opacity-40"
+          disabled={!syncReady || syncBusy !== null}
+          title={syncReady ? '' : syncChanged ? 'Save settings first' : 'Add the address and token, then save'}
+          onclick={syncNow}
+        >
+          {syncBusy === 'sync' ? 'Syncing…' : 'Sync now'}
+        </button>
+        <button
+          class="rounded-full border border-line px-4 py-2 text-[13px] font-medium hover:border-ink disabled:opacity-50"
+          disabled={!form.syncUrl.trim() || (!syncToken.trim() && !tokenSaved) || syncBusy !== null}
+          onclick={checkSync}
+        >
+          {syncBusy === 'check' ? 'Checking…' : 'Check connection'}
+        </button>
+      </div>
+      {#if syncError}
+        <p class="mt-2 break-words text-sm text-rec" role="alert">{syncError}</p>
+      {:else if syncInfo}
+        <p class="mt-2 flex items-center gap-1.5 text-sm" role="status"><Icon name="check" size={16} /> {syncedLabel(syncInfo)}</p>
+      {:else if syncChanged && form.syncUrl.trim()}
+        <p class="mt-2 text-xs text-muted">Save settings to use this server.</p>
+      {/if}
     </section>
 
     <section>

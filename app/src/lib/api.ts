@@ -90,6 +90,26 @@ export interface Settings {
   quickPrompts: QuickPrompt[];
   /** Whether a key is saved for the active profile. Keys live in Windows Credential Manager, one per profile. */
   hasKey: boolean;
+  /** A fivesight-mcp server (e.g. on a homelab) to copy the database to. Empty: sync is off. */
+  syncUrl: string;
+  /** Also sync on its own shortly after a meeting ends and its notes are written. */
+  syncAfterMeetings: boolean;
+  /** Whether the server's sync token is saved (in Windows Credential Manager). */
+  hasSyncToken: boolean;
+}
+
+/** What the sync server holds. */
+export interface SyncStatus {
+  /** When its copy was last replaced (epoch ms); null if never. */
+  syncedAt: number | null;
+  bytes: number;
+  meetings: number;
+}
+
+/** The outcome of a sync, manual or automatic. */
+export interface SyncEvent {
+  status: SyncStatus | null;
+  error: string | null;
 }
 
 export interface Status {
@@ -287,8 +307,14 @@ export interface Api {
   rewindChat(meetingId: number | null, keep: number): Promise<void>;
   search(query: string): Promise<Hit[]>;
   getSettings(): Promise<Settings>;
-  /** `apiKeys` maps profile ids to keys typed for them. */
-  saveSettings(s: Settings, apiKeys: Record<string, string> | null): Promise<void>;
+  /** `apiKeys` maps profile ids to keys typed for them; `syncToken` is a newly typed sync token. */
+  saveSettings(s: Settings, apiKeys: Record<string, string> | null, syncToken?: string | null): Promise<void>;
+  /** Copy the database to the sync server now. */
+  syncNow(): Promise<SyncStatus>;
+  /** What the sync server has; uses `token` if given, else the saved one. */
+  syncStatus(url: string, token: string | null): Promise<SyncStatus>;
+  forgetSyncToken(): Promise<void>;
+  onSync(cb: (e: SyncEvent) => void): Promise<Off>;
   /** Why settings fell back to defaults at startup, if they did. */
   settingsNotice(): Promise<string | null>;
   keySaved(id: string, baseUrl: string): Promise<boolean>;
@@ -351,7 +377,11 @@ const tauriApi: Api = {
   rewindChat: (meetingId, keep) => invoke('rewind_chat', { meetingId, keep }),
   search: (query) => invoke('search', { query }),
   getSettings: () => invoke('get_settings'),
-  saveSettings: (settings, apiKeys) => invoke('save_settings', { settings, apiKeys }),
+  saveSettings: (settings, apiKeys, syncToken) => invoke('save_settings', { settings, apiKeys, syncToken: syncToken ?? null }),
+  syncNow: () => invoke('sync_now'),
+  syncStatus: (url, token) => invoke('sync_status', { url, token }),
+  forgetSyncToken: () => invoke('forget_sync_token'),
+  onSync: (cb) => listen<SyncEvent>('sync', (e) => cb(e.payload)),
   settingsNotice: () => invoke('settings_notice'),
   keySaved: (id, baseUrl) => invoke('key_saved', { id, baseUrl }),
   forgetKey: (id, baseUrl) => invoke('forget_key', { id, baseUrl }),
@@ -416,8 +446,12 @@ function createMockApi(): Api {
     vocabulary: 'Playwright, Claude',
     userName: '',
     quickPrompts: defaultQuickPrompts,
-    hasKey: false
+    hasKey: false,
+    syncUrl: '',
+    syncAfterMeetings: false,
+    hasSyncToken: false
   };
+  let syncedAt: number | null = null;
   const speechModels: SpeechModelInfo[] = [
     { id: 'large-v3-turbo', label: 'Large v3 Turbo', note: 'Best balance of accuracy and speed for live meetings.', vramMb: 2300, bytes: 1_624_555_275, present: false },
     { id: 'large-v3-turbo-q8_0', label: 'Large v3 Turbo (8-bit)', note: 'Almost the same accuracy in about half the memory.', vramMb: 1500, bytes: 874_188_075, present: false },
@@ -600,7 +634,9 @@ function createMockApi(): Api {
         segs.filter((s) => s.text.toLowerCase().includes(q.toLowerCase())).map((s) => ({ meetingId: Number(id), meetingTitle: get(Number(id)).title, startMs: s.startMs, snippet: s.text }))
       ),
     getSettings: async () => ({ ...settings }),
-    saveSettings: async (s, typed) => {
+    saveSettings: async (s, typed, syncToken) => {
+      if (syncToken?.trim()) settings.hasSyncToken = true;
+      s = { ...s, hasSyncToken: settings.hasSyncToken, syncUrl: s.syncUrl.trim().replace(/\/+$/, '').replace(/\/mcp$/, '') };
       for (const p of s.profiles) {
         for (const [field, value] of [['Model', p.model], ['Fallback model', p.fallbackModel]]) {
           if (looksLikeAddress(value)) throw `${field} in "${p.name}" should be a model name, not a server address. Put the address in Server address.`;
@@ -611,6 +647,23 @@ function createMockApi(): Api {
       settings = { ...s, hasKey: keys.has(active.id + active.baseUrl.trim()) };
     },
     settingsNotice: async () => null,
+    syncNow: async () => {
+      if (!settings.syncUrl) throw "Add your server's address in Settings first.";
+      if (!settings.hasSyncToken) throw "Add the server's sync token in Settings first.";
+      await new Promise((r) => setTimeout(r, 800));
+      syncedAt = Date.now();
+      const status = { syncedAt, bytes: 3_276_800, meetings: nextId - 1 };
+      emit<SyncEvent>('sync', { status, error: null });
+      return status;
+    },
+    syncStatus: async (url, token) => {
+      await new Promise((r) => setTimeout(r, 300));
+      if (!token && !settings.hasSyncToken) throw "Paste the server's sync token first.";
+      if (!/^https?:\/\/\S+$/.test(url.trim())) throw `"${url}" isn't a web address. It looks like http://your-server:8787.`;
+      return { syncedAt, bytes: syncedAt ? 3_276_800 : 0, meetings: syncedAt ? nextId - 1 : 0 };
+    },
+    forgetSyncToken: async () => void (settings.hasSyncToken = false),
+    onSync: (cb) => sub('sync', cb),
     keySaved: async (id, baseUrl) => keys.has(id + baseUrl.trim()),
     forgetKey: async (id, baseUrl) => void keys.delete(id + baseUrl.trim()),
     testLlm: async (s, key) => {
