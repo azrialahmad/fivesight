@@ -16,6 +16,24 @@
     return Array.from(doc.querySelectorAll('[data-participant-id]'));
   }
 
+  /**
+   * The document of Meet's picture-in-picture window (Document Picture-in-Picture), or null when
+   * none is open. While it is, Meet draws the tiles there and the tab's grid goes stale.
+   */
+  function pipDocument(win) {
+    try {
+      const w = win && win.documentPictureInPicture && win.documentPictureInPicture.window;
+      return w && !w.closed && w.document ? w.document : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** Where to read tiles from: the picture-in-picture window while it shows any, else the tab. */
+  function tileDocument(main, pip) {
+    return pip && tiles(pip).length > 0 ? pip : main;
+  }
+
   function tileId(tile) {
     return tile.getAttribute('data-participant-id');
   }
@@ -165,6 +183,8 @@
   const api = {
     meetCode,
     tiles,
+    pipDocument,
+    tileDocument,
     tileId,
     ownName,
     looksLikeName,
