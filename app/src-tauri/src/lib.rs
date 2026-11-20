@@ -1577,6 +1577,11 @@ fn sync_soon(app: &AppHandle) {
     std::thread::spawn(move || {
         std::thread::sleep(SYNC_DELAY);
         let st = app.state::<AppState>();
+        // An upload still running copied the database before this change: wait for it to finish
+        // rather than skip, or the change would stay off the server until the next meeting.
+        while st.syncing.load(Ordering::SeqCst) && st.sync_generation.load(Ordering::SeqCst) == generation {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
         if st.sync_generation.load(Ordering::SeqCst) != generation || lock(&st.recording).is_some() {
             return;
         }

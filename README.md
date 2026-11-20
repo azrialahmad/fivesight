@@ -160,7 +160,9 @@ uploads a copy of its database there from **Settings → Sync to your server**, 
 each meeting. Each sync replaces the server's copy; nothing comes back.
 
 [`mcp/compose.yaml`](mcp/compose.yaml) runs it with Docker: put this repository in `./src` next to
-it and two random tokens in `.env` (`openssl rand -hex 32` each):
+it, an empty `data` folder made by your own user (`mkdir data`; the container runs as uid 1000
+and can't write to a folder Docker creates as root) and two random tokens in `.env`
+(`openssl rand -hex 32` each):
 
 - `FIVESIGHT_MCP_TOKEN`: agents send it to read.
 - `FIVESIGHT_SYNC_TOKEN`: the app sends it to upload. Paste it into Settings.
