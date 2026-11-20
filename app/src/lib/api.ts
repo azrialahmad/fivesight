@@ -457,6 +457,7 @@ function createMockApi(): Api {
     { id: 'large-v3-turbo-q8_0', label: 'Large v3 Turbo (8-bit)', note: 'Almost the same accuracy in about half the memory.', vramMb: 1500, bytes: 874_188_075, present: false },
     { id: 'large-v3-turbo-q5_0', label: 'Large v3 Turbo (5-bit)', note: 'For cards with little memory. Slightly less accurate.', vramMb: 1100, bytes: 574_041_195, present: false },
     { id: 'large-v3', label: 'Large v3', note: 'Most accurate, but several times slower. Needs a strong card to keep up live.', vramMb: 4200, bytes: 3_095_033_483, present: false },
+    { id: 'qwen3-asr-1.7b-q8', label: 'Qwen3-ASR 1.7B (experimental)', note: 'Fewer mistakes than Whisper on Indonesian and mixed speech in our tests, and faster. Runs in llama.cpp beside the app.', vramMb: 3000, bytes: 3_172_526_657, present: false },
     { id: 'small-q5_1', label: 'Small (5-bit)', note: 'Fastest and smallest. Noticeably weaker, especially for Indonesian.', vramMb: 600, bytes: 190_085_487, present: false }
   ];
   let vadPresent = false;

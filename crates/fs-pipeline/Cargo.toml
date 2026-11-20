@@ -10,3 +10,7 @@ tracing.workspace = true
 fs-audio = { path = "../fs-audio" }
 fs-vad = { path = "../fs-vad", features = ["silero"] }
 fs-stt = { path = "../fs-stt", features = ["engine"] }
+
+[dev-dependencies]
+hound = "3.5.1"
+serde_json.workspace = true
