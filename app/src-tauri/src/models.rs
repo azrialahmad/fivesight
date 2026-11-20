@@ -239,8 +239,13 @@ pub fn unpack(zip: &Path, dir: &Path) -> Result<(), String> {
     let name = zip.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
     let to = unpack_dir(dir);
     std::fs::create_dir_all(&to).map_err(|e| format!("Couldn't create {}: {e}", to.display()))?;
-    // Windows 10 and later ship bsdtar, which reads zip files.
-    let mut cmd = std::process::Command::new("tar");
+    // Windows 10 and later ship bsdtar, which reads zip files. Named by its full path: a GNU tar
+    // earlier on PATH (Git's, say) can't read zips and takes "C:\..." for a remote host.
+    let tar = std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("tar"));
+    let mut cmd = std::process::Command::new(tar);
     cmd.arg("-xf").arg(zip).arg("-C").arg(&to);
     #[cfg(windows)]
     {
