@@ -10,6 +10,8 @@ pub enum EngineError {
     Whisper(#[from] whisper_rs::WhisperError),
     #[error("model path is not valid UTF-8")]
     BadPath,
+    #[error("qwen3-asr: {0}")]
+    Qwen(String),
 }
 
 #[derive(Debug, Clone)]
@@ -101,5 +103,81 @@ impl Engine {
             });
         }
         Ok(out)
+    }
+}
+
+/// Anything that turns audio into segments, for code that works with either engine.
+pub trait Transcribe {
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        language: Option<&str>,
+        beam_size: i32,
+        initial_prompt: Option<&str>,
+    ) -> Result<Vec<Segment>, EngineError>;
+}
+
+impl Transcribe for Engine {
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        language: Option<&str>,
+        beam: i32,
+        prompt: Option<&str>,
+    ) -> Result<Vec<Segment>, EngineError> {
+        Engine::transcribe(self, samples, language, beam, prompt)
+    }
+}
+
+/// Which speech model to run.
+#[derive(Debug, Clone)]
+pub enum EngineSpec {
+    /// whisper.cpp with this model file.
+    Whisper(std::path::PathBuf),
+    /// Qwen3-ASR through llama-server.
+    Qwen(crate::qwen::QwenConfig),
+}
+
+/// The loaded speech model.
+pub enum SpeechEngine {
+    Whisper(Engine),
+    Qwen(crate::qwen::QwenEngine),
+}
+
+impl SpeechEngine {
+    pub fn load(spec: &EngineSpec, use_gpu: bool) -> Result<Self, EngineError> {
+        Ok(match spec {
+            EngineSpec::Whisper(model) => Self::Whisper(Engine::load(model, use_gpu)?),
+            EngineSpec::Qwen(cfg) => Self::Qwen(crate::qwen::QwenEngine::start(cfg)?),
+        })
+    }
+
+    /// Qwen picks the language itself; Whisper needs it chosen first (see [`Engine::detect_among`]).
+    pub fn picks_language(&self) -> bool {
+        matches!(self, Self::Qwen(_))
+    }
+
+    /// Whisper's language probabilities; Qwen has none (see [`SpeechEngine::picks_language`]).
+    pub fn detect_among(&self, samples: &[f32], langs: &[&str]) -> Result<Vec<f32>, EngineError> {
+        match self {
+            Self::Whisper(e) => e.detect_among(samples, langs),
+            Self::Qwen(_) => Ok(vec![0.0; langs.len()]),
+        }
+    }
+}
+
+impl Transcribe for SpeechEngine {
+    /// For Qwen, `beam_size` is ignored and `initial_prompt` is used as context (vocabulary).
+    fn transcribe(
+        &self,
+        samples: &[f32],
+        language: Option<&str>,
+        beam: i32,
+        prompt: Option<&str>,
+    ) -> Result<Vec<Segment>, EngineError> {
+        match self {
+            Self::Whisper(e) => e.transcribe(samples, language, beam, prompt),
+            Self::Qwen(q) => q.transcribe(samples, language, prompt),
+        }
     }
 }

@@ -22,16 +22,19 @@ use std::time::{Duration, Instant};
 
 use echo::{EchoConfig, EchoGuard};
 use fs_audio::{rms, Capture, Source};
-use fs_stt::engine::{Engine, Segment};
+use fs_stt::engine::{EngineSpec, Segment, SpeechEngine, Transcribe};
 use fs_stt::filter::{judge, FilterConfig, SegmentStats, Verdict};
 use fs_stt::hints::{echoes_prompt, retry_prompt};
 use fs_stt::lang::{LangMode, LangTracker, BILINGUAL_PROMPT, MIN_DETECT_SECS};
+pub use fs_stt::qwen::QwenConfig;
 use fs_vad::silero::SileroVad;
 use fs_vad::{EndpointConfig, Endpointer, Event, FRAME, SAMPLE_RATE};
 
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub whisper_model: PathBuf,
+    /// Transcribe with Qwen3-ASR (llama.cpp) instead of Whisper. `whisper_model` is then unused.
+    pub qwen: Option<QwenConfig>,
     pub vad_model: PathBuf,
     /// Auto picks between Indonesian and English per utterance; Id/En pin one language.
     pub language: LangMode,
@@ -57,6 +60,7 @@ impl PipelineConfig {
     pub fn new(whisper_model: PathBuf, vad_model: PathBuf) -> Self {
         Self {
             whisper_model,
+            qwen: None,
             vad_model,
             language: LangMode::Auto,
             initial_prompt: Some(BILINGUAL_PROMPT.into()),
@@ -70,6 +74,15 @@ impl PipelineConfig {
             final_beam: 3,
             filter: FilterConfig::default(),
             echo: Some(EchoConfig::default()),
+        }
+    }
+}
+
+impl PipelineConfig {
+    fn engine_spec(&self) -> EngineSpec {
+        match &self.qwen {
+            Some(q) => EngineSpec::Qwen(q.clone()),
+            None => EngineSpec::Whisper(self.whisper_model.clone()),
         }
     }
 }
@@ -121,6 +134,70 @@ pub enum PipelineError {
     Thread(String),
 }
 
+/// Where the pipeline's audio comes from.
+pub enum AudioInput {
+    /// The default microphone and the system's playback (loopback), live.
+    Live,
+    /// Two recordings (16 kHz mono): what the mic and the loopback heard, fed in step at
+    /// `speed` times real time. For replaying a meeting through the real pipeline.
+    Recorded { mic: Vec<f32>, loopback: Vec<f32>, speed: f32 },
+}
+
+/// Feeds recorded audio to the stream threads frame by frame, mic and loopback in step.
+struct Feeder {
+    stop: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Feeder {
+    fn start(
+        mic: Vec<f32>,
+        loopback: Vec<f32>,
+        speed: f32,
+        txs: [SyncSender<Vec<f32>>; 2],
+    ) -> Result<Self, PipelineError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let speed = if speed > 0.0 { speed } else { 1.0 };
+        let join = thread::Builder::new()
+            .name("replay-feeder".into())
+            .spawn(move || {
+                let frames = mic.len().max(loopback.len()).div_ceil(FRAME);
+                let frame_time = Duration::from_secs_f64(FRAME as f64 / SAMPLE_RATE as f64 / speed as f64);
+                let t0 = Instant::now();
+                let take = |s: &[f32], i: usize| {
+                    let mut f: Vec<f32> = s.get(i * FRAME..((i + 1) * FRAME).min(s.len())).unwrap_or(&[]).to_vec();
+                    f.resize(FRAME, 0.0);
+                    f
+                };
+                for i in 0..frames {
+                    if stop2.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    if txs[0].send(take(&mic, i)).is_err() || txs[1].send(take(&loopback, i)).is_err() {
+                        return;
+                    }
+                    let due = t0 + frame_time * (i as u32 + 1);
+                    if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                        thread::sleep(wait);
+                    }
+                }
+                // Dropping the senders ends the stream threads, which finalize what is open.
+            })
+            .map_err(|e| PipelineError::Thread(e.to_string()))?;
+        Ok(Self { stop, join: Some(join) })
+    }
+}
+
+impl Drop for Feeder {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
 struct Job {
     source: Source,
     segment_id: u64,
@@ -132,6 +209,7 @@ struct Job {
 
 pub struct Pipeline {
     captures: Vec<Capture>,
+    feeder: Option<Feeder>,
     threads: Vec<JoinHandle<()>>,
     prompt: Arc<Mutex<Option<String>>>,
     split_others: Arc<AtomicI64>,
@@ -141,6 +219,16 @@ impl Pipeline {
     /// Load models, open both audio streams and start transcribing.
     /// Events arrive on `events`; dropping the `Pipeline` stops everything.
     pub fn start(cfg: PipelineConfig, events: Sender<TranscriptEvent>) -> Result<Self, PipelineError> {
+        Self::start_with(cfg, events, AudioInput::Live)
+    }
+
+    /// Like [`Pipeline::start`], with audio from `input`. With recordings, `events` closes once
+    /// they have played through and the last line is transcribed.
+    pub fn start_with(
+        cfg: PipelineConfig,
+        events: Sender<TranscriptEvent>,
+        input: AudioInput,
+    ) -> Result<Self, PipelineError> {
         let (job_tx, job_rx) = sync_channel::<Job>(16);
         let inflight_mic = Arc::new(AtomicBool::new(false));
         let inflight_out = Arc::new(AtomicBool::new(false));
@@ -163,7 +251,7 @@ impl Pipeline {
             };
             thread::Builder::new()
                 .name("whisper-worker".into())
-                .spawn(move || match Engine::load(&cfg.whisper_model, true) {
+                .spawn(move || match SpeechEngine::load(&cfg.engine_spec(), true) {
                     Ok(engine) => {
                         let _ = ready_tx.send(Ok(()));
                         worker_loop(engine, cfg, job_rx, events, shared);
@@ -178,6 +266,7 @@ impl Pipeline {
 
         let mut threads = vec![worker];
         let mut captures = Vec::new();
+        let mut senders = Vec::new();
         for (source, inflight) in [(Source::Mic, inflight_mic), (Source::Loopback, inflight_out)] {
             let (frame_tx, frame_rx) = sync_channel::<Vec<f32>>(512);
             let vad = SileroVad::load(&cfg.vad_model).map_err(|e| PipelineError::Vad(e.to_string()))?;
@@ -206,9 +295,20 @@ impl Pipeline {
                     .spawn(move || stream_loop(ctx, vad, ep, frame_rx))
                     .map_err(|e| PipelineError::Thread(e.to_string()))?,
             );
-            captures.push(Capture::start(source, frame_tx)?);
+            match input {
+                AudioInput::Live => captures.push(Capture::start(source, frame_tx)?),
+                AudioInput::Recorded { .. } => senders.push(frame_tx),
+            }
         }
-        Ok(Self { captures, threads, prompt, split_others })
+        let feeder = match input {
+            AudioInput::Live => None,
+            AudioInput::Recorded { mic, loopback, speed } => {
+                let [m, l]: [SyncSender<Vec<f32>>; 2] =
+                    senders.try_into().map_err(|_| PipelineError::Thread("expected two streams".into()))?;
+                Some(Feeder::start(mic, loopback, speed, [m, l])?)
+            }
+        };
+        Ok(Self { captures, feeder, threads, prompt, split_others })
     }
 
     /// The speaker on the call changed at `at` (Unix ms; the Meet extension says so, corrected
@@ -233,6 +333,7 @@ impl Pipeline {
 impl Drop for Pipeline {
     fn drop(&mut self) {
         self.captures.clear(); // stops capture, closes frame channels
+        self.feeder = None; // same for a replay
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -359,7 +460,7 @@ fn stream_loop(ctx: StreamCtx, mut vad: SileroVad, mut ep: Endpointer, frames: R
 }
 
 /// Ask Whisper how likely Indonesian and English are, then apply the sticky choice.
-fn detect_and_choose(engine: &Engine, tracker: &mut LangTracker, audio: &[f32], secs: f32) -> &'static str {
+fn detect_and_choose(engine: &SpeechEngine, tracker: &mut LangTracker, audio: &[f32], secs: f32) -> &'static str {
     match engine.detect_among(audio, &["id", "en"]) {
         Ok(p) => tracker.choose(p[0], p[1], secs),
         Err(e) => {
@@ -378,7 +479,7 @@ struct WorkerShared {
 }
 
 fn worker_loop(
-    engine: Engine,
+    engine: SpeechEngine,
     cfg: PipelineConfig,
     jobs: Receiver<Job>,
     events: Sender<TranscriptEvent>,
@@ -418,6 +519,8 @@ fn worker_loop(
         let lang: Option<&'static str> = match cfg.language {
             LangMode::Id => Some("id"),
             LangMode::En => Some("en"),
+            // Qwen picks the language itself, per line.
+            LangMode::Auto if engine.picks_language() => None,
             LangMode::Auto => Some(match job.kind {
                 Kind::Partial => match seg_lang.get(&key) {
                     Some(l) => *l,
@@ -459,7 +562,13 @@ fn worker_loop(
         let base = cfg.language.base_prompt();
         let context = recent.text();
         let short = secs < SHORT_SECS;
-        let prompt = utterance_prompt(meeting_prompt.as_deref(), base, context.as_deref(), short);
+        let prompt = if engine.picks_language() {
+            // Qwen reads the prompt as vocabulary, not as preceding text: the hints alone, without
+            // Whisper's example sentence or the conversation.
+            hints_only(meeting_prompt.as_deref(), base)
+        } else {
+            utterance_prompt(meeting_prompt.as_deref(), base, context.as_deref(), short)
+        };
         // What a second try leaves out: the conversation when it was used, else the example sentence.
         let strip = if context.is_some() && prompt != meeting_prompt { context.as_deref() } else { base };
         // A short utterance is cheap to search harder, and needs it most.
@@ -623,11 +732,19 @@ pub fn utterance_prompt(
     Some(if glossary.is_empty() { context.to_string() } else { format!("{glossary} {context}") })
 }
 
+/// The meeting's hints (title, glossary, people) without `base`, the example sentence at its end.
+pub fn hints_only(meeting: Option<&str>, base: Option<&str>) -> Option<String> {
+    let meeting = meeting.map(str::trim).filter(|m| !m.is_empty())?;
+    let b = base.map(str::trim).filter(|b| !b.is_empty());
+    let rest = b.and_then(|b| meeting.strip_suffix(b)).unwrap_or(meeting).trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
 /// Second try at an utterance whose text only repeated `prompt`: the same audio with the
 /// glossary but without the `base` example sentence. Returns the text when that hears
 /// something other than its own (smaller) prompt, which means someone said it.
 pub fn listen_again(
-    engine: &Engine,
+    engine: &impl Transcribe,
     audio: &[f32],
     lang: Option<&str>,
     beam: i32,
@@ -690,10 +807,25 @@ fn release_held(
 
 #[cfg(test)]
 mod tests {
-    use super::{trim_ellipsis, utterance_prompt, Recent, CONTEXT_CHARS};
+    use super::{hints_only, trim_ellipsis, utterance_prompt, Recent, CONTEXT_CHARS};
 
     const BASE: &str = "Jadi PR-nya udah di-review.";
     const MEETING: &str = "Glossary: Goldplus, MamiAds. People: Nuki Pratama. Jadi PR-nya udah di-review.";
+
+    #[test]
+    fn qwen_gets_the_hints_without_the_example_sentence() {
+        assert_eq!(
+            hints_only(Some(MEETING), Some(BASE)).as_deref(),
+            Some("Glossary: Goldplus, MamiAds. People: Nuki Pratama.")
+        );
+        assert_eq!(hints_only(Some("Glossary: GP."), Some(BASE)).as_deref(), Some("Glossary: GP."));
+        assert_eq!(hints_only(Some(BASE), Some(BASE)), None);
+        assert_eq!(hints_only(None, Some(BASE)), None);
+        // What Qwen says back on a short "okay" when it has nothing to hear is the hint list:
+        // caught as repeating the prompt, so the line is heard again without hints.
+        let hints = hints_only(Some(MEETING), Some(BASE)).unwrap();
+        assert!(fs_stt::hints::echoes_prompt("Glossary: Goldplus, MamiAds. People: Nuki Pratama.", &hints));
+    }
 
     #[test]
     fn the_last_thing_said_takes_the_example_sentences_place() {
