@@ -1,0 +1,6 @@
+.venv/
+.work/
+sets/
+recordings/
+.tools/
+__pycache__/
