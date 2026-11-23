@@ -14,6 +14,10 @@ use crate::system::SystemInfo;
 
 /// Hugging Face commit the Whisper files are pinned to, so a file can't change under its checksum.
 const WHISPER_REV: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
+/// Same for Qwen3-ASR (ggml-org/Qwen3-ASR-1.7B-GGUF).
+const QWEN_REV: &str = "36a678687ba7d07a74ca70ccb0e36902e005fb80";
+/// llama.cpp build whose llama-server runs Qwen3-ASR. CUDA 13.5 builds run on RTX 50xx (Blackwell).
+pub const LLAMA_BUILD: &str = "b12577";
 
 /// A file fivesight can download.
 #[derive(Debug, Clone, Copy)]
@@ -27,6 +31,10 @@ impl ModelFile {
     pub fn url(&self) -> String {
         if self.file == VAD.file {
             "https://github.com/snakers4/silero-vad/raw/v6.2/src/silero_vad/data/silero_vad.onnx".into()
+        } else if self.file.ends_with(".gguf") {
+            format!("https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF/resolve/{QWEN_REV}/{}", self.file)
+        } else if self.file.ends_with(".zip") {
+            format!("https://github.com/ggml-org/llama.cpp/releases/download/{LLAMA_BUILD}/{}", self.file)
         } else {
             format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/{WHISPER_REV}/{}", self.file)
         }
@@ -40,6 +48,16 @@ pub const VAD: ModelFile = ModelFile {
     sha256: "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3",
 };
 
+/// What runs a speech model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EngineKind {
+    /// whisper.cpp, built into the app.
+    Whisper,
+    /// Qwen3-ASR in llama.cpp's llama-server, run beside the app.
+    Qwen,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SpeechModel {
     pub id: &'static str,
@@ -47,8 +65,47 @@ pub struct SpeechModel {
     pub note: &'static str,
     /// Graphics memory it needs while transcribing, roughly (weights plus working buffers).
     pub vram_mb: u64,
+    pub engine: EngineKind,
+    /// The model itself.
     pub file: ModelFile,
+    /// Other files it needs (Qwen: audio encoder and the llama.cpp runtime zips).
+    pub extra: &'static [ModelFile],
 }
+
+impl SpeechModel {
+    /// Every file to download for this model.
+    pub fn files(&self) -> impl Iterator<Item = &ModelFile> {
+        std::iter::once(&self.file).chain(self.extra.iter())
+    }
+
+    pub fn total_bytes(&self) -> u64 {
+        self.files().map(|f| f.bytes).sum()
+    }
+
+    /// All its files are on disk (zips unpacked).
+    pub fn present(&self) -> bool {
+        self.files().all(is_present)
+    }
+}
+
+/// Qwen3-ASR's audio encoder and the llama.cpp runtime (server and CUDA libraries).
+const QWEN_EXTRA: &[ModelFile] = &[
+    ModelFile {
+        file: "mmproj-Qwen3-ASR-1.7B-Q8_0.gguf",
+        bytes: 355_709_344,
+        sha256: "46c1d533af3f354ceb37ce855dbceff7da7fa7cf1e6a523df3b13440bd164c0d",
+    },
+    ModelFile {
+        file: "llama-b12577-bin-win-cuda-13.5-x64.zip",
+        bytes: 225_468_170,
+        sha256: "45e169ca832c5cd488b30ccd38c689e7972ab7256045be2fb1b086ee52a303de",
+    },
+    ModelFile {
+        file: "cudart-llama-bin-win-cuda-13.5-x64.zip",
+        bytes: 426_314_199,
+        sha256: "c2bf4cc202bfbaaa7a0b75f5082457c3811326947bb216059b72839d844e9cba",
+    },
+];
 
 /// Best first. All are multilingual; the large-v3 family handles Indonesian/English mixing best.
 pub const SPEECH_MODELS: &[SpeechModel] = &[
@@ -57,55 +114,78 @@ pub const SPEECH_MODELS: &[SpeechModel] = &[
         label: "Large v3 Turbo",
         note: "Best balance of accuracy and speed for live meetings.",
         vram_mb: 2_300,
+        engine: EngineKind::Whisper,
         file: ModelFile {
             file: "ggml-large-v3-turbo.bin",
             bytes: 1_624_555_275,
             sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
         },
+        extra: &[],
     },
     SpeechModel {
         id: "large-v3-turbo-q8_0",
         label: "Large v3 Turbo (8-bit)",
         note: "Almost the same accuracy in about half the memory.",
         vram_mb: 1_500,
+        engine: EngineKind::Whisper,
         file: ModelFile {
             file: "ggml-large-v3-turbo-q8_0.bin",
             bytes: 874_188_075,
             sha256: "317eb69c11673c9de1e1f0d459b253999804ec71ac4c23c17ecf5fbe24e259a1",
         },
+        extra: &[],
     },
     SpeechModel {
         id: "large-v3-turbo-q5_0",
         label: "Large v3 Turbo (5-bit)",
         note: "For cards with little memory. Slightly less accurate.",
         vram_mb: 1_100,
+        engine: EngineKind::Whisper,
         file: ModelFile {
             file: "ggml-large-v3-turbo-q5_0.bin",
             bytes: 574_041_195,
             sha256: "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2",
         },
+        extra: &[],
     },
     SpeechModel {
         id: "large-v3",
         label: "Large v3",
         note: "Most accurate, but several times slower. Needs a strong card to keep up live.",
         vram_mb: 4_200,
+        engine: EngineKind::Whisper,
         file: ModelFile {
             file: "ggml-large-v3.bin",
             bytes: 3_095_033_483,
             sha256: "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
         },
+        extra: &[],
+    },
+    SpeechModel {
+        id: "qwen3-asr-1.7b-q8",
+        label: "Qwen3-ASR 1.7B (experimental)",
+        note: "Fewer mistakes than Whisper on Indonesian and mixed speech in our tests, and faster. Runs in llama.cpp beside the app.",
+        vram_mb: 3_000,
+        engine: EngineKind::Qwen,
+        file: ModelFile {
+            file: "Qwen3-ASR-1.7B-Q8_0.gguf",
+            bytes: 2_165_034_944,
+            sha256: "58e22d0532d4eacaf034cfac17a6fed159f37c41390c710186783be439d1fc57",
+        },
+        extra: QWEN_EXTRA,
     },
     SpeechModel {
         id: "small-q5_1",
         label: "Small (5-bit)",
         note: "Fastest and smallest. Noticeably weaker, especially for Indonesian.",
         vram_mb: 600,
+        engine: EngineKind::Whisper,
         file: ModelFile {
             file: "ggml-small-q5_1.bin",
             bytes: 190_085_487,
             sha256: "ae85e4a935d7a567bd102fe55afc16bb595bdb618e11b2fc7591bc08120411bb",
         },
+        extra: &[],
     },
 ];
 
@@ -129,6 +209,56 @@ fn search_dirs() -> Vec<PathBuf> {
     dirs.extend(download_dir());
     dirs.push(PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models")));
     dirs
+}
+
+/// Where a llama.cpp runtime zip is unpacked, and the marker written once it is.
+fn unpack_dir(dir: &Path) -> PathBuf {
+    dir.join(format!("llama-{LLAMA_BUILD}"))
+}
+
+fn unpacked_marker(dir: &Path, zip: &str) -> PathBuf {
+    unpack_dir(dir).join(format!(".{zip}.ok"))
+}
+
+/// On disk and usable: a complete file, or for a runtime zip, its unpacked contents.
+pub fn is_present(f: &ModelFile) -> bool {
+    if f.file.ends_with(".zip") {
+        search_dirs().iter().any(|d| unpacked_marker(d, f.file).exists())
+    } else {
+        find(f).is_some()
+    }
+}
+
+/// The unpacked llama-server, if the runtime is on disk.
+pub fn llama_server() -> Option<PathBuf> {
+    search_dirs().into_iter().map(|d| unpack_dir(&d).join("llama-server.exe")).find(|p| p.is_file())
+}
+
+/// Unpack a downloaded runtime zip next to the models and remove the zip.
+pub fn unpack(zip: &Path, dir: &Path) -> Result<(), String> {
+    let name = zip.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_string();
+    let to = unpack_dir(dir);
+    std::fs::create_dir_all(&to).map_err(|e| format!("Couldn't create {}: {e}", to.display()))?;
+    // Windows 10 and later ship bsdtar, which reads zip files. Named by its full path: a GNU tar
+    // earlier on PATH (Git's, say) can't read zips and takes "C:\..." for a remote host.
+    let tar = std::env::var_os("SystemRoot")
+        .map(|r| PathBuf::from(r).join("System32").join("tar.exe"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("tar"));
+    let mut cmd = std::process::Command::new(tar);
+    cmd.arg("-xf").arg(zip).arg("-C").arg(&to);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let out = cmd.output().map_err(|e| format!("Couldn't unpack {name}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("Couldn't unpack {name}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    }
+    std::fs::write(unpacked_marker(dir, &name), b"").map_err(|e| format!("Couldn't finish unpacking {name}: {e}"))?;
+    let _ = std::fs::remove_file(zip);
+    Ok(())
 }
 
 /// A complete copy of `f` (right size) in any search folder.
@@ -187,7 +317,7 @@ pub fn recommend(info: &SystemInfo) -> Recommendation {
         warnings.push(format!("{} of memory is on the low side; close other apps during meetings.", gb(info.ram_mb)));
     }
     if let Some(free) = info.free_disk_mb {
-        let need = (model.file.bytes + VAD.bytes) / (1024 * 1024) + 500;
+        let need = (model.total_bytes() + VAD.bytes) / (1024 * 1024) + 500;
         if free < need {
             warnings.push(format!("Only {} free on the model drive; the download needs about {}.", gb(free), gb(need)));
         }
@@ -329,6 +459,22 @@ mod tests {
         assert_eq!(recommend(&pc(&[("GTX 1050", 3_072, true)], 16)).speech_model, Some("large-v3-turbo-q8_0"));
         assert_eq!(recommend(&pc(&[("MX450", 2_048, true)], 8)).speech_model, Some("large-v3-turbo-q5_0"));
         assert_eq!(recommend(&pc(&[("MX150", 1_024, true)], 8)).speech_model, Some("small-q5_1"));
+    }
+
+    #[test]
+    fn qwen_comes_with_its_encoder_and_runtime_from_pinned_places() {
+        let q = speech_model("qwen3-asr-1.7b-q8").unwrap();
+        assert_eq!(q.engine, EngineKind::Qwen);
+        assert_eq!(q.files().count(), 4);
+        assert_eq!(q.total_bytes(), 3_172_526_657);
+        let urls: Vec<String> = q.files().map(ModelFile::url).collect();
+        assert!(urls[0].contains(QWEN_REV) && urls[1].contains(QWEN_REV), "{urls:?}");
+        assert!(urls[2].ends_with("/releases/download/b12577/llama-b12577-bin-win-cuda-13.5-x64.zip"));
+        assert!(urls[3].ends_with("/releases/download/b12577/cudart-llama-bin-win-cuda-13.5-x64.zip"));
+        // Experimental: never picked automatically.
+        assert_ne!(recommend(&pc(&[("RTX 5090", 32_000, true)], 64)).speech_model, Some(q.id));
+        // Whisper models need nothing extra.
+        assert!(SPEECH_MODELS.iter().filter(|m| m.engine == EngineKind::Whisper).all(|m| m.extra.is_empty()));
     }
 
     #[test]

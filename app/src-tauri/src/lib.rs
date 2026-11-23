@@ -697,16 +697,33 @@ fn open_extension_folder(app: AppHandle) -> Result<(), String> {
 
 /// Where the speech models live. Order: `FIVESIGHT_MODELS`, `%LOCALAPPDATA%\fivesight\models`,
 /// then the repo's `models/` folder (development).
-/// The chosen Whisper model and the voice-activity model, if both are on disk.
-fn model_paths(s: &Settings) -> Result<(PathBuf, PathBuf), String> {
+/// The chosen speech model's file, the voice-activity model, and for Qwen3-ASR what runs it,
+/// if all are on disk.
+fn model_paths(s: &Settings) -> Result<(PathBuf, PathBuf, Option<fs_pipeline::QwenConfig>), String> {
     let chosen = models::speech_model(&s.speech_model)
         .ok_or_else(|| format!("Unknown speech model \"{}\". Choose one in Settings → Run setup.", s.speech_model))?;
-    let whisper = models::find(&chosen.file).ok_or_else(|| {
-        format!("The speech model ({}) isn't downloaded yet. Open Settings → Run setup to get it.", chosen.label)
-    })?;
+    let missing =
+        || format!("The speech model ({}) isn't downloaded yet. Open Settings → Run setup to get it.", chosen.label);
+    let model = models::find(&chosen.file).ok_or_else(missing)?;
     let vad = models::find(&models::VAD)
         .ok_or("The voice detection model isn't downloaded yet. Open Settings → Run setup to get it.")?;
-    Ok((whisper, vad))
+    let qwen = match chosen.engine {
+        models::EngineKind::Whisper => None,
+        models::EngineKind::Qwen => {
+            if !chosen.present() {
+                return Err(missing());
+            }
+            let mmproj = chosen
+                .extra
+                .iter()
+                .find(|f| f.file.starts_with("mmproj"))
+                .and_then(models::find)
+                .ok_or_else(missing)?;
+            let server = models::llama_server().ok_or_else(missing)?;
+            Some(fs_pipeline::QwenConfig { server, model: model.clone(), mmproj, gpu: true })
+        }
+    };
+    Ok((model, vad, qwen))
 }
 
 fn stored_key(user: &str) -> Option<String> {
@@ -775,7 +792,7 @@ fn get_status(state: State<'_, AppState>) -> Status {
         recording_meeting_id: rec.as_ref().map(|r| r.meeting_id),
         models_dir: model_paths(&lock(&state.settings))
             .ok()
-            .and_then(|(w, _)| w.parent().map(|p| p.display().to_string())),
+            .and_then(|(w, _, _)| w.parent().map(|p| p.display().to_string())),
     }
 }
 
@@ -936,7 +953,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
     if lock(&state.recording).is_some() {
         return Err("Already recording.".into());
     }
-    let (whisper_path, vad_path) = model_paths(&lock(&state.settings))?;
+    let (whisper_path, vad_path, qwen) = model_paths(&lock(&state.settings))?;
     let default_language = lock(&state.settings).language.clone();
 
     // Reuse the meeting or create one. Times in the transcript are measured from when the
@@ -965,6 +982,7 @@ async fn start_recording(app: AppHandle, state: State<'_, AppState>, meeting_id:
     let offset_ms = (now_ms() - started_at).max(0) as u64;
     tracing::info!("recording with {}", whisper_path.display());
     let mut cfg = PipelineConfig::new(whisper_path, vad_path);
+    cfg.qwen = qwen;
     cfg.language = LangMode::parse(&language);
     cfg.initial_prompt = meeting_prompt(&state, mid, cfg.language, &names);
     let prompt = cfg.initial_prompt.clone();
@@ -1716,8 +1734,8 @@ async fn setup_info() -> Result<SetupInfo, String> {
                     label: m.label,
                     note: m.note,
                     vram_mb: m.vram_mb,
-                    bytes: m.file.bytes,
-                    present: models::find(&m.file).is_some(),
+                    bytes: m.total_bytes(),
+                    present: m.present(),
                 })
                 .collect(),
             vad_present: models::find(&models::VAD).is_some(),
@@ -1800,8 +1818,10 @@ async fn download_models(
     }
     for id in &speech_models {
         let m = models::speech_model(id).ok_or_else(|| format!("Unknown speech model \"{id}\"."))?;
-        if models::find(&m.file).is_none() && !queue.iter().any(|f| f.file == m.file.file) {
-            queue.push(m.file);
+        for f in m.files() {
+            if !models::is_present(f) && !queue.iter().any(|q| q.file == f.file) {
+                queue.push(*f);
+            }
         }
     }
     let dir = models::download_dir().ok_or("Couldn't find the local app data folder.")?;
@@ -1827,6 +1847,11 @@ async fn download_models(
             let result =
                 models::download(&client, f, &dir, &st.download_cancel, |r, t| ev(f.file, index, r, t, false, None))
                     .await;
+            // The llama.cpp runtime comes zipped: unpack it next to the models.
+            let result = match result {
+                Ok(path) if f.file.ends_with(".zip") => models::unpack(&path, &dir),
+                other => other.map(|_| ()),
+            };
             if let Err(e) = result {
                 tracing::warn!("download {}: {e}", f.file);
                 ev(f.file, index, 0, f.bytes, false, Some(e));

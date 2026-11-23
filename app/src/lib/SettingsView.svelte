@@ -82,6 +82,7 @@
     'large-v3-turbo-q8_0': 'Large v3 Turbo (8-bit)',
     'large-v3-turbo-q5_0': 'Large v3 Turbo (5-bit)',
     'large-v3': 'Large v3',
+    'qwen3-asr-1.7b-q8': 'Qwen3-ASR 1.7B (experimental)',
     'small-q5_1': 'Small (5-bit)'
   };
   const speechLabel = $derived(speechLabels[session.settings.speechModel] ?? session.settings.speechModel);
